@@ -2028,6 +2028,170 @@ async function bootstrapExternalRelayWebRemoteControl(
   transport.start();
 }
 
+type StandaloneWebConnectionState = "connecting" | "reconnecting" | "connected" | "auth-required";
+
+interface StandaloneWebConnectionPorts {
+  connect(options: { signal: AbortSignal; onClose(): void }): Promise<RootServices>;
+  checkAccess(signal: AbortSignal): Promise<boolean>;
+  onReady(services: RootServices): void;
+  onState(state: StandaloneWebConnectionState): void;
+  windowTarget: Pick<Window, "addEventListener" | "removeEventListener">;
+  documentTarget: Pick<Document, "addEventListener" | "removeEventListener" | "visibilityState">;
+}
+
+// 修复依据：独立 Web 只有首连，close 回调为空；后台恢复和旧 RPC 清理由此无人负责。
+// 当前控制器只拥有连接代际，不保存任务事实，不自动重放任何业务写请求。
+function createStandaloneWebConnection(ports: StandaloneWebConnectionPorts) {
+  let stopped = false;
+  let hadReady = false;
+  let failures = 0;
+  let current: AbortController | undefined;
+  let live: RootServices | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+  let pulseInFlight = false;
+  let broadcastSubscription: { dispose(): void } | undefined;
+  const broadcastListeners = new Set<
+    Parameters<RootServices["broadcastService"]["onMessage"]>[0]
+  >();
+  // 全局 Zustand Store 只在首次挂载捕获广播接口；保持这个引用，重连只替换它的真实目标。
+  const broadcast = new Proxy({} as RootServices["broadcastService"], {
+    get(_target, key) {
+      if (key === "onMessage") {
+        return (listener: Parameters<RootServices["broadcastService"]["onMessage"]>[0]) => {
+          broadcastListeners.add(listener);
+          return { dispose: () => broadcastListeners.delete(listener) };
+        };
+      }
+      return (...args: unknown[]) => {
+        if (!live) return Promise.reject(new Error("ConnectionClosed"));
+        return Reflect.apply(Reflect.get(live.broadcastService, key), live.broadcastService, args);
+      };
+    },
+  });
+  const publish = (state: StandaloneWebConnectionState) => {
+    if (!stopped) ports.onState(state);
+  };
+  const clearTimers = () => {
+    clearTimeout(retryTimer);
+    clearTimeout(heartbeatTimer);
+    retryTimer = heartbeatTimer = undefined;
+  };
+  const forget = () => {
+    const old = current;
+    current = undefined;
+    live = undefined;
+    pulseInFlight = false;
+    broadcastSubscription?.dispose();
+    broadcastSubscription = undefined;
+    old?.abort();
+  };
+  const schedule = () => {
+    if (stopped || retryTimer) return;
+    publish("reconnecting");
+    retryTimer = setTimeout(
+      () => {
+        retryTimer = undefined;
+        void attempt();
+      },
+      Math.min(8_000, 1_000 * 2 ** Math.min(failures++, 3)),
+    );
+  };
+  const drop = (owner: AbortController) => {
+    if (current !== owner || stopped) return;
+    clearTimers();
+    forget();
+    schedule();
+  };
+  const readPulse = async (services: RootServices) => {
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        services.systemService.info(),
+        new Promise<never>((_resolve, reject) => {
+          deadline = setTimeout(() => reject(new Error("Heartbeat timed out")), 10_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(deadline);
+    }
+  };
+  const pulse = async () => {
+    const owner = current;
+    const services = live;
+    if (!owner || !services || pulseInFlight || stopped) return;
+    pulseInFlight = true;
+    clearTimeout(heartbeatTimer);
+    try {
+      await readPulse(services);
+      if (current !== owner || stopped) return;
+      heartbeatTimer = setTimeout(() => void pulse(), 25_000);
+    } catch {
+      drop(owner);
+    } finally {
+      if (current === owner) pulseInFlight = false;
+    }
+  };
+  const attempt = async () => {
+    if (stopped || current) return;
+    clearTimers();
+    const owner = new AbortController();
+    current = owner;
+    publish(hadReady ? "reconnecting" : "connecting");
+    try {
+      if (!(await ports.checkAccess(owner.signal))) {
+        if (current !== owner || stopped) return;
+        forget();
+        publish("auth-required");
+        return;
+      }
+      if (current !== owner || stopped) return;
+      const services = await ports.connect({ signal: owner.signal, onClose: () => drop(owner) });
+      await readPulse(services);
+      if (current !== owner || stopped) return;
+      live = services;
+      broadcastSubscription = services.broadcastService.onMessage((message) => {
+        if (current === owner) for (const listener of broadcastListeners) listener(message);
+      });
+      failures = 0;
+      hadReady = true;
+      ports.onReady({ ...services, broadcastService: broadcast });
+      publish("connected");
+      heartbeatTimer = setTimeout(() => void pulse(), 25_000);
+    } catch {
+      drop(owner);
+    }
+  };
+  const recover = () => {
+    if (stopped) return;
+    if (live) void pulse();
+    else if (!current) {
+      clearTimers();
+      void attempt();
+    }
+  };
+  const visible = () => {
+    if (ports.documentTarget.visibilityState === "visible") recover();
+  };
+  ports.windowTarget.addEventListener("online", recover);
+  ports.windowTarget.addEventListener("pageshow", recover);
+  ports.documentTarget.addEventListener("visibilitychange", visible);
+  void attempt();
+  return {
+    retry: recover,
+    dispose() {
+      if (stopped) return;
+      stopped = true;
+      clearTimers();
+      forget();
+      broadcastListeners.clear();
+      ports.windowTarget.removeEventListener("online", recover);
+      ports.windowTarget.removeEventListener("pageshow", recover);
+      ports.documentTarget.removeEventListener("visibilitychange", visible);
+    },
+  };
+}
+
 async function bootstrapWebApp() {
   const params = new URLSearchParams(window.location.search);
   if (isWebRemoteControlRoute() || isWebRemoteControlOAuthCallback(new URL(window.location.href))) {
@@ -2063,44 +2227,97 @@ async function bootstrapWebApp() {
     return;
   }
 
-  try {
-    const services = await connectViaWebSocket(bootstrap.wsUrl, {
-      onClose: () => {},
-    });
-    const platform = createWebPlatform();
-    document.title = "ZCode - Web + Server";
-
+  const platform = createWebPlatform();
+  document.title = "ZCode - Web + Server";
+  let services: RootServices | undefined;
+  let state: StandaloneWebConnectionState = "connecting";
+  let connection: ReturnType<typeof createStandaloneWebConnection> | undefined;
+  const zh = isZhLocale();
+  const render = () =>
     root.render(
-      <AppErrorBoundary>
-        <ZCodeIntlProvider
-          settingService={services.settingService}
-          broadcastService={services.broadcastService}
-        >
-          <Root
-            services={services}
-            platform={platform}
-            initialWorkspaceAbsPath={bootstrap.initialWorkspaceAbsPath}
-            initialWorkspaceIdentity={bootstrap.initialWorkspaceIdentity}
-            initialTaskId={bootstrap.initialTaskId}
-            restoreSession={bootstrap.restoreSession}
-            allowOpenWorkspace={bootstrap.allowOpenWorkspace}
-            preferDirectoryBrowser
-            supportsEmbeddedBrowser={false}
-            allowRemoteWorkspace={false}
-          />
-        </ZCodeIntlProvider>
-      </AppErrorBoundary>,
+      <>
+        {/* 修复依据：保持同一组件树和 key，让重连更新服务，而不是卸载草稿和导航。 */}
+        <div className="contents" inert={state !== "connected"}>
+          {services ? (
+            <AppErrorBoundary>
+              <ZCodeIntlProvider
+                settingService={services.settingService}
+                broadcastService={services.broadcastService}
+              >
+                <Root
+                  services={services}
+                  platform={platform}
+                  initialWorkspaceAbsPath={bootstrap.initialWorkspaceAbsPath}
+                  initialWorkspaceIdentity={bootstrap.initialWorkspaceIdentity}
+                  initialTaskId={bootstrap.initialTaskId}
+                  restoreSession={bootstrap.restoreSession}
+                  allowOpenWorkspace={bootstrap.allowOpenWorkspace}
+                  preferDirectoryBrowser
+                  supportsEmbeddedBrowser={false}
+                  allowRemoteWorkspace={false}
+                />
+              </ZCodeIntlProvider>
+            </AppErrorBoundary>
+          ) : null}
+        </div>
+        {state !== "connected" ? (
+          <div
+            role="status"
+            data-testid="standalone-connection-status"
+            className="fixed inset-x-0 top-0 z-[100] flex flex-wrap items-center justify-center gap-3 border-b border-border bg-background px-4 py-3 text-ui-base text-foreground shadow-sm"
+          >
+            <span>
+              {state === "auth-required"
+                ? zh
+                  ? "登录验证已过期，请重新验证。当前页面已保留。"
+                  : "Authentication required. Your page is preserved."
+                : zh
+                  ? "连接已断开，正在重新连接。当前页面已保留。"
+                  : "Reconnecting. Your page is preserved."}
+            </span>
+            {state === "auth-required" ? (
+              <a className="underline" href={window.location.pathname}>
+                {zh ? "重新验证" : "Sign in again"}
+              </a>
+            ) : null}
+            <button
+              className="rounded-md border border-border px-3 py-1 hover:bg-hover"
+              onClick={() => connection?.retry()}
+            >
+              {zh ? "重试连接" : "Retry"}
+            </button>
+          </div>
+        ) : null}
+      </>,
     );
-  } catch (error) {
-    renderWebRemoteControlFailure(
-      error && typeof error === "object" && "reason" in error
-        ? (error as WebRemoteControlFailure)
-        : toWebRemoteControlFailure(
-            "unexpected-error",
-            error instanceof Error ? error.message : String(error),
-          ),
-    );
-  }
+  connection = createStandaloneWebConnection({
+    connect: (options) => connectViaWebSocket(bootstrap.wsUrl, options),
+    async checkAccess(signal) {
+      const response = await fetch("/api/server-info", {
+        cache: "no-store",
+        redirect: "manual",
+        credentials: "same-origin",
+        signal: AbortSignal.any([signal, AbortSignal.timeout(8_000)]),
+      });
+      if (response.type === "opaqueredirect" || response.status === 401 || response.status === 403)
+        return false;
+      if (!response.ok) throw new Error("Server unavailable");
+      return response.headers.get("content-type")?.includes("application/json") === true;
+    },
+    onReady(next) {
+      services = next;
+      render();
+    },
+    onState(next) {
+      state = next;
+      render();
+    },
+    windowTarget: window,
+    documentTarget: document,
+  });
+  window.addEventListener("pagehide", (event) => {
+    if (!event.persisted) connection?.dispose();
+  });
 }
 
 void bootstrapWebApp();
