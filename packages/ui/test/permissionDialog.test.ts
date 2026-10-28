@@ -1,3 +1,5 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   OFFICIAL_CUA_PERMISSION_RULE_TOOL_NAME,
   type ZCodePermissionRequest,
@@ -42,6 +44,51 @@ function renderPermissionDialog(
 }
 
 describe("PermissionDialog", () => {
+  it("shows the full long subagent source and bounds its command preview", () => {
+    const description =
+      "Refine mobile compact viewport, push PR #2, run CI " + "long-unbroken-context-".repeat(12);
+    const html = renderPermissionDialog({
+      type: "permission_request",
+      taskId: "preview-only",
+      traceId: "preview-only",
+      requestId: "preview-only",
+      description: "Dangerous command requires your approval for this execution",
+      kind: "Bash",
+      title: "Bash",
+      freeText: true,
+      options: [
+        {
+          optionId: "allow_once",
+          kind: "allow_once",
+          name: "Allow",
+          response: { decision: "allow" },
+        },
+        { optionId: "deny", kind: "deny", name: "Deny", response: { decision: "deny" } },
+      ],
+      origin: { ...SUBAGENT_ORIGIN, agentType: "executor", description },
+      raw: {
+        toolName: "Bash",
+        input: {
+          command: Array.from({ length: 40 }, (_, n) => `printf preview-only-${n}`).join("\n"),
+        },
+      },
+    });
+    const badge =
+      html.match(/<span[^>]*data-interaction-origin-badge="subagent"[^>]*>[\s\S]*?<\/span>/)?.[0] ??
+      "";
+    expect(badge).toContain(`>来自子智能体：executor · ${description}</span>`);
+    expect(badge).toContain("whitespace-normal");
+    expect(badge).not.toContain("truncate");
+    expect(badge).not.toContain("max-w-40");
+    expect(html).toContain('data-permission-dialog-bounded="true"');
+    if (process.env.ZCODE_PERMISSION_PREVIEW_DIR) {
+      writeFileSync(
+        join(process.env.ZCODE_PERMISSION_PREVIEW_DIR, "permission-long-source.html"),
+        html,
+      );
+    }
+  });
+
   it("renders the optional feedback input only when V4 enables it", () => {
     const withoutFeedback = renderPermissionDialog({
       type: "permission_request",
@@ -311,8 +358,8 @@ describe("PermissionDialog", () => {
     });
 
     expect(html).toContain('data-interaction-origin-badge="subagent"');
-    expect(html).toContain("子智能体 · reviewer (agent#1@0)");
-    // 截断时完整文本留在 tooltip 里，且仍带 agentType。
+    expect(html).toContain("来自子智能体：zcode-workflow · reviewer (agent#1@0)");
+    // 可见来源和 title 都保留 agentType，不能仅依赖 hover。
     expect(html).toContain("来自子智能体：zcode-workflow · reviewer (agent#1@0)");
   });
 

@@ -19,6 +19,18 @@ afterEach(() => {
 });
 
 describe("settingsNavigation", () => {
+  it("手机直达设置意图的检测不消费导航目标", async () => {
+    const storage = new Map([["zcode-settings-section-intent", "memory"]]);
+    vi.stubGlobal("window", { sessionStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      removeItem: (key: string) => storage.delete(key),
+    }});
+    const navigation = await loadSettingsNavigation("test");
+    expect(navigation.hasPendingSettingsSection()).toBe(true);
+    expect(navigation.consumePendingSettingsSection()).toBe("memory");
+    expect(navigation.hasPendingSettingsSection()).toBe(false);
+  });
+
   it("保留 usage、hooks 和 memory 分区", async () => {
     const navigation = await loadSettingsNavigation("test");
 

@@ -2277,3 +2277,24 @@ html[data-document-hidden] *::after {
   [data-sidebar-divider-extension] {
   display: none;
 }
+
+/* 手机使用官方独立页面与正常字号，不缩放整棵桌面 UI。字号仍由原有 store 投影，
+ * 此处只提供手机下限；用户选择更大字号时继续生效，横屏/宽屏自动撤回。 */
+@media (max-width: 767px) {
+  :root:has(.mobile-workspace, [data-mobile-settings]) { --mobile-ui-font-floor: 16px; }
+  [data-mobile-settings] { height: 100dvh; min-height: 0; }
+  [data-mobile-settings] button:not([role="switch"]):not([role="checkbox"]) { min-height: 44px; }
+  .mobile-workspace { height: 100dvh; padding-bottom: env(safe-area-inset-bottom); }
+  .mobile-workspace button:not([role="switch"]):not([role="checkbox"]) { min-height: 44px; min-width: 44px; }
+  /* 只扩大开关/复选框的透明命中区，不能把胶囊或勾选框本体拉成 44px。 */
+  :is(.mobile-workspace, [data-mobile-settings]) button:is([role="switch"], [role="checkbox"]) { position: relative; }
+  :is(.mobile-workspace, [data-mobile-settings]) button:is([role="switch"], [role="checkbox"])::before { content: ""; position: absolute; inset: -14px -8px; }
+  [data-mobile-model-picker] { width: min(24rem, calc(100vw - 24px)); }
+  [data-mobile-model-picker] :is([role="menuitem"], [role="menuitemradio"], button) { min-height: 44px; }
+}
+
+@media (max-width: 767px) {
+  /* 手机设置项不能沿用桌面为右侧控件预留的 192px，否则说明会被挤成窄列。 */
+  [data-mobile-settings] [data-settings-row-grid] { grid-template-columns: minmax(0, 1fr); }
+  [data-mobile-settings] [data-settings-row-grid] > div:last-child > * { max-width: 100%; }
+}

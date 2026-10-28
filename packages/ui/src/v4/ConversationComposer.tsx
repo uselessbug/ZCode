@@ -2366,7 +2366,7 @@ function ConversationComposerImpl({
               phase={composerPhase}
               provider={provider}
               isWebRemoteControl={isWebRemoteControl}
-              isMobileViewport={isMobileTextInputViewport}
+              isMobileViewport={isMobileTextInputViewport || isMobileCompactViewport}
               draftMode={draftMode}
               draftConfig={draftConfig}
               usage={composerUsage}
@@ -2440,6 +2440,8 @@ function ConversationComposerImpl({
       highspeedEntranceAnimated,
       highspeedPresented,
       highspeedSweepActive,
+      isMobileTextInputViewport,
+      isMobileCompactViewport,
       isWebRemoteControl,
       mode,
       handleSelectModelTrace,

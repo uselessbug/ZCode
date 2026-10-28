@@ -5441,7 +5441,7 @@ export function SessionPane({
         queueEditActiveForCurrentComposer ||
         quotaBanner.state.blocksSubmit
       }
-      isWebRemoteControl={compactForRemoteControl || !isDesktop}
+      isWebRemoteControl={compactForRemoteControl}
       workspacePath={workspacePath}
       workspaceIdentity={workspaceIdentity}
       remoteSessionId={remoteSessionId ?? undefined}
@@ -5703,7 +5703,7 @@ export function SessionPane({
         onDrop={effectiveDropTargetController?.onDrop}
         className={cn(
           "relative flex h-full min-h-0 flex-col",
-          (compactForRemoteControl || !isDesktop) && "min-w-0",
+          compactForRemoteControl && "min-w-0",
         )}
       >
         {effectiveDropTargetController?.active ? (
@@ -5731,7 +5731,7 @@ export function SessionPane({
           ref={conversationLayoutContainerRef}
           className={cn(
             "@container/conversation relative flex min-h-0 flex-1 flex-col",
-            (compactForRemoteControl || !isDesktop) && "min-w-0",
+            compactForRemoteControl && "min-w-0",
           )}
         >
           {sessionId && !compactForRemoteControl ? (
@@ -5777,7 +5777,7 @@ export function SessionPane({
               endedSubagentCount={subagents.endedTotal}
               rootSessionId={rootSessionId ?? sessionId ?? undefined}
               parentSessionId={sessionId ?? undefined}
-              isWebRemoteControl={compactForRemoteControl || !isDesktop}
+              isWebRemoteControl={compactForRemoteControl}
               isMobileViewport={isMobileTextInputViewport || isMobileCompactViewport}
               layoutMode={statusPanelLayout}
               summaryPanelVariantOverride={effectiveSummaryPanelVariantOverride}

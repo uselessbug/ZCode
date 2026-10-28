@@ -271,10 +271,12 @@ describe("BrowserSettingsSection", () => {
     expect(screen.queryByText("settings.browser.import.successWithSkipped")).toBeNull();
   });
 
-  it("Web/手机端禁用本机浏览器数据操作并展示桌面端提示", () => {
+  it("Web/手机端禁用本机浏览器数据操作并说明 Chromium MCP 不受限", () => {
     renderSection(false);
 
-    expect(screen.getByText("settings.browser.desktopOnly")).toBeTruthy();
+    // Web 提示必须区分 Electron 内置浏览器数据与不受限的服务端 Chromium MCP。
+    expect(screen.getByText("settings.browser.webUnsupported")).toBeTruthy();
+    expect(screen.queryByText("settings.browser.desktopOnly")).toBeNull();
     expect(
       (
         screen.getByRole("button", {

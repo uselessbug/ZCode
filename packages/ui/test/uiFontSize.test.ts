@@ -40,7 +40,7 @@ describe("uiFontSize", () => {
 
     expect(fontSizePx).toBe(16);
     expect(style.fontSize).toBe("");
-    expect(properties.get("--ui-font-size")).toBe("16px");
+    expect(properties.get("--ui-font-size")).toBe("max(16px, var(--mobile-ui-font-floor, 0px))");
   });
 
   it("监听其他窗口的字号存储变化并支持清理订阅", () => {
@@ -69,7 +69,7 @@ describe("uiFontSize", () => {
       newValue: "20",
     } as StorageEvent);
 
-    expect(properties.get("--ui-font-size")).toBe("20px");
+    expect(properties.get("--ui-font-size")).toBe("max(20px, var(--mobile-ui-font-floor, 0px))");
     dispose();
     expect(windowStub.removeEventListener).toHaveBeenCalledOnce();
     expect(listeners.has("storage")).toBe(false);

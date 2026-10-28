@@ -122,6 +122,7 @@ export function SettingsRow({
   return (
     <div className="border-t border-border px-4 py-3 first:border-t-0">
       <div
+        data-settings-row-grid="true"
         className={cn(
           "grid items-center gap-4",
           controlLayout === "wide"

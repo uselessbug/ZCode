@@ -163,7 +163,7 @@ export function WebRemoteControlMobileShell({
         switcher={switcher}
       />
       {isMobileViewport ? (
-        <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-background">
+        <div className="mobile-workspace relative flex h-full min-h-0 min-w-0 flex-col bg-background">
           {currentPage === "home" ? (
             <section className="flex h-full min-h-0 min-w-0 flex-col" data-mobile-page="home">
               {renderTaskHome({ navigateToChat, setSwitching: setSwitchingWorkspace })}

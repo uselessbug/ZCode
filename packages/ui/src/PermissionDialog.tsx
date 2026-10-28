@@ -813,7 +813,7 @@ export function PermissionDialog({
   const shouldUseWorkflowBlock = isWorkflowAsk;
   // 保存确认窗同理，但问句、内容与选项都不同：没有图、没有 Refine，主体是落点 + 元数据 + 脚本。
   const shouldUseSaveWorkflowBlock = blockKind === "saveWorkflow";
-  // 限高布局目前只给保存确认窗（docs/dynamic-workflow/launch.md「`SaveWorkflow`」第 4 步）：窗口上限与
+  // 保存确认、子代理来源和手机确认复用同一限高布局（docs/dynamic-workflow/launch.md）：窗口上限与
   // 问答窗（ElicitationDialog）相同；选项以上全部内容是**唯一**的纵向滚动区，选项、反馈行与确认
   // 隔一条细线钉在下面。滚动区用负外边距铺满窗宽，滚动条贴窗口边缘、细线横贯整窗。
   // Bugfix：上一版问句钉顶、中段滚动、段内三块各自滚动、窗口再兜底滚动，最多五层滚动容器叠在
@@ -821,7 +821,9 @@ export function PermissionDialog({
   // 钉底只在屏幕够高（≥36rem）时成立：选项、最多 5 行的反馈、错误行与确认栏本身就有约 320px，
   // 矮屏（如横屏手机）上它们会高过上限、被窗口裁掉，确认按钮跟着消失。所以基础布局是整窗一个
   // 滚动区（选项随内容滚动），够高才切到「选项以上滚、选项钉底」；两种高度下都只有一个滚动容器。
-  const bounded = shouldUseSaveWorkflowBlock;
+  // 来源完整换行后，子代理确认卡复用已有单滚动区；手机上也不能把确认按钮挤出可达区域。
+  const bounded =
+    shouldUseSaveWorkflowBlock || request.origin?.kind === "subagent" || isMobileTextInputViewport;
   return (
     <div ref={rootRef} className="w-full shrink-0 relative z-1">
       <div
@@ -847,7 +849,7 @@ export function PermissionDialog({
             )}
             {...(bounded ? { "data-permission-dialog-scroll": "true" } : {})}
           >
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-start gap-2">
               <p className="text-ui-base font-medium leading-tight text-foreground-subtle">
                 {intl.formatMessage({ id: "chat.permission.title" })}
               </p>
@@ -1075,11 +1077,18 @@ export function PermissionDialog({
               {responseError}
             </p>
           ) : null}
-          <div className="flex shrink-0 items-center justify-between gap-2 px-1">
-            <p className="flex gap-2 text-ui-base items-center text-foreground-subtle">
-              <Info className="text-foreground size-4 shrink-0" />
-              {intl.formatMessage({ id: "chat.permission.keyboardHint" })}
-            </p>
+          <div
+            className={cn(
+              "flex shrink-0 items-center justify-between gap-2 px-1",
+              isMobileTextInputViewport && "justify-end",
+            )}
+          >
+            {!isMobileTextInputViewport ? (
+              <p className="flex min-w-0 flex-1 flex-wrap gap-2 text-ui-base items-center text-foreground-subtle">
+                <Info className="text-foreground size-4 shrink-0" />
+                {intl.formatMessage({ id: "chat.permission.keyboardHint" })}
+              </p>
+            ) : null}
             <Button
               type="button"
               aria-label={intl.formatMessage({ id: "common.confirm" })}

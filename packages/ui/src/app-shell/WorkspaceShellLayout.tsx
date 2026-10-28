@@ -1908,7 +1908,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       onBrowserPageMetadataChange={handleBrowserPageMetadataChange}
       onSelectGitSource={setGitSelectedSourceId}
       mobileOverlay={options.mobileOverlay}
-      mobileStacked={isWebRemoteControlShell}
+      mobileStacked={isCompactMobileWorkspace}
     />
   );
   const sidePanePanel = renderSidePanePanel();
@@ -2278,7 +2278,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
                   workspacePath={workspaceAbsPath}
                   workspaceIdentity={workspaceIdentity}
                   isDesktop={isDesktop === true}
-                  compactForRemoteControl={isWebRemoteControlShell}
+                  compactForRemoteControl={isCompactMobileWorkspace}
                   sessionId={activeTaskId}
                   provider={activeTaskProvider ?? undefined}
                   onSessionCreated={handleV4SessionCreated}

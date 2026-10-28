@@ -1217,8 +1217,8 @@ function V4ComposerModelControlsImpl({
   // Bug 根因：手机端固定宽度的二级菜单没有消费 Radix 测得的当前方向可用宽度，
   // 共享 min-w-32 还会阻止极窄空间继续收缩。保持二级交互，同时把窗口边缘作为硬上限。
   const providerSubmenuClassName = isMobileViewport
-      ? "w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)"
-      : undefined;
+    ? "w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)"
+    : undefined;
   useToolbarShortcutBindings({
     hasAnyOption: Boolean(modelOption) || Boolean(thoughtOption),
     toolbarDisabled: disabled || recoveryPending || connectionSwitch.pending,
@@ -1319,9 +1319,14 @@ function V4ComposerModelControlsImpl({
         <ModelConfigSelect
           key={workspaceIdentity?.trim() || workspacePath}
           modelGroups={modelSelectGroups}
+          isMobileViewport={isMobileViewport}
           contentAlign="center"
           normalizedValue={normalizedModelValue}
-          triggerLabel={modelTriggerDisplay.modelLabel}
+          triggerLabel={
+            isMobileViewport
+              ? (modelTriggerDisplay.modelLabel.split("/").at(-1) ?? modelTriggerDisplay.modelLabel)
+              : modelTriggerDisplay.modelLabel
+          }
           composerOptions={composerOptions}
           showManageModelsAction={showManageModelsAction}
           manageModelsLabel={manageModelsLabel}
@@ -1347,10 +1352,22 @@ function V4ComposerModelControlsImpl({
           onOpenChange={handleModelPickerOpenChange}
           openRequestKey={modelMenuOpenRequestKey}
           labelVisibilityClassName="hidden @sm/composer:inline-flex"
-          indicatorClassName="block group-data-[composer-model-icon=true]/toolbar:hidden"
-          triggerLabelClassName="block min-w-0 text-left group-data-[composer-model-icon=true]/toolbar:hidden [&>span]:max-w-full [&>span>span]:block [&>span>span]:truncate"
+          indicatorClassName={
+            isMobileViewport
+              ? "block"
+              : "block group-data-[composer-model-icon=true]/toolbar:hidden"
+          }
+          triggerLabelClassName={
+            isMobileViewport
+              ? "block min-w-0 max-w-32 truncate text-left [&>span]:max-w-full [&>span>span]:block [&>span>span]:truncate"
+              : "block min-w-0 text-left group-data-[composer-model-icon=true]/toolbar:hidden [&>span]:max-w-full [&>span>span]:block [&>span>span]:truncate"
+          }
           triggerClassName="composer-model-trigger group-data-[composer-model-icon=true]/toolbar:px-1.5 group-data-[composer-model-icon=true]/toolbar:justify-center"
-          triggerIconClassName="hidden group-data-[composer-model-icon=true]/toolbar:inline-flex"
+          triggerIconClassName={
+            isMobileViewport
+              ? "hidden"
+              : "hidden group-data-[composer-model-icon=true]/toolbar:inline-flex"
+          }
           focusSelectorOnClose={V4_COMPOSER_INPUT_SELECTOR}
           providerSubmenuClassName={providerSubmenuClassName}
         />

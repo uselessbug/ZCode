@@ -43,6 +43,7 @@ import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { usePlatform } from "@/hooks/usePlatform.js";
 import { logger } from "@/logger.js";
 import { getPathLeaf } from "@/lib/path.js";
+import { useIsMobileCompactViewport } from "@/lib/mobileTextInput.js";
 import { useProviderSettingsView } from "@/hooks/useProviderSettingsView.js";
 import { useUsageEntitlement } from "@/hooks/useUsageEntitlement.js";
 import {
@@ -50,6 +51,7 @@ import {
   clearPendingSettingsPluginOrigin,
   clearPendingSettingsPluginScopeKey,
   consumeInitialSettingsSection,
+  hasPendingSettingsSection,
   consumePendingSettingsSourceServerId,
   consumePendingSettingsSourceServerDetails,
   consumePendingSettingsPluginOrigin,
@@ -254,6 +256,7 @@ function SettingsSidebarButton({
   icon: Icon,
   label,
   active,
+  expanded = false,
   children,
   className,
   ...buttonProps
@@ -261,6 +264,8 @@ function SettingsSidebarButton({
   icon: LucideIcon;
   label: string;
   active?: boolean;
+  /** 手机单栏列表态：保留图标 + 完整文字，不折叠成桌面图标栏。 */
+  expanded?: boolean;
   children?: ReactNode;
   className?: string;
 } & ButtonHTMLAttributes<HTMLButtonElement>) {
@@ -271,8 +276,9 @@ function SettingsSidebarButton({
         type={buttonProps.type ?? "button"}
         aria-label={label}
         className={cn(
-          "flex h-8 w-full items-center gap-2 rounded-xl px-2.5 text-left transition-colors",
-          "max-lg:mx-auto max-lg:size-10 max-lg:justify-center max-lg:px-0",
+          "flex w-full items-center gap-2 rounded-xl px-2.5 text-left transition-colors",
+          // 手机单栏列表项保证 ≥44px 触控高度；桌面/窄窗口保持原图标栏折叠。
+          expanded ? "h-11" : "h-8 max-lg:mx-auto max-lg:size-10 max-lg:justify-center max-lg:px-0",
           active
             ? "bg-surface-hover text-foreground"
             : "text-remote-foreground-muted hover:bg-surface-hover hover:text-foreground",
@@ -282,7 +288,7 @@ function SettingsSidebarButton({
         <span className="flex size-4 shrink-0 items-center justify-center text-current">
           <Icon className="size-4 text-foreground" />
         </span>
-        <span className="min-w-0 flex-1 max-lg:sr-only">
+        <span className={cn("min-w-0 flex-1", !expanded && "max-lg:sr-only")}>
           {children ?? <span className="truncate text-ui-base text-foreground">{label}</span>}
         </span>
       </button>
@@ -335,6 +341,12 @@ export function SettingsPage({
   const isLinuxDesktop = Boolean(isDesktop && !isMacDesktop && !isWindowsDesktop);
   const usesInlineWindowControls = Boolean(isWindowsDesktop || isLinuxDesktop);
   const platform = usePlatform();
+  // 手机设置页（非桌面 + ≤767px）改用单栏：列表 → 详情 → 返回列表。
+  // 只保留一个导航布尔，不复制设置业务状态；宽屏桌面与窄窗口桌面沿用双栏。
+  const isMobileCompactViewport = useIsMobileCompactViewport();
+  const isMobileSettingsLayout = !isDesktop && isMobileCompactViewport;
+  const [mobileSettingsDetailOpen, setMobileSettingsDetailOpen] =
+    useState(hasPendingSettingsSection);
   const remoteWorkspaceController = useOptionalRemoteWorkspaceController();
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(() => {
     const initialSection = consumeInitialSettingsSection("general");
@@ -851,6 +863,8 @@ export function SettingsPage({
         // 页面不会重新挂载，之前写入的 pending section 无人消费，看起来像点击没反应。
         // 这里订阅同窗口跳转意图，立即切换当前设置分区。
         setActiveSettingsSection(section, activeSection);
+        // 手机单栏：外部跳转（quickpick/营销/剩余额度等）直达详情页。
+        setMobileSettingsDetailOpen(true);
         // 设置入口是一级路由边界。即使仍落在同一 section，也必须销毁旧的 New/Edit/Detail 子状态。
         setSettingsSectionNavigationVersion((version) => version + 1);
         setTargetSourceServerId(section === "remoteDevices" ? detail?.sourceServerId : undefined);
@@ -1510,9 +1524,16 @@ export function SettingsPage({
         <div
           data-testid={TID_SETTINGS_PAGE}
           data-active-section={activeSection}
+          data-mobile-settings={isMobileSettingsLayout ? "true" : undefined}
           // 隐式 auto 行会按 Memory viewer 的内容高度撑出窗口，随后被 DesktopWindowFrame 裁切且没有滚动条。
           // 固定为单个 minmax(0, 1fr) 行，让普通设置页和内部滚动 viewer 都以窗口剩余高度为边界。
-          className="relative grid h-screen min-h-full w-full grid-cols-[68px_minmax(0,1fr)] grid-rows-[minmax(0,1fr)] lg:grid-cols-[268px_minmax(0,1fr)]"
+          className={cn(
+            "relative grid h-screen min-h-full w-full grid-rows-[minmax(0,1fr)]",
+            // 手机单栏：列表与详情互斥显示，不再保留桌面 68px 图标栏。
+            isMobileSettingsLayout
+              ? "grid-cols-1"
+              : "grid-cols-[68px_minmax(0,1fr)] lg:grid-cols-[268px_minmax(0,1fr)]",
+          )}
         >
           {isWindowsDesktop ? <WindowsTopLeftLogo /> : null}
 
@@ -1531,7 +1552,13 @@ export function SettingsPage({
               <DesktopWindowControls />
             </div>
           ) : null}
-          <aside className="min-w-0">
+          <aside
+            className={cn(
+              "min-w-0",
+              // 手机单栏详情态隐藏列表；宽屏桌面始终双栏。
+              isMobileSettingsLayout && mobileSettingsDetailOpen && "hidden",
+            )}
+          >
             <div className="flex h-full flex-col">
               <div className="h-12 [app-region:drag]"></div>
               <div className="px-2 pb-3 pt-3">
@@ -1604,7 +1631,11 @@ export function SettingsPage({
                       >
                         <div
                           id={groupLabelId}
-                          className="px-2.5 pb-1 text-ui-sm font-medium text-remote-foreground-muted max-lg:sr-only"
+                          className={cn(
+                            "px-2.5 pb-1 text-ui-sm font-medium text-remote-foreground-muted",
+                            // 手机单栏列表保留分组标题；桌面/窄窗口沿用 sr-only 折叠。
+                            !isMobileSettingsLayout && "max-lg:sr-only",
+                          )}
                         >
                           {groupLabel}
                         </div>
@@ -1620,6 +1651,7 @@ export function SettingsPage({
                                 icon={Icon}
                                 label={label}
                                 active={isActive}
+                                expanded={isMobileSettingsLayout}
                                 aria-current={isActive ? "page" : undefined}
                                 data-testid={testId(TID_SETTINGS_SECTION_NAV, id)}
                                 data-settings-section-nav={id}
@@ -1635,6 +1667,8 @@ export function SettingsPage({
                                       setTargetSourceServerId(undefined);
                                       setSettingsSectionNavigationVersion((version) => version + 1);
                                       setActiveSettingsSection(id);
+                                      // 手机单栏：点击分区进入详情页。
+                                      setMobileSettingsDetailOpen(true);
                                     },
                                     completed: { resultSource: "local_commit", sectionId: id },
                                     failureStage: "navigation_commit",
@@ -1662,6 +1696,7 @@ export function SettingsPage({
                 <SettingsSidebarButton
                   icon={Rocket}
                   label={intl.formatMessage({ id: "settings.onboarding" })}
+                  expanded={isMobileSettingsLayout}
                   className="mt-4 border border-dashed border-border hover:border-border-hover"
                   onClick={() => {
                     runUserAction({
@@ -1707,6 +1742,8 @@ export function SettingsPage({
             data-settings-content-frame="true"
             className={cn(
               "flex min-h-0 flex-col",
+              // 手机单栏列表态隐藏详情；宽屏桌面始终双栏。
+              isMobileSettingsLayout && !mobileSettingsDetailOpen && "hidden",
               // 桌面平台统一复用主工作区的面板 inset；左侧仍与导航相接，顶部由独立拖拽留白承接。
               isDesktop ? (isWindowsDesktop ? "pr-1.5 pb-1.5" : "pr-1 pb-1") : "p-0",
             )}
@@ -1785,6 +1822,20 @@ export function SettingsPage({
                         <div>
                           <div className="flex flex-wrap items-center justify-between gap-3">
                             <div className="flex min-w-0 flex-wrap items-center gap-3">
+                              {isMobileSettingsLayout ? (
+                                <button
+                                  type="button"
+                                  data-testid="settings-mobile-back"
+                                  aria-label={intl.formatMessage({
+                                    id: "settings.mobileBackToList",
+                                  })}
+                                  // 手机详情页返回列表；size-11 ≈ 44px 触控目标。
+                                  className="flex size-11 shrink-0 items-center justify-center rounded-xl text-foreground-subtle hover:bg-surface-hover hover:text-foreground"
+                                  onClick={() => setMobileSettingsDetailOpen(false)}
+                                >
+                                  <ArrowLeft className="size-5" />
+                                </button>
+                              ) : null}
                               {showActiveSectionTitle ? (
                                 <h2 className="text-ui-settings-title font-semibold tracking-tight text-foreground lg:text-ui-settings-title-lg">
                                   {activeSectionLabel}
@@ -2103,7 +2154,10 @@ export function SettingsPage({
                                 memoryEnabled={memoryEnabled}
                                 memoryService={localHostServices.memoryService}
                                 onMemoryEnabledChange={handleMemoryEnabledChange}
-                                projectMemoryViewerAvailable={Boolean(isDesktop)}
+                                // Bugfix: base Host 始终提供 IMemoryService 契约，桌面、云端 Web、
+                                // 手机远控都通过同一 localHostServices 代理读取所属 Host 的项目记忆。
+                                // 旧的 Boolean(isDesktop) 假门禁把已有服务在 Web 上误判为不可用。
+                                projectMemoryViewerAvailable
                                 workspaceDisplayNames={memoryWorkspaceDisplayNames}
                               />
                             </ServiceProvider>

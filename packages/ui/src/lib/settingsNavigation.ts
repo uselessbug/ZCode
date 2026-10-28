@@ -323,6 +323,17 @@ function clearPendingSettingsSectionIntent(): void {
   }
 }
 
+/** 手机设置页需要区分普通打开与直达分区；只读取原导航意图，不复制或消费它。 */
+export function hasPendingSettingsSection(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const raw = window.sessionStorage.getItem(SETTINGS_SECTION_INTENT_KEY);
+    return raw === "skills" || (raw !== null && isSettingsSectionId(raw));
+  } catch {
+    return false;
+  }
+}
+
 export function consumePendingSettingsSection(
   fallbackSection: SettingsSectionId = "general",
 ): SettingsSectionId {

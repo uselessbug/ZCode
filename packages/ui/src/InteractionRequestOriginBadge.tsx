@@ -16,7 +16,7 @@ export function InteractionRequestOriginBadge({
   }
 
   // description 点名是哪个子代理在问（动态工作流子代理为 `<名字> (<siteId>@<ordinal>)`，
-  // docs/dynamic-workflow/launch.md「Permissions inside a run」）；徽标截断，完整文本留在 tooltip。
+  // docs/dynamic-workflow/launch.md「Permissions inside a run」）；权限来源必须直接完整可读，不能依赖桌面 hover 或在手机上截断。
   const description = origin.description?.trim();
   const label = description
     ? intl.formatMessage({ id: "chat.interactionOrigin.subagent.named" }, { description })
@@ -38,9 +38,12 @@ export function InteractionRequestOriginBadge({
       variant="outline"
       title={title}
       data-interaction-origin-badge="subagent"
-      className={cn("max-w-40 align-baseline text-ui-base truncate", className)}
+      className={cn(
+        "h-auto min-h-5 max-w-full min-w-0 shrink justify-start overflow-visible rounded-lg py-1 text-left align-baseline text-ui-base leading-5 whitespace-normal break-words [overflow-wrap:anywhere]",
+        className,
+      )}
     >
-      {label}
+      {title}
     </Badge>
   );
 }
