@@ -1076,8 +1076,9 @@ function SubagentForm({
             role="radiogroup"
             className="relative inline-grid w-56 grid-cols-8 rounded-lg border border-input-border bg-input p-1"
           >
+            {/* 手机按钮的触控高度为 44px，选中圈不能沿用 24px 桌面按钮的固定顶部偏移。 */}
             <span
-              className="pointer-events-none absolute top-1 size-6 rounded-full border border-border-hover bg-surface shadow-xs transition-[left]"
+              className="pointer-events-none absolute top-1/2 size-6 -translate-y-1/2 rounded-full border border-border-hover bg-surface shadow-xs transition-[left]"
               style={{
                 left: `calc(0.25rem + ((100% - 0.5rem) / ${AGENT_COLORS.length}) * ${selectedColorIndex})`,
               }}
