@@ -1,0 +1,55 @@
+name: Build and publish container
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build ARM64 image from this checkout
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          docker build --platform linux/arm64 \
+            --build-arg VERSION="$version" \
+            --build-arg REVISION="$GITHUB_SHA" \
+            -t zcode:build .
+      - name: Check native modules and browser tools
+        run: |
+          docker run --rm --entrypoint node zcode:build --input-type=module -e '
+            import { DatabaseSync } from "node:sqlite";
+            import { createRequire } from "node:module";
+            const db = new DatabaseSync(":memory:");
+            if (db.prepare("select 1 as ok").get().ok !== 1) process.exit(1);
+            db.close();
+            const pty = createRequire("/app/zcode/server/entry-http.js")("node-pty");
+            const p = pty.spawn("/bin/echo", ["pty-ok"], {cols:80, rows:24});
+            let output = "";
+            p.onData(data => output += data);
+            p.onExit(() => process.exit(output.includes("pty-ok") ? 0 : 1));
+            setTimeout(() => process.exit(1), 10000).unref();'
+          docker run --rm --entrypoint gh zcode:build --version
+          docker run --rm --entrypoint /opt/browser-mcp/node_modules/.bin/playwright-mcp zcode:build --help
+          docker run --rm --entrypoint /usr/bin/chromium zcode:build --version
+      - name: Publish latest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag zcode:build "$image:latest"
+          docker push "$image:latest"
