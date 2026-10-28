@@ -129,4 +129,23 @@ describe("Root startup gate", () => {
       }),
     ).toBe(false);
   });
+  it("首次 provider 目录仍在同步时继续等待官方检查完成", () => {
+    expect(
+      shouldResolveProviderStartupState({
+        isWebRemoteControlRoot: false,
+        providerStartupSyncPending: true,
+        providerAvailabilityStartupCheckCompleted: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("首次检查完成后，重连目录的临时 loading 不重新关闭恢复门禁", () => {
+    expect(
+      shouldResolveProviderStartupState({
+        isWebRemoteControlRoot: false,
+        providerStartupSyncPending: true,
+        providerAvailabilityStartupCheckCompleted: true,
+      }),
+    ).toBe(false);
+  });
 });
