@@ -436,6 +436,12 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   const tabStoreApi = useTabStoreApi();
   const isLinuxDesktop = Boolean(isDesktop && !isMacDesktop && !isWindowsDesktop);
   const isWebRemoteControlShell = Boolean(webRemoteControlWorkspaceSwitcher);
+  // 设置里的“新建技能/插件试用”走 Root 草稿入口，未经过 sidebar 的手机导航回调。
+  // 复用已有按 workspace/identity 隔离的待插入请求，等目录准备成功后才进入聊天消费。
+  const pendingComposerPrefill = useZCodeSessionStore(
+    (state) =>
+      state.getWorkspaceState(workspaceAbsPath, workspaceIdentity).composerTextInsertRequest,
+  );
   // Windows/Linux 原先遗漏外层留白，导致独立面板贴住窗口边缘；桌面统一使用 4px 间距。
   const hasDesktopPanelInset = isMacDesktop || isWindowsDesktop || isLinuxDesktop;
   const usesInlineWindowControls = Boolean(isWindowsDesktop || isLinuxDesktop);
@@ -2106,6 +2112,11 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
         activeWorkspaceIdentity={workspaceIdentity}
         activeWorkspacePath={workspaceAbsPath}
         initialNavigationIntent={initialWebRemoteControlMobileNavigationIntent}
+        composerPrefillRequestId={
+          !isWebRemoteControlShell && activeTaskId === null
+            ? pendingComposerPrefill?.requestId
+            : undefined
+        }
         webRemoteControlTerminalTransportState={webRemoteControlTerminalTransportState}
         isSidePaneOpen={isSidePaneOpen}
         onCloseSidePane={isSidePaneOpen ? handleToggleSidePane : undefined}

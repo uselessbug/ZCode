@@ -12,6 +12,7 @@ import {
   createChatComposerAttachment,
   createChatComposerPathAttachment,
   createClipboardTextAttachmentFilenameForDate,
+  createClipboardTextComposerAttachment,
   createClipboardTextPathComposerAttachment,
   formatAttachmentSize,
   revokeChatComposerAttachment,
@@ -767,6 +768,14 @@ export function useComposerAttachments(
       if (!shouldCreateClipboardTextAttachment(text)) return;
       event.preventDefault();
       event.stopPropagation?.();
+      // 普通 Web 没有 desktop host，platform.createTempTextAttachment 不存在，
+      // 原先在 preventDefault 之后才调用它会直接失败：长文本既没进输入框也没变成附件。
+      // 按 openAttachmentPicker 同款能力口径分流，Web 复用既有 bytes 上传路径（内存 File 附件），
+      // 桌面仍走临时文件零复制路径。不新增上传协议，也不把长文本塞进 Composer 正文。
+      if (!platform.canSelectFilePath) {
+        addPreparedAttachments([createClipboardTextComposerAttachment(text)]);
+        return;
+      }
       void (async () => {
         try {
           const attachment = await platform.createTempTextAttachment?.({

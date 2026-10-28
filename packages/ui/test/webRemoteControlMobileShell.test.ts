@@ -48,13 +48,14 @@ vi.mock("@/components/ui/resizable.js", () => ({
     ),
 }));
 
-function renderMobileShell(initialNavigationIntent?: "chat") {
+function renderMobileShell(initialNavigationIntent?: "chat", composerPrefillRequestId?: number) {
   return renderToStaticMarkup(
     createElement(WebRemoteControlMobileShell, {
       activeTaskId: "task-1",
       activeWorkspacePath: "/workspace/app",
       chatContent: createElement("main", { "data-testid": "chat-content" }),
       initialNavigationIntent,
+      composerPrefillRequestId,
       renderTaskHome: () => createElement("aside", { "data-testid": "project-home" }),
       renderChatHeader: () => createElement("header", { "data-testid": "chat-header" }),
       switcher: {
@@ -122,6 +123,14 @@ describe("WebRemoteControlMobileShell", () => {
 
     expect(html).toContain('data-mobile-page="chat"');
     expect(html).toContain('data-testid="chat-content"');
+  });
+
+  it("opens a settings-created prefilled draft without requiring a relay navigation intent", () => {
+    const html = renderMobileShell(undefined, 1);
+
+    expect(html).toContain('data-mobile-page="chat"');
+    expect(html).toContain('data-testid="chat-content"');
+    expect(html).not.toContain('data-testid="project-home"');
   });
 
   it("renders a theme menu trigger in the mobile chat header", () => {

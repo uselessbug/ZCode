@@ -208,6 +208,7 @@ function resultFor(operationId: string) {
 
 beforeEach(() => {
   latestApi = null;
+  mocks.platform.canSelectFilePath = true;
   mocks.platform.createTempTextAttachment.mockReset();
   mocks.platform.getPathForFile.mockReset();
   mocks.platform.selectFiles.mockReset();
@@ -399,6 +400,79 @@ describe("useComposerAttachments eager upload", () => {
     expect(latestApi?.attachments[0]).toMatchObject({
       filename: "pasted-text.txt",
       mimeType: "text/plain",
+      sourceKind: "clipboard-text",
+    });
+    act(() => root.unmount());
+  });
+
+  it("普通 Web 粘贴长文本时退回内存 File 附件，不再调用临时文件接口", async () => {
+    const transfer = createTransferService();
+    mocks.service = transfer.service;
+    // 普通 Web 没有 desktop host：createTempTextAttachment 缺失，必须走既有 bytes 上传路径。
+    mocks.platform.canSelectFilePath = false;
+    const { root } = renderProbe({ attachmentSessionId: null, scopeId: "web-long-paste" });
+    const preventDefault = vi.fn();
+    const text = "B".repeat(15_400);
+
+    act(() =>
+      latestApi?.handlePaste({
+        clipboardData: {
+          files: [],
+          getData: (type: string) => (type === "text/plain" ? text : ""),
+          types: ["text/plain"],
+        } as unknown as DataTransfer,
+        preventDefault,
+        stopPropagation: vi.fn(),
+      }),
+    );
+
+    await vi.waitFor(() => expect(latestApi?.attachments).toHaveLength(1));
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(mocks.platform.createTempTextAttachment).not.toHaveBeenCalled();
+    expect(latestApi?.attachments[0]).toMatchObject({
+      filename: expect.stringMatching(/^pasted-text-\d{8}-\d{6}\.txt$/),
+      mimeType: "text/plain",
+      sourceKind: "clipboard-text",
+      charCount: text.length,
+    });
+    act(() => root.unmount());
+  });
+
+  it("桌面粘贴长文本仍走临时文件零复制路径", async () => {
+    const transfer = createTransferService();
+    mocks.service = transfer.service;
+    mocks.platform.createTempTextAttachment.mockResolvedValue({
+      filename: "pasted-text.txt",
+      localPath: "/tmp/pasted-text.txt",
+      mimeType: "text/plain",
+      sizeBytes: 15_400,
+    });
+    const { root } = renderProbe({
+      attachmentSessionId: null,
+      localDesktop: true,
+      scopeId: "desktop-long-paste",
+    });
+    const preventDefault = vi.fn();
+    const text = "C".repeat(15_400);
+
+    act(() =>
+      latestApi?.handlePaste({
+        clipboardData: {
+          files: [],
+          getData: (type: string) => (type === "text/plain" ? text : ""),
+          types: ["text/plain"],
+        } as unknown as DataTransfer,
+        preventDefault,
+        stopPropagation: vi.fn(),
+      }),
+    );
+
+    await vi.waitFor(() => expect(latestApi?.attachments).toHaveLength(1));
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(mocks.platform.createTempTextAttachment).toHaveBeenCalledOnce();
+    expect(latestApi?.attachments[0]).toMatchObject({
+      filename: "pasted-text.txt",
+      localPath: "/tmp/pasted-text.txt",
       sourceKind: "clipboard-text",
     });
     act(() => root.unmount());

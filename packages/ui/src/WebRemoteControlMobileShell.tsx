@@ -66,6 +66,7 @@ export function WebRemoteControlMobileShell({
   chatContent,
   chatOverlay,
   initialNavigationIntent,
+  composerPrefillRequestId,
   isSidePaneOpen = false,
   onCloseSidePane,
   renderTaskHome,
@@ -82,6 +83,7 @@ export function WebRemoteControlMobileShell({
   activeTaskId: string | null;
   taskViewEnabled?: boolean;
   initialNavigationIntent?: WebRemoteControlMobileNavigationIntent;
+  composerPrefillRequestId?: number;
   isSidePaneOpen?: boolean;
   onCloseSidePane?: () => void;
   renderTaskHome: (options: {
@@ -96,7 +98,9 @@ export function WebRemoteControlMobileShell({
 }) {
   const { intl } = useZCodeIntl();
   const [currentPage, setCurrentPage] = useState<WebRemoteControlMobilePage>(() =>
-    resolveInitialWebRemoteControlMobilePage(initialNavigationIntent),
+    composerPrefillRequestId
+      ? "chat"
+      : resolveInitialWebRemoteControlMobilePage(initialNavigationIntent),
   );
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const terminalTransportState = useWebRemoteControlTerminalTransportState(
@@ -108,6 +112,18 @@ export function WebRemoteControlMobileShell({
     setCurrentPage("chat");
     pushWebRemoteControlMobileChatHistory();
   }, []);
+
+  useEffect(() => {
+    // 普通 Web 设置层只准备了草稿；手机 Home 没有 Composer，必须显式进入 Chat 才能消费预填。
+    // 不观察 currentPage，避免返回 Home 后把已经处理的意图重新执行。
+    if (isMobileViewport && composerPrefillRequestId) navigateToChat();
+  }, [
+    isMobileViewport,
+    composerPrefillRequestId,
+    activeWorkspacePath,
+    activeWorkspaceIdentity,
+    navigateToChat,
+  ]);
 
   const navigateHome = useCallback(() => {
     if (

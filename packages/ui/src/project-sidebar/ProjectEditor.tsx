@@ -450,6 +450,8 @@ export function ProjectEditor({
                 data-testid="virtual-project-directory-browser"
               >
                 <DirectoryBrowser
+                  // 独立云端的项目位于 /workspace；只指定浏览起点，保留 HOME 和远端目录语义。
+                  initialPath={isStandaloneWeb ? "/workspace" : undefined}
                   embedded
                   showSelectionActions
                   selectLabel={msg("browse")}

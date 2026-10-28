@@ -897,6 +897,56 @@ describe("SubagentsSection", () => {
     ]);
   });
 
+  it("内置子代理模型选择器按手机视口透传 isMobileViewport，桌面保持 false", async () => {
+    stateOverrides = new Map<number, unknown>([
+      [
+        1,
+        [
+          {
+            id: "built-in:explore",
+            name: "Explore",
+            description: "Search broadly",
+            systemPrompt: "Search.",
+            path: "built-in:Explore",
+            scope: "built-in",
+            source: "built-in",
+            enabled: true,
+            readOnly: true,
+            tools: ["Read"],
+          },
+        ],
+      ],
+      [2, { userScopeAvailable: true }],
+    ]);
+
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      addEventListener: () => {},
+      addListener: () => {},
+      dispatchEvent: () => false,
+      matches: query.includes("max-width: 767px"),
+      media: query,
+      onchange: null,
+      removeEventListener: () => {},
+      removeListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+
+    try {
+      await renderSubagentsSection();
+      expect(capturedModelConfigSelects).toEqual([
+        expect.objectContaining({ isMobileViewport: true }),
+      ]);
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+
+    capturedModelConfigSelects.length = 0;
+    await renderSubagentsSection();
+    expect(capturedModelConfigSelects).toEqual([
+      expect.objectContaining({ isMobileViewport: false }),
+    ]);
+  });
+
   it("offers disabled without implicitly selecting it when reasoning is missing", async () => {
     const plainModel = "custom:custom-openai:plain-chat";
     const customAgent = {
