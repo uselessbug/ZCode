@@ -1560,8 +1560,9 @@ export function SettingsPage({
             )}
           >
             <div className="flex h-full flex-col">
-              <div className="h-12 [app-region:drag]"></div>
-              <div className="px-2 pb-3 pt-3">
+              {/* 手机列表不需要桌面标题栏的 48px 拖拽留白，否则返回按钮与列表整体下沉。 */}
+              {!isMobileSettingsLayout ? <div className="h-12 [app-region:drag]"></div> : null}
+              <div className={cn("px-2", isMobileSettingsLayout ? "py-2" : "pb-3 pt-3")}>
                 {onBack ? (
                   <ControlHintTooltip
                     title={intl.formatMessage({
@@ -1578,7 +1579,10 @@ export function SettingsPage({
                       aria-label={intl.formatMessage({
                         id: "workspace.backToWorkspace",
                       })}
-                      className="m-1 w-[calc(100%-0.5rem)] justify-start gap-2 rounded-xl bg-surface px-1.5 text-remote-foreground-muted hover:bg-surface-hover hover:text-foreground max-lg:m-1 max-lg:size-10 max-lg:justify-center max-lg:px-0"
+                      className={cn(
+                        "m-1 w-[calc(100%-0.5rem)] justify-start gap-2 rounded-xl bg-surface px-1.5 text-remote-foreground-muted hover:bg-surface-hover hover:text-foreground max-lg:m-1 max-lg:size-10 max-lg:justify-center max-lg:px-0",
+                        isMobileSettingsLayout && "max-lg:size-11",
+                      )}
                       onClick={() => {
                         runUserAction({
                           input: {
