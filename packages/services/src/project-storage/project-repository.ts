@@ -12,6 +12,7 @@ import type {
   AutoArchiveInput,
   ProjectDirectories,
   ProjectRepositoryContract,
+  ProjectRepositoryOptions,
   ProjectTask,
   ProjectTaskRef,
   ProjectTree,
@@ -22,6 +23,7 @@ import { ensureHost, OWNERSHIP_DECIDED } from "#src/project-storage/legacy-tasks
 import {
   assertRemoteProjectRoots,
   assertRemoteTaskDirectories,
+  type StandaloneNonProjectPolicy,
 } from "#src/project-storage/remote-policy.js";
 
 const executionDirectoriesSchema = z.array(z.string().min(1)).max(256);
@@ -85,6 +87,7 @@ function resolveDirectories(
   db: DatabaseSync,
   task: ProjectTaskRef,
   ownerHostId = "local",
+  policy?: StandaloneNonProjectPolicy,
 ): ProjectDirectories {
   const row = readTask(db, task);
   // 旧远端影子行仍可能保留；行与项目一致不代表当前 Host 有权加载其目录。
@@ -99,6 +102,7 @@ function resolveDirectories(
     typeof row?.execution_directories === "string"
       ? executionDirectoriesSchema.parse(JSON.parse(row.execution_directories))
       : [],
+    policy,
   );
   return {
     workspacePath,
@@ -155,7 +159,18 @@ export class ProjectRepository implements ProjectRepositoryContract {
   constructor(
     private readonly db: DatabaseSync,
     private readonly ownerHostId?: string,
+    private readonly options?: ProjectRepositoryOptions,
   ) {}
+
+  /** 独立云端非项目策略只转译给 remote-policy，不改写其它 owner 判定。 */
+  private get standalonePolicy(): StandaloneNonProjectPolicy | undefined {
+    return this.options
+      ? {
+          allowStandaloneNonProject: this.options.allowStandaloneCloudWorkspaces,
+          standaloneWorkspaceRoot: this.options.standaloneWorkspaceRoot,
+        }
+      : undefined;
+  }
 
   archiveInactive(input: AutoArchiveInput): ProjectTaskRef[] {
     return transaction(this.db, () => {
@@ -203,16 +218,20 @@ export class ProjectRepository implements ProjectRepositoryContract {
         ? {
             deletedTasks: this.db
               .prepare(`
-        SELECT task_id AS taskId,workspace_path AS workspacePath,workspace_identity AS workspaceIdentity,host_id AS hostId
+        SELECT task_id AS taskId,workspace_path AS workspacePath,workspace_identity AS workspaceIdentity,workspace_key AS workspaceKey,host_id AS hostId
         FROM tasks WHERE host_id=? AND (deleted=1 OR coalesce(cli_deleted,0)=1)`)
               .all(this.ownerHostId ?? "local")
               .map((row) => ({
                 taskId: String(row.taskId),
                 workspacePath: String(row.workspacePath),
                 hostId: String(row.hostId),
-                ...(typeof row.workspaceIdentity === "string"
-                  ? { workspaceIdentity: row.workspaceIdentity }
-                  : {}),
+                // 与 readTasks 同源：删除事实的存储身份也必须能反解 Host，否则墓碑键与
+                // 活动任务分叉，分组列表在删除后重新入组或丢失。
+                ...(typeof row.workspaceIdentity === "string" && row.workspaceIdentity.trim()
+                  ? { workspaceIdentity: String(row.workspaceIdentity) }
+                  : isRemoteWorkspaceIdentity(String(row.workspaceKey))
+                    ? { workspaceIdentity: String(row.workspaceKey) }
+                    : {}),
               })),
           }
         : {}),
@@ -332,7 +351,7 @@ export class ProjectRepository implements ProjectRepositoryContract {
       if (!task) throw new Error("project.task-not-found");
       if (project.hostId !== (this.ownerHostId ?? "local") || task.host_id !== project.hostId)
         throw new Error("project.cross-host-move");
-      assertRemoteTaskDirectories(this.ownerHostId, project, String(task.root_path));
+      assertRemoteTaskDirectories(this.ownerHostId, project, String(task.root_path), [], this.standalonePolicy);
       if (!project.roots.some((root) => root.rootPath === task.root_path)) {
         if (!input.addMissingRoot) throw new Error("project.root-confirmation-required");
         this.db
@@ -366,7 +385,11 @@ export class ProjectRepository implements ProjectRepositoryContract {
   }
 
   resolveSessionDirectories(task: ProjectTaskRef): ProjectDirectories {
-    return transaction(this.db, () => resolveDirectories(this.db, task, this.ownerHostId), false);
+    return transaction(
+      this.db,
+      () => resolveDirectories(this.db, task, this.ownerHostId, this.standalonePolicy),
+      false,
+    );
   }
 
   reserveCreatedTask(input: {
@@ -384,6 +407,7 @@ export class ProjectRepository implements ProjectRepositoryContract {
           input.projectId ? requireProject(this.db, input.projectId) : null,
           input.task.workspacePath,
           input.additionalDirectories,
+          this.standalonePolicy,
         );
         if (input.projectId) {
           const project = requireProject(this.db, input.projectId);
@@ -414,7 +438,7 @@ export class ProjectRepository implements ProjectRepositoryContract {
               : JSON.stringify(executionDirectoriesSchema.parse(input.additionalDirectories)),
           );
       }
-      return resolveDirectories(this.db, input.task, this.ownerHostId);
+      return resolveDirectories(this.db, input.task, this.ownerHostId, this.standalonePolicy);
     });
   }
 }

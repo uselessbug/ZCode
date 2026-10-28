@@ -39,6 +39,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+import { logger } from "@/logger.js";
 import {
   formatRemoteWorkspaceDisplayLabel,
   formatRemoteWorkspaceHeaderHostLabel,
@@ -407,6 +408,11 @@ export function WorkspaceHeaderTitleSection({
           previousState: { pinned: isPinned, archived: false },
           nextState: { pinned: false, archived: true },
         });
+      })
+      .catch((error) => {
+        // 归档 Promise 原先没有失败处理；独立 Web 上错误会被静默吞掉，用户只看到"没反应"。
+        logger.error("[WorkspaceHeaderSections] Failed to archive task", error);
+        toast(intl.formatMessage({ id: "taskList.archiveFailed" }));
       });
   };
 
@@ -680,6 +686,11 @@ export function WorkspaceHeaderTitleSection({
                         previousState: { pinned: isPinned, archived: false },
                         nextState: { pinned: isPinned, archived: false },
                       });
+                    })
+                    .catch((error) => {
+                      // 同归档：缺少失败处理会让"标记未读"在独立 Web 上静默失败。
+                      logger.error("[WorkspaceHeaderSections] Failed to mark task as unread", error);
+                      toast(intl.formatMessage({ id: "taskList.markAsUnreadFailed" }));
                     });
                 }}
                 onOpenTaskFeedback={() => {

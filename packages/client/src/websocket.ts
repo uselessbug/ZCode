@@ -20,6 +20,11 @@ interface WebSocketConnectionOptions {
   onOpenSocket?: (socket: WebSocket) => void;
   signal?: AbortSignal;
   connectTimeoutMs?: number;
+  /**
+   * 是否暴露 windowControllerService。普通 Web 的 Headless Host 不注册该通道，
+   * 默认 false 让 services.windowControllerService 保持 undefined，消费方回退到 zcodeTaskService。
+   */
+  exposeWindowController?: boolean;
 }
 
 function wrapBrowserWebSocket(ws: WebSocket): ISocket {
@@ -113,7 +118,9 @@ export function connectViaWebSocket(
       clearTimeout(deadline);
       settled = true;
       options?.onOpenSocket?.(ws);
-      resolve(new RemoteServiceAccess(client));
+      // 普通 Web 的 Host 不注册 window-controller；缺省不暴露该代理，避免消费方选中
+      // 惰性构造的"看似存在"对象后首次调用才报 Unknown channel。
+      resolve(new RemoteServiceAccess(client, { exposeWindowController: options?.exposeWindowController ?? false }));
     });
   });
 }

@@ -1920,7 +1920,7 @@ function ConversationTimelineImpl({
   return (
     <div
       ref={timelineRootRef}
-      className={cn("relative flex min-h-0 flex-1 flex-col", compactForRemoteControl && "min-w-0")}
+      className={cn("relative flex min-h-0 flex-1 flex-col", "min-w-0")}
     >
       {selectionActions ? (
         <ConversationSelectionTooltip
@@ -1984,7 +1984,7 @@ function ConversationTimelineImpl({
           // 分享选择面板展开时改为 overflow-hidden：scrollTop 与 scrollbar-gutter 都保持不变，
           // 但原生滚动条、滚轮和键盘翻页都不再能移动背景，勾选目标不会漂走。
           backgroundScrollLocked && "!overflow-y-hidden",
-          compactForRemoteControl && "min-w-0",
+          "min-w-0",
           // 浮窗形态：滚动容器止于输入框上方 12px，消息底部再留 16px 空白。
           floatingComposerDock &&
             "mb-[calc(var(--v4-floating-composer-dock-height,0px)+12px)] pb-4",

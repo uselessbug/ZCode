@@ -18,8 +18,21 @@ export interface ProjectMigrationContext {
 export interface ProjectStorageContract {
   /** 加法升级后同事务交接旧版本新增行/删除/标题意图；每次启动调用，不重算已处理的 NULL。 */
   migrate(db: DatabaseSync, context: ProjectMigrationContext): Promise<MigrationResult>;
-  repository(db: DatabaseSync, hostId?: string): ProjectRepositoryContract;
+  repository(
+    db: DatabaseSync,
+    hostId?: string,
+    options?: ProjectRepositoryOptions,
+  ): ProjectRepositoryContract;
   admitTaskIdentity(db: DatabaseSync, task: ProjectTaskRef, hostId?: string): void;
+}
+
+/**
+ * 独立云端 Web 的项目仓储策略。只在显式开启独立云端工作区时才允许无项目的会话
+ * 与自动分配项目 root；默认关闭，保持真实远端 Source 与桌面远控的原契约。
+ */
+export interface ProjectRepositoryOptions {
+  allowStandaloneCloudWorkspaces?: boolean;
+  standaloneWorkspaceRoot?: string;
 }
 
 export interface ProjectRoot {

@@ -491,6 +491,12 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   const [isWebRemoteControlMobileViewport, setIsWebRemoteControlMobileViewport] = useState(
     getIsWebRemoteControlMobileViewport,
   );
+  // 独立云端 Web 没有 relay switcher：非桌面一律常驻手机壳层。MobileShell 在宽视口内部
+  // 直接渲染 children(wideContent)，因此常驻挂载才能在横竖屏（390px <-> 844px）切换时
+  // 不卸载组件、不丢失 currentPage === "chat"；紧凑宽度仍只在窄视口生效。
+  const isMobileWorkspaceShellActive = isWebRemoteControlShell || !isDesktop;
+  const isCompactMobileWorkspace =
+    isWebRemoteControlShell || (!isDesktop && isWebRemoteControlMobileViewport);
   const [isWebRemoteControlNavigationDragging, setIsWebRemoteControlNavigationDragging] =
     useState(false);
   const webRemoteControlNavigationHeightRef = useRef(webRemoteControlNavigationHeightPx);
@@ -916,7 +922,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   }, [isWebRemoteControlNavigationCollapsed, webRemoteControlNavigationHeightPx]);
   useEffect(() => {
     if (
-      !isWebRemoteControlShell ||
+      (isDesktop && !isWebRemoteControlShell) ||
       typeof window === "undefined" ||
       typeof window.matchMedia !== "function"
     ) {
@@ -940,7 +946,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
     return () => {
       mediaQueryList.removeListener(syncMobileViewport);
     };
-  }, [isWebRemoteControlShell]);
+  }, [isDesktop, isWebRemoteControlShell]);
 
   useEffect(() => {
     if (!isWebRemoteControlShell || typeof window === "undefined") {
@@ -1557,7 +1563,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
         showEditProject
         workspacePath={workspaceAbsPath}
         workspaceIdentity={workspaceIdentity}
-        compactForRemoteControl={isWebRemoteControlShell}
+        compactForRemoteControl={isCompactMobileWorkspace}
         onCreateTask={handleCreateTaskInChat}
         onSelectConversationWorkspace={handleSelectConversationWorkspace}
         allowRemoteWorkspace={allowRemoteWorkspace}
@@ -1579,7 +1585,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
             gitSummary={gitState.summary}
             dirtyFileCount={gitDirtyFileCount}
             onRefreshGit={handleRefreshGit}
-            compactForRemoteControl={isWebRemoteControlShell}
+            compactForRemoteControl={isCompactMobileWorkspace}
             className="px-0 pt-0"
             popoverClassName="w-72"
             branchListClassName="max-h-48"
@@ -1602,6 +1608,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       handleRefreshGit,
       handleSelectConversationWorkspace,
       handleCreateTaskInChat,
+      isCompactMobileWorkspace,
       isWebRemoteControlShell,
       onOpenRemoteWorkspace,
       onConnectRemote,
@@ -1942,13 +1949,82 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
             }
           : handleOpenSidebarFiles
       }
-      onSelectTask={handleSelectTaskInChat}
-      onStartDraftInWorkspace={handleStartDraftInWorkspaceInChat}
+      onSelectTask={
+        mobile && !isWebRemoteControlShell
+          ? (
+              targetWorkspacePath: string,
+              taskId: string,
+              targetWorkspaceIdentity?: string,
+              targetRemoteSessionId?: string,
+              expectedUnreadAt?: number,
+            ) => {
+              handleSelectTaskInChat(
+                targetWorkspacePath,
+                taskId,
+                targetWorkspaceIdentity,
+                targetRemoteSessionId,
+                expectedUnreadAt,
+              );
+              mobile.navigateToChat();
+            }
+          : handleSelectTaskInChat
+      }
+      onStartDraftInWorkspace={
+        mobile && !isWebRemoteControlShell
+          ? (
+              targetWorkspacePath: string,
+              targetWorkspaceIdentity?: string,
+              targetWorkspacePurpose?: import("@zcode/shared").WorkspacePurpose,
+              createSource?: import("@zcode/shared").SessionCreateSource,
+            ) => {
+              handleStartDraftInWorkspaceInChat(
+                targetWorkspacePath,
+                targetWorkspaceIdentity,
+                targetWorkspacePurpose,
+                createSource,
+              );
+              mobile.navigateToChat();
+            }
+          : handleStartDraftInWorkspaceInChat
+      }
       onOpenCodeViewer={handleOpenCodeViewer}
       onOpenBrowserUrl={handleOpenBrowserUrl}
       fileTreeOpenRequest={fileTreeOpenRequest}
-      onCreateTask={handleCreateTaskInChat}
-      onCreateConversationTask={onCreateConversationTask ?? handleCreateTaskInChat}
+      onCreateTask={
+        mobile && !isWebRemoteControlShell
+          ? (request?: import("./types.js").CreateTaskRequest) => {
+              const nextRequest =
+                typeof request === "string" ? { provider: request } : { ...(request ?? {}) };
+              const prevOnComplete = nextRequest.onComplete;
+              handleCreateTaskInChat({
+                ...nextRequest,
+                onComplete: () => {
+                  prevOnComplete?.();
+                  mobile.navigateToChat();
+                },
+              });
+              mobile.navigateToChat();
+            }
+          : handleCreateTaskInChat
+      }
+      onCreateConversationTask={
+        mobile && !isWebRemoteControlShell
+          ? (request?: import("./types.js").CreateTaskRequest) => {
+              const handler = onCreateConversationTask ?? handleCreateTaskInChat;
+              const nextRequest =
+                typeof request === "string" ? { provider: request } : { ...(request ?? {}) };
+              const prevOnComplete = nextRequest.onComplete;
+              handler({
+                ...nextRequest,
+                onComplete: () => {
+                  prevOnComplete?.();
+                  mobile.navigateToChat();
+                },
+              });
+              mobile.navigateToChat();
+            }
+          : (onCreateConversationTask ?? handleCreateTaskInChat)
+      }
       onCreateConversationTaskOnSource={onCreateConversationTaskOnSource}
       onOpenFolderFromWorkspaceMenu={onOpenFolderFromWorkspaceMenu}
       onOpenRemoteWorkspace={onOpenRemoteWorkspace}
@@ -1978,9 +2054,23 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       goBackShortcutLabel={goBackShortcutLabel}
       goForwardShortcutLabel={goForwardShortcutLabel}
       onOpenCommandCenter={handleOpenCommandCenter}
-      onOpenAutomations={handleOpenAutomations}
+      onOpenAutomations={
+        mobile && !isWebRemoteControlShell
+          ? () => {
+              handleOpenAutomations();
+              mobile.navigateToChat();
+            }
+          : handleOpenAutomations
+      }
       automationsActive={workspaceMainView === "automations"}
-      onOpenPluginStore={handleOpenPluginStore}
+      onOpenPluginStore={
+        mobile && !isWebRemoteControlShell
+          ? () => {
+              handleOpenPluginStore();
+              mobile.navigateToChat();
+            }
+          : handleOpenPluginStore
+      }
       pluginStoreActive={workspaceMainView === "plugin-store"}
       // 桌面没有 mobile 导航动作；内联包装曾让右侧开关穿透侧栏 memo，重复渲染全部项目。
       onWebRemoteTaskOpen={
@@ -2006,7 +2096,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   // 断点切换曾卸载查看 Reporter，伪造离开后返回并清掉手动未读。
   // 同一 Shell 持有查看与手机导航，只替换布局内容；真实 Home/后台仍立即撤销查看。
   const renderRemoteShell = (wideContent: ReactNode) =>
-    webRemoteControlWorkspaceSwitcher ? (
+    isMobileWorkspaceShellActive ? (
       <WebRemoteControlMobileShell
         isMobileViewport={isWebRemoteControlMobileViewport}
         taskViewEnabled={
@@ -2792,7 +2882,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       isWindowsDesktop={isWindowsDesktop}
       headerTestId={TID_APP_HEADER}
     >
-      {isWebRemoteControlShell ? renderRemoteShell(wideContent) : wideContent}
+      {isMobileWorkspaceShellActive ? renderRemoteShell(wideContent) : wideContent}
     </DesktopWindowFrame>
   );
 });

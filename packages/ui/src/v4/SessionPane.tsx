@@ -311,7 +311,7 @@ import { isProviderNotReadyError } from "@/lib/chatPrepareError.js";
 import { useOptionalCodingPlanUpgradeDialog } from "@/settings/CodingPlanUpgradeDialogProvider.js";
 import { setPendingSettingsSectionIntent } from "@/lib/settingsNavigation.js";
 import { useOptionalTabStore } from "@/store/TabStoreProvider.js";
-import { useIsMobileTextInputViewport } from "@/lib/mobileTextInput.js";
+import { useIsMobileCompactViewport, useIsMobileTextInputViewport } from "@/lib/mobileTextInput.js";
 import type {
   OpenPlanDetailSideTabRequest,
   OpenScopedPlanDetailSideTabRequest,
@@ -1177,6 +1177,8 @@ export function SessionPane({
     ? readOnlyDropTargetController
     : dropTargetController;
   const isMobileTextInputViewport = useIsMobileTextInputViewport();
+  // 窄屏（<=767px）无论是否带 coarse 触摸指针都按手机布局收口，避免 360/390/412px 下溢出。
+  const isMobileCompactViewport = useIsMobileCompactViewport();
 
   // 稳定回调读取的最新值经 ref 透传，避免回调依赖高频变化的 snapshot/文本。
   const snapshotRef = useRef<ConversationSnapshot | null>(snapshot);
@@ -5439,7 +5441,7 @@ export function SessionPane({
         queueEditActiveForCurrentComposer ||
         quotaBanner.state.blocksSubmit
       }
-      isWebRemoteControl={compactForRemoteControl}
+      isWebRemoteControl={compactForRemoteControl || !isDesktop}
       workspacePath={workspacePath}
       workspaceIdentity={workspaceIdentity}
       remoteSessionId={remoteSessionId ?? undefined}
@@ -5701,7 +5703,7 @@ export function SessionPane({
         onDrop={effectiveDropTargetController?.onDrop}
         className={cn(
           "relative flex h-full min-h-0 flex-col",
-          compactForRemoteControl && "min-w-0",
+          (compactForRemoteControl || !isDesktop) && "min-w-0",
         )}
       >
         {effectiveDropTargetController?.active ? (
@@ -5729,7 +5731,7 @@ export function SessionPane({
           ref={conversationLayoutContainerRef}
           className={cn(
             "@container/conversation relative flex min-h-0 flex-1 flex-col",
-            compactForRemoteControl && "min-w-0",
+            (compactForRemoteControl || !isDesktop) && "min-w-0",
           )}
         >
           {sessionId && !compactForRemoteControl ? (
@@ -5775,8 +5777,8 @@ export function SessionPane({
               endedSubagentCount={subagents.endedTotal}
               rootSessionId={rootSessionId ?? sessionId ?? undefined}
               parentSessionId={sessionId ?? undefined}
-              isWebRemoteControl={compactForRemoteControl}
-              isMobileViewport={isMobileTextInputViewport}
+              isWebRemoteControl={compactForRemoteControl || !isDesktop}
+              isMobileViewport={isMobileTextInputViewport || isMobileCompactViewport}
               layoutMode={statusPanelLayout}
               summaryPanelVariantOverride={effectiveSummaryPanelVariantOverride}
               onVariantChange={handleSummaryPanelVariantChange}
@@ -5921,7 +5923,9 @@ export function SessionPane({
                     ) : isDraft ? (
                       <div data-testid={TID_CHAT_EMPTY} className="w-full">
                         <ConversationDraftEmptyState
-                          compactForRemoteControl={compactForRemoteControl}
+                          compactForRemoteControl={
+                            compactForRemoteControl || (!isDesktop && isMobileCompactViewport)
+                          }
                         />
                       </div>
                     ) : null
@@ -5939,7 +5943,9 @@ export function SessionPane({
                       ? handleFloatingLatestTurnSummaryChange
                       : undefined
                   }
-                  compactEmptyStateWithDock={compactForRemoteControl}
+                  compactEmptyStateWithDock={
+                    compactForRemoteControl || (!isDesktop && isMobileCompactViewport)
+                  }
                   summaryPanelLayout={statusPanelLayout}
                   conversationFindQuery={!isDraft && focused ? conversationFindQuery : ""}
                   conversationFindActiveIndex={

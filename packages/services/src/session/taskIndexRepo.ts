@@ -23,7 +23,11 @@ import type {
 
 import { createServiceLogger } from "#src/logger/serviceLogger.js";
 import { getTasksIndexDatabasePath, getZCodeDataRootDir } from "#src/paths.js";
-import { projectStorage, type ProjectMigrationContext } from "#src/project-storage/index.js";
+import {
+  projectStorage,
+  type ProjectMigrationContext,
+  type ProjectRepositoryOptions,
+} from "#src/project-storage/index.js";
 import { runTasksDatabaseMigrations } from "#src/session/tasksDatabase/migrations.js";
 
 const require = createRequire(import.meta.url);
@@ -346,9 +350,13 @@ export class TaskIndexRepo {
     return this.getDatabase();
   }
 
-  async getProjectRepository() {
+  /**
+   * 项目仓储读取/写入端口。独立云端 Web 的装配层按调用传入策略，
+   * 只在显式开启时放宽远端 owner 的无项目会话与自动 root 分配。
+   */
+  async getProjectRepository(options?: ProjectRepositoryOptions) {
     await this.ensureReady();
-    return projectStorage.repository(this.getDatabase(), this.storageHostId);
+    return projectStorage.repository(this.getDatabase(), this.storageHostId, options);
   }
 
   async ensureReady(): Promise<void> {
@@ -1397,5 +1405,22 @@ export class TaskIndexRepo {
       return null;
     }
     return rowToMeta(row);
+  }
+
+  /**
+   * 归档条件删除的前置读取：只暴露 archived/deleted 组织态事实。
+   *
+   * ZCodeTaskMeta 不含 archived，而 deleteArchivedTask 会把 deleted 置 1，
+   * 因此调用方需要在写 tombstone 之前读到归档事实。返回 null 表示行不存在。
+   */
+  async getTaskIndexFlags(params: {
+    workspacePath: string;
+    workspaceIdentity?: string;
+    taskId: string;
+  }): Promise<{ archived: boolean; deleted: boolean } | null> {
+    await this.ensureReady();
+    const row = this.getTaskRow(params);
+    if (!row) return null;
+    return { archived: row.archived === 1, deleted: row.deleted === 1 };
   }
 }

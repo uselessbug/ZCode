@@ -219,7 +219,7 @@ export const ProjectSidebar = memo(function ProjectSidebar(props: ProjectSidebar
       <SidebarTooltipProvider>
         <aside data-testid={TID_SIDEBAR} className="flex h-full min-h-0 flex-col overflow-hidden">
           <div
-            className={`h-12 shrink-0 [app-region:drag] ${props.isWebRemoteControl ? "max-md:hidden" : ""}`}
+            className={`h-12 shrink-0 [app-region:drag] ${props.isWebRemoteControl || !props.isDesktop ? "max-md:hidden" : ""}`}
           />
           {/* 内联改名聚焦曾把 hidden 容器横向滚动，导致手机整栏左移；滑动面板只裁切，不允许焦点滚动。 */}
           <div className="relative min-h-0 flex-1 overflow-clip">

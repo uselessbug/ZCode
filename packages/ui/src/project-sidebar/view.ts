@@ -269,5 +269,12 @@ export function formatProjectError(
   if (code === "remote-project.host-removed") return formatMessage({ id: "project.hostRemoved" });
   if (code === "project.connection-unavailable")
     return formatMessage({ id: "project.connectionUnavailable" });
+  // remote owner 的存储策略错误必须以可读文案呈现，不能把原始错误码丢给用户。
+  if (code === "project.remote-single-root-required")
+    return formatMessage({ id: "project.remoteSingleRootRequired" });
+  if (code === "project.remote-project-required")
+    return formatMessage({ id: "project.remoteProjectRequired" });
+  if (code === "project.remote-root-immutable")
+    return formatMessage({ id: "project.remoteRootImmutable" });
   return String(cause);
 }

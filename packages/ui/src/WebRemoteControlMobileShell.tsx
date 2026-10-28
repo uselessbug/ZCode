@@ -76,7 +76,7 @@ export function WebRemoteControlMobileShell({
 }: {
   children?: ReactNode;
   isMobileViewport?: boolean;
-  switcher: WebRemoteControlWorkspaceSwitcherApi;
+  switcher?: WebRemoteControlWorkspaceSwitcherApi;
   activeWorkspacePath: string;
   activeWorkspaceIdentity?: string;
   activeTaskId: string | null;

@@ -2964,13 +2964,20 @@ export function createZCodeTaskServiceAdapter(
     },
 
     async deleteArchivedTask(params): Promise<boolean> {
-      const meta = await taskIndexRepo.deleteArchivedTask(params);
-      if (!meta) return false;
+      // Bug 根因：原顺序先 taskIndexRepo.deleteArchivedTask（立即把 deleted 置 1）再让 CLI 删除。
+      // mutateSessionFacts 抛错时 SQLite 已被改成 deleted=1，刷新后失败项消失且无法重试。
+      // 修复：先读归档事实，再让 CLI 接受删除事实，最后才写 tombstone。
+      const flags = await taskIndexRepo.getTaskIndexFlags(params);
+      if (!flags || flags.deleted || !flags.archived) return false;
       await taskIndexSyncer.mutateSessionFacts(
         { ...params, sessionId: params.taskId },
         { type: "delete" },
       );
-      emitWorkspaceTaskListChanged(params, meta, "task_deleted");
+      // CLI 成功后写 tombstone 并置 handoff_pending。mutateSessionFacts 的对账可能已按
+      // CLI deleted 事实把该行置 deleted=1，此时 deleteArchivedTask 返回 null；
+      // 删除事实已成立，仍按成功处理并广播，避免刷新/重连把任务复活。
+      const meta = await taskIndexRepo.deleteArchivedTask(params);
+      emitWorkspaceTaskListChanged(params, meta ?? undefined, "task_deleted");
       return true;
     },
 
@@ -2991,15 +2998,17 @@ export function createZCodeTaskServiceAdapter(
         };
         try {
           // 保留逐项事务与归档 guard：一项失败不能回滚其它成功项，也不能提前隐藏失败项。
-          const meta = await taskIndexRepo.deleteArchivedTask(target);
-          if (!meta) {
+          const flags = await taskIndexRepo.getTaskIndexFlags(target);
+          if (!flags || flags.deleted || !flags.archived) {
             result.skippedTaskIds.push(taskId);
             continue;
           }
+          // 先 CLI 后 tombstone：CLI 抛错时 repo 未被写成 deleted=1，失败项刷新后仍在归档列表。
           await taskIndexSyncer.mutateSessionFacts(
             { ...target, sessionId: taskId },
             { type: "delete" },
           );
+          await taskIndexRepo.deleteArchivedTask(target);
           result.deletedTaskIds.push(taskId);
         } catch (error) {
           result.failedTaskIds.push(taskId);

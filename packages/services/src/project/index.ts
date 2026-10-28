@@ -72,6 +72,16 @@ const saveProjectSchema = z
     "project.restore-roots-required",
   );
 
+/** 自动分配的项目目录名：只保留路径安全字符，非 ASCII 名称退化为 project，唯一性由 id 前缀保证。 */
+function sanitizeStandaloneDirectoryName(value: string): string {
+  const sanitized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return sanitized || "project";
+}
+
 export function createProjectService(options: {
   repository(): Promise<ProjectRepositoryContract>;
   workspaceDirectory: string;
@@ -80,6 +90,12 @@ export function createProjectService(options: {
   /** 只解析现有连接；连接缺失拒绝，不创建替代 Host。 */
   resolveHost?: (hostId: string) => Promise<IProjectService>;
   afterChange?: () => Promise<void>;
+  /**
+   * 独立云端 Web 的工作区策略。只在显式开启时支持无 projectId 的非项目工作模式，
+   * 以及在配置的工作区根下为 0 目录新建项目自动分配专用 root。
+   */
+  allowStandaloneCloudWorkspaces?: boolean;
+  standaloneWorkspaceRoot?: string;
 }): IProjectService {
   const route = async (hostId?: string) => {
     if (!hostId || hostId === (options.ownerHostId ?? "local")) return null;
@@ -90,6 +106,9 @@ export function createProjectService(options: {
   const changed = async () => {
     await options.afterChange?.();
   };
+  // 独立云端工作区根：与容器实际工作区一致，避免把项目/对话目录建到进程内部 home。
+  const standaloneWorkspaceRoot = () => options.standaloneWorkspaceRoot?.trim() || "/workspace";
+  const standaloneCloudWorkspaces = () => Boolean(options.allowStandaloneCloudWorkspaces);
   const service: IProjectService = {
     async readDirectory(params = {}) {
       const input = z
@@ -144,7 +163,7 @@ export function createProjectService(options: {
       input = saveProjectSchema.parse(input);
       const remote = await route(input.hostId);
       if (remote) return remote.saveProject(input);
-      const roots = input.roots
+      const providedRoots = input.roots
         ? [
             ...new Set(
               input.roots.map((path) => {
@@ -154,8 +173,33 @@ export function createProjectService(options: {
             ),
           ]
         : undefined;
+      let roots = providedRoots;
+      const remoteOwner = Boolean(options.ownerHostId && options.ownerHostId !== "local");
+      if (remoteOwner && standaloneCloudWorkspaces() && (providedRoots?.length ?? 0) === 0) {
+        // 0 目录新建项目：在独立云端工作区根下自动分配专用目录并固定为唯一 root。
+        // 已有 root 的项目沿用既有 root（幂等重试），不能重新分配，否则触发 remote-root-immutable。
+        const existing = input.id
+          ? (await options.repository())
+              .readTree({ includeTasks: false })
+              .projects.find((item) => item.id === input.id)
+          : undefined;
+        const previousRoots = existing?.roots.map((root) => root.rootPath) ?? [];
+        if (previousRoots.length > 0) roots = previousRoots;
+        else {
+          const allocatedRoot = join(
+            standaloneWorkspaceRoot(),
+            "projects",
+            `${sanitizeStandaloneDirectoryName(
+              input.name ?? input.defaultName ?? "project",
+            )}-${input.id ? input.id.slice(0, 8) : randomUUID().slice(0, 8)}`,
+          );
+          await mkdir(allocatedRoot, { recursive: true });
+          roots = [allocatedRoot];
+        }
+      }
+      // 只校验调用方显式传入的目录；自动分配的目录刚由 mkdir 创建，沿用的 root 此前已存在。
       await Promise.all(
-        (roots ?? []).map(async (path) => {
+        (providedRoots ?? []).map(async (path) => {
           if (!(await stat(path)).isDirectory()) throw new Error("project.directory-required");
         }),
       );
@@ -208,14 +252,20 @@ export function createProjectService(options: {
       const id = params?.projectId;
       const remoteOwner = Boolean(options.ownerHostId && options.ownerHostId !== "local");
       // 旧入口可绕过项目直接在远端 mkdir；必须在目录或会话副作用之前拒绝。
-      if (remoteOwner && !id) throw new Error("project.remote-project-required");
+      // 独立云端 Web 显式开启非项目模式时才允许无 projectId 的会话，其它远端 owner 维持拒绝。
+      if (remoteOwner && !id && !standaloneCloudWorkspaces())
+        throw new Error("project.remote-project-required");
       if (id && creationFlights.has(id)) return creationFlights.get(id)!;
       const flight = (async (): Promise<ProjectDirectories> => {
         if (!id) {
           // 草稿 ID 在客户端先落盘；重复点击、回包丢失与重启重试都准备同一目录。
           // 无 draftId 的自动化/Bots 等调用仍独立分配，不能全局复用最近目录。
+          // 独立云端非项目会话落在工作区根下的专用对话目录；普通本地模式沿用原 workspaceDirectory。
+          const baseDirectory = standaloneCloudWorkspaces()
+            ? join(standaloneWorkspaceRoot(), ".zcode", "conversations")
+            : options.workspaceDirectory;
           const path = join(
-            options.workspaceDirectory,
+            baseDirectory,
             draftId ? `draft-${draftId}` : `${Date.now()}-${randomUUID()}`,
           );
           // 已交付的目录若被移走，只报告缺失；不能用 mkdir 静默重建空目录。
@@ -234,7 +284,10 @@ export function createProjectService(options: {
           throw new Error("project.remote-single-root-required");
         if (!project.roots.length) {
           // 多窗口为同一空项目生成同一个目录，不依赖进程间定时锁。
-          const path = join(options.workspaceDirectory, id);
+          // 独立云端项目目录必须落在配置的工作区根下，不能建到进程内部 home。
+          const path = standaloneCloudWorkspaces()
+            ? join(standaloneWorkspaceRoot(), "projects", id)
+            : join(options.workspaceDirectory, id);
           await mkdir(path, { recursive: true });
           // 空判断和 INSERT 必须共用写事务，防止另一 Host 的 roots 编辑被覆盖。
           project = repo.initializeProjectRoot(id, path);
@@ -292,6 +345,9 @@ export function bindRemoteProjectIdentities(
         ...new Set([
           ...tree.projects.flatMap((project) => project.roots.map((root) => root.rootPath)),
           ...tree.tasks.map((task) => task.workspacePath),
+          // 删除事实也要解析身份：分组仓储的墓碑键与活动任务同源，漏掉会让删除投影
+          // 用路径当 key，与 admit 写入的 workspace_key 分叉。
+          ...(tree.deletedTasks ?? []).map((task) => task.workspacePath),
         ]),
       ];
       const identities = new Map(
@@ -303,6 +359,14 @@ export function bindRemoteProjectIdentities(
           ...task,
           workspaceIdentity: identities.get(task.workspacePath)!,
         })),
+        ...(tree.deletedTasks
+          ? {
+              deletedTasks: tree.deletedTasks.map((task) => ({
+                ...task,
+                workspaceIdentity: identities.get(task.workspacePath)!,
+              })),
+            }
+          : {}),
       };
     },
     readDirectory: (params) => service.readDirectory(params),

@@ -121,6 +121,7 @@ import {
   resolveChatEnterShortcut,
   resolveChatEnterSubmits,
   shouldAvoidIosInputFocusZoom,
+  useIsMobileCompactViewport,
   useIsMobileTextInputViewport,
 } from "@/lib/mobileTextInput.js";
 import { appendPromptHistoryEntry } from "@/lib/promptHistory.js";
@@ -723,6 +724,8 @@ function ConversationComposerImpl({
   const commandResolutionCleanupsRef = useRef(new Set<() => void>());
   const reportedErrorKeysRef = useRef(new Set<string>());
   const isMobileTextInputViewport = useIsMobileTextInputViewport();
+  // 窄屏（<=767px）无论是否带 coarse 触摸指针都按手机输入控件收口，避免三行占位符遮挡工具栏。
+  const isMobileCompactViewport = useIsMobileCompactViewport();
   const primaryModifierPressed = usePrimaryFollowupModifier();
   const appleKeyboardPlatform = isAppleKeyboardPlatform();
   // Bugfix：M3 删除旧 ChatView 后，M5 只恢复了桌面端的 false 硬编码，已登记的手机远控
@@ -740,7 +743,8 @@ function ConversationComposerImpl({
   });
   // Bugfix：手机远控把完整能力说明放进绝对定位 placeholder 后，三行英文会越过
   // 40px 编辑区并覆盖工具栏。手机端改用短文案并限制两行；桌面端继续保留完整提示。
-  const compactMobilePlaceholder = isWebRemoteControl && isMobileTextInputViewport;
+  const compactMobilePlaceholder =
+    isWebRemoteControl && (isMobileTextInputViewport || isMobileCompactViewport);
   const sendShortcut = resolveChatEnterShortcut({ enterSubmits });
   const updateText = useCallback(
     (next: string) => {

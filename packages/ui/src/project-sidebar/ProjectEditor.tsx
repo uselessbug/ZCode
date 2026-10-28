@@ -140,6 +140,12 @@ export function ProjectEditor({
   const hostId =
     project?.hostId ?? fixedFolder?.hostId ?? host?.id ?? (devices ? selectedDeviceId : undefined);
   const remote = Boolean(hostId && hostId !== "local");
+  // 能力必须来自当前平台而不是 hostId 标签：独立云端 Web 的 host alias 会把 owner 显示为
+  // "local"，但存储策略仍是 remote owner（单 root、root 固定）。缺少本机目录选择器即说明
+  // 这是云端 Web，前端要和后端 remote policy 保持一致，避免提交后才报原始错误码。
+  const nativeDirectoryPicker = Boolean(platform?.selectDirectories);
+  const isStandaloneWeb = !nativeDirectoryPicker && !remote;
+  const singleRootMode = remote || isStandaloneWeb;
   const msg = (id: string) => intl.formatMessage({ id: `project.${id}` });
   const [name, setName] = useState(
     project?.name ?? (fixedFolder ? getPathLeaf(fixedFolder.path) : ""),
@@ -207,11 +213,13 @@ export function ProjectEditor({
   };
   const addRoots = (values: string[]) => {
     if (remote && project) return;
-    const next = remote
+    // 单 root 模式（真实远端 Source 与独立云端 Web）最多保留 1 个目录，
+    // 防止选多个目录触发后端 remote-single-root-required。
+    const next = singleRootMode
       ? values.filter(Boolean).slice(0, 1)
       : [...new Set([...roots, ...values.filter(Boolean)])];
     setRoots(next);
-    if (remote || !roots.length) setPrimary(next[0] ?? "");
+    if (singleRootMode || !roots.length) setPrimary(next[0] ?? "");
     setBrowsing(false);
   };
   const browse = async () => {
@@ -605,7 +613,7 @@ export function ProjectEditor({
                             {msg("setPrimary")}
                           </Button>
                         )}
-                        {!fixedFolder && (!remote || !project) ? (
+                        {!fixedFolder && (!singleRootMode || !project) ? (
                           <Button
                             size="icon-sm"
                             variant="ghost"
@@ -623,7 +631,7 @@ export function ProjectEditor({
                         ) : null}
                       </div>
                     ))}
-                    {!fixedFolder && (!remote || !project) ? (
+                    {!fixedFolder && (!singleRootMode || !project) ? (
                       <button
                         type="button"
                         data-testid="virtual-project-browse"
@@ -666,6 +674,12 @@ export function ProjectEditor({
                     ) : null}
                   </div>
                 </fieldset>
+                {isStandaloneWeb && !project && !roots.length ? (
+                  // 独立云端 Web 允许只填名称创建项目：说明未选目录时服务器会自动分配专用目录。
+                  <p className="text-ui-sm text-foreground-subtle">
+                    {msg("standaloneAutoRootHint")}
+                  </p>
+                ) : null}
                 {legacyDeviceId === hostId ? (
                   <p className="text-ui-sm text-foreground-subtle">
                     {msg("legacyUpgradeRequired")}

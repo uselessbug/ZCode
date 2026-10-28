@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type {
   WindowHostControllerTaskListItem,
+  ZCodeTaskListItem,
   ZCodeTaskListKind,
   ZCodeTaskListWorkspaceScope,
 } from "@zcode/services";
@@ -17,6 +18,18 @@ type GlobalTaskListItem = WindowHostControllerTaskListItem;
 
 const subscribeToNothing = () => () => {};
 const zeroRevision = () => 0;
+
+/** 独立 Web 回退路径没有 live overlay；与桌面投影一致地按持久 status 派生只读状态。 */
+function defaultLiveStatus(meta: ZCodeTaskListItem): GlobalTaskListItem["liveStatus"] {
+  switch (meta.status) {
+    case "completed":
+      return "completed";
+    case "error":
+      return "error";
+    default:
+      return "idle";
+  }
+}
 
 function buildWorkspaceScopes(workspaceTabs: WorkspaceTabState[]): ZCodeTaskListWorkspaceScope[] {
   const scopes = new Map<string, ZCodeTaskListWorkspaceScope>();
@@ -129,6 +142,23 @@ export function useGlobalTaskList(params: {
   );
   const queryKey = useMemo(() => JSON.stringify(query), [query]);
 
+  // 独立 Web 的 Host 不注册 window-controller；同一 tasks-index 由 zcodeTaskService 暴露，
+  // 回退查询保持完全相同的 query 契约（kind/workspaceScopes/sortBy/search/limit）。
+  const listTaskListViaService = useCallback(async () => {
+    const result = await baseServices.zcodeTaskService.listTaskList(query);
+    return {
+      items: result.items.map(
+        (item): GlobalTaskListItem => ({
+          ...item,
+          sourceAvailability: "online",
+          liveStatus: defaultLiveStatus(item),
+        }),
+      ),
+      total: result.total,
+      hasMore: result.hasMore,
+    };
+  }, [baseServices.zcodeTaskService, query]);
+
   const load = useCallback(
     async (version: WindowControllerTaskListVersion) => {
       const requestSerial = ++requestSerialRef.current;
@@ -140,15 +170,11 @@ export function useGlobalTaskList(params: {
         setLoading(false);
         return;
       }
-      if (!controllerRegistry) {
-        // 原子切换后 base attachment 必须提供 Controller；缺失代表 Host/Renderer 版本不一致。
-        logger.error("[useGlobalTaskList] window Host Controller channel unavailable");
-        setLoading(false);
-        return;
-      }
       setLoading(true);
       try {
-        const result = await controllerRegistry.list(queryKey, version, query);
+        const result = controllerRegistry
+          ? await controllerRegistry.list(queryKey, version, query)
+          : await listTaskListViaService();
         if (requestSerialRef.current !== requestSerial) {
           return;
         }
@@ -168,8 +194,8 @@ export function useGlobalTaskList(params: {
         setHasMore(result.hasMore);
       } catch (error) {
         if (requestSerialRef.current === requestSerial) {
-          // Controller 查询失败时保留最后可信列表，避免单 source 异常清空其他 workspace。
-          logger.error(`[useGlobalTaskList] Controller 加载 ${params.kind} 列表失败`, error);
+          // 查询失败时保留最后可信列表，避免单 source 异常清空其他 workspace。
+          logger.error(`[useGlobalTaskList] 加载 ${params.kind} 列表失败`, error);
         }
       } finally {
         if (requestSerialRef.current === requestSerial) {
@@ -177,7 +203,7 @@ export function useGlobalTaskList(params: {
         }
       }
     },
-    [controllerRegistry, params.kind, query, queryKey, workspaceScopes],
+    [controllerRegistry, listTaskListViaService, params.kind, query, queryKey, workspaceScopes],
   );
 
   const refresh = useCallback(async () => {
@@ -200,6 +226,24 @@ export function useGlobalTaskList(params: {
       workspaceSourceGenerationSignature,
     });
   }, [controllerRevision, load, taskListVersionSignature, workspaceSourceGenerationSignature]);
+
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+  useEffect(() => {
+    // 独立 Web 无 Controller 时没有 Controller frame 触发重查；直接订阅每个 scope 的
+    // workspace 任务变更事件，让顶栏置顶状态（WorkspaceHeaderSections）与全局搜索在
+    // 归档、取消归档、删除、重命名后刷新。桌面路径继续由 Controller registry 驱动。
+    const subscriptions = controllerRegistry
+      ? []
+      : workspaceScopes.map((scope) =>
+          baseServices.zcodeTaskService.onDynamicWorkspaceEvent(scope)((event) => {
+            if (event.type === "workspace_task_list_changed") void refreshRef.current();
+          }),
+        );
+    return () => {
+      subscriptions.forEach((subscription) => subscription.dispose());
+    };
+  }, [baseServices.zcodeTaskService, controllerRegistry, workspaceScopes]);
 
   const hasRemoteScope = params.workspaceTabs.some((tab) => Boolean(tab.workspaceIdentity));
   return {

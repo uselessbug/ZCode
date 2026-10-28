@@ -19,7 +19,13 @@ import {
 export { createLegacySingleRootProjectService } from "#src/project/index.js";
 export { createRemoteProjectService } from "#src/remote-projects/index.js";
 import { getZCodeDataRootDir as projectDataRoot } from "#src/paths.js";
-import { createTaskGroupService, ITaskGroupService, groupTaskKey } from "#src/task-groups/index.js";
+import type { ProjectRepositoryOptions } from "#src/project-storage/index.js";
+import {
+  createTaskGroupService,
+  ITaskGroupService,
+  groupTaskKey,
+  resolveTaskGroupOwnerHostId,
+} from "#src/task-groups/index.js";
 import { IGenUiService } from "./gen-ui/contract.js";
 import { createGenUiService } from "./gen-ui/node.js";
 import { channelReplyHostRequestSchema, channelReplyResultSchema } from "@zcode/shared";
@@ -1249,6 +1255,13 @@ export function createLocalServices(options: {
   serviceAuthorityMode?: ServiceAuthorityMode;
   /** 可信 Server Core 注入，区分物理持库 Host 与历史 workspace canonical route。 */
   projectStorageHostId?: string;
+  /**
+   * 独立云端 Web 显式开启时，允许无 projectId 的非项目工作模式，
+   * 并允许在 standaloneWorkspaceRoot 下为 0 目录新建项目自动分配唯一 root。
+   */
+  allowStandaloneCloudWorkspaces?: boolean;
+  /** 独立云端工作区根；缺省 /workspace。 */
+  standaloneWorkspaceRoot?: string;
   sourceServerWorkspaceService?: ISourceServerWorkspaceService;
   resolveProjectHostService?: (hostId: string) => Promise<IProjectService>;
   /** Bot 复用窗口已有 Source 连接；不经 main 创建 workspace attachment。 */
@@ -2170,6 +2183,14 @@ export function createLocalServices(options: {
     database: () => taskIndexRepo.getOrganizationDatabase(),
     afterChange: publishProjectChange,
   });
+  // 独立云端 Web 的仓储策略：只在装配层显式开启时传给 project 仓储与 project 服务。
+  const projectRepositoryOptions: ProjectRepositoryOptions | undefined =
+    options?.allowStandaloneCloudWorkspaces
+      ? {
+          allowStandaloneCloudWorkspaces: true,
+          standaloneWorkspaceRoot: options.standaloneWorkspaceRoot?.trim() || "/workspace",
+        }
+      : undefined;
   const projectService = createProjectService({
     directories: {
       home: async () => (await systemService.info()).homedir,
@@ -2177,31 +2198,51 @@ export function createLocalServices(options: {
     },
     ownerHostId: options?.projectStorageHostId,
     resolveHost: options?.resolveProjectHostService,
-    repository: () => taskIndexRepo.getProjectRepository(),
+    repository: () => taskIndexRepo.getProjectRepository(projectRepositoryOptions),
     workspaceDirectory: join(projectDataRoot(), "workspace"),
     afterChange: publishProjectChange,
+    allowStandaloneCloudWorkspaces: options?.allowStandaloneCloudWorkspaces,
+    standaloneWorkspaceRoot: options?.standaloneWorkspaceRoot,
   });
   const taskGroupService = createTaskGroupService({
     database: () => taskIndexRepo.getOrganizationDatabase(),
+    // 独立云端 Web 的 owner Host 与本地别名只在装配层显式开启时生效。
+    ownerHostId: options?.projectStorageHostId,
+    allowStandaloneLocalHostAlias: Boolean(options?.allowStandaloneCloudWorkspaces),
     resolveTasks: async (refs) => {
       // 只读所属 Host 的权威目录；项目路由不会为分组建立连接或启动 Agent。
-      const hostIds = [...new Set(refs.map((task) => task.hostId))];
+      const allowAlias = Boolean(options?.allowStandaloneCloudWorkspaces);
+      const ownerHostId = options?.projectStorageHostId;
+      const ownerHostIdOf = (hostId: string) =>
+        resolveTaskGroupOwnerHostId(hostId, ownerHostId, allowAlias);
+      const hostIds = [...new Set(refs.map((ref) => ownerHostIdOf(ref.hostId)))];
       const results = await Promise.all(
-        hostIds.map(async (hostId) => {
-          const tree = await projectService.readTree({ hostId, includeDeletedTasks: true });
-          const facts = new Map(
-            [
-              ...tree.tasks,
-              ...(tree.deletedTasks ?? []).map((task) => ({ ...task, deleted: true })),
-            ].map((task) => [groupTaskKey(task), task]),
-          );
+        hostIds.map(async (targetHostId) => {
+          const tree = await projectService.readTree({
+            hostId: targetHostId,
+            includeDeletedTasks: true,
+          });
+          const facts = [
+            // 两个分支都显式带 deleted，避免联合类型上访问不到该字段。
+            ...tree.tasks.map((task) => ({ ...task, deleted: false })),
+            ...(tree.deletedTasks ?? []).map((task) => ({ ...task, deleted: true })),
+          ];
           return refs
-            .filter((ref) => ref.hostId === hostId)
+            .filter((ref) => ownerHostIdOf(ref.hostId) === targetHostId)
             .flatMap((ref) => {
-              const fact = facts.get(groupTaskKey(ref));
-              return fact && fact.hostId === ref.hostId && fact.workspacePath === ref.workspacePath
-                ? [{ ...fact, ...ref }]
-                : [];
+              const key = groupTaskKey(ref);
+              let fact = facts.find((task) => groupTaskKey(task) === key);
+              if (!fact && allowAlias)
+                fact = facts.find(
+                  (task) =>
+                    task.taskId === ref.taskId && task.workspacePath === ref.workspacePath,
+                );
+              if (!fact) return [];
+              // 只回传 Host 的权威事实：绝不用请求侧 hostId/identity 覆盖存储键，
+              // 否则仓储写入的 workspace_key 与前端 tree.tasks 的 taskGroupKey 会分叉。
+              if (ownerHostIdOf(fact.hostId) !== targetHostId || fact.workspacePath !== ref.workspacePath)
+                return [];
+              return [{ ...fact, deleted: Boolean(fact.deleted) }];
             });
         }),
       );
@@ -2217,7 +2258,9 @@ export function createLocalServices(options: {
   const zcodeAgentService = createZCodeAgentService({
     prepareProjectExecution,
     prepareSessionCreation: async (target) =>
-      (await taskIndexRepo.getProjectRepository()).reserveCreatedTask({
+      (
+        await taskIndexRepo.getProjectRepository(projectRepositoryOptions)
+      ).reserveCreatedTask({
         task: { ...target, taskId: target.sessionId },
         projectId: target.projectId,
         additionalDirectories: target.additionalDirectories,
@@ -3245,6 +3288,8 @@ export async function createServerHostServices(options: {
     },
   });
   const migrationFailedPathCount = await workspaceAliasRepo.getFailedPathCount();
+  // 独立云端 Web 兼容开关：只在显式配置时开放非项目工作模式与 0 目录项目自动 root。
+  const standaloneWebCompat = process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1";
   const services = createLocalServices({
     zcodeBuiltinProviderConfigFilePath: options.zcodeBuiltinProviderConfigFilePath,
     providerProvisioningTargetEnabled: options.providerProvisioningTargetEnabled,
@@ -3252,6 +3297,8 @@ export async function createServerHostServices(options: {
     topicResourceRelayChannel: options.topicResourceRelayChannel,
     projectStorageHostId,
     sourceServerWorkspaceService,
+    allowStandaloneCloudWorkspaces: standaloneWebCompat,
+    standaloneWorkspaceRoot: process.env.ZCODE_DEFAULT_WORKSPACE_DIR?.trim() || "/workspace",
   });
   return { services, workspaceIdentityMapper, migrationFailedPathCount };
 }
