@@ -1,3 +1,5 @@
+> 本规格描述已直接集成到当前源码的独立 Web 行为。下文的基础版本和补丁顺序仅是历史背景；构建使用本仓库当前源码，不再应用外部覆盖补丁。
+
 # Standalone Web mobile usability and existing server capabilities
 
 Use the official WebRemoteControlMobileShell Home/Chat navigation. Do not fake a relay switcher, desktop identity or second service owner. Only narrow Web views get compact chat controls; desktop Web keeps its full layout. Preserve task-group ownership fixes, sessions, model settings, Access and Caddy.

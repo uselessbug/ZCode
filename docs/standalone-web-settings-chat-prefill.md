@@ -1,3 +1,5 @@
+> 本规格描述已直接集成到当前源码的独立 Web 行为。下文的基础版本和补丁顺序仅是历史背景；构建使用本仓库当前源码，不再应用外部覆盖补丁。
+
 # 独立 Web 设置入口的手机草稿导航
 
 新建技能与插件试用均沿现有 Root 新任务路径：prepareSession 成功 → startDraftInWorkspace → 持久化预填草稿并发布 composerTextInsertRequest。普通独立 Web 没有官方 relay 的 openProjectDraft(chat) 回调，手机 Home 不挂载 Composer，预填请求虽已存储却无人消费。

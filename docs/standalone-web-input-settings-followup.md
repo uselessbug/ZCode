@@ -1,3 +1,5 @@
+> 本规格描述已直接集成到当前源码的独立 Web 行为。下文的基础版本和补丁顺序仅是历史背景；构建使用本仓库当前源码，不再应用外部覆盖补丁。
+
 # 独立 Web 输入与设置收口：长文本粘贴附件与内置子代理模型选择器手机尺寸
 
 固定上游 3c5b227649371507ddc4eb46ac5133afe6db1cab（3.16.2）。本 spec 覆盖两个独立的小范围收口：
@@ -5,7 +7,7 @@
 1. **Composer 长文本粘贴**：普通 Web（无 desktop host）粘贴 ≥15360 字符文本时，当前先 `preventDefault` 再调用 `platform.createTempTextAttachment`，因该平台方法缺失而失败，长文本既没进输入框也没变成附件。
 2. **设置页内置子代理行**：内置子代理行内 model / effort 覆盖控件的 `ModelConfigSelect` 未传 `isMobileViewport`，手机（≤767px）下拉菜单项仍按桌面 32px 渲染。
 
-连接生命周期见 `deploy/specs/standalone-web-recovery.md`，设置页服务边界与单栏布局见 `deploy/specs/standalone-web-settings.md`。本 spec 不改上传协议、不改模型/推理强度/Provider 存储、不改全局样式。
+连接生命周期见 [连接恢复](standalone-web-recovery.md)，设置页服务边界与单栏布局见 `deploy/specs/standalone-web-settings.md`。本 spec 不改上传协议、不改模型/推理强度/Provider 存储、不改全局样式。
 
 ## 状态所有者与接口
 
