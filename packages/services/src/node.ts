@@ -11,6 +11,7 @@ export {
   prepareRemoteServerConnection,
 } from "#src/remote-projects/index.js";
 import {
+  createProjectDataPort,
   createProjectService,
   createTaskAutoArchiveScheduler,
   IProjectService,
@@ -28,7 +29,7 @@ import {
 } from "#src/task-groups/index.js";
 import { IGenUiService } from "./gen-ui/contract.js";
 import { createGenUiService } from "./gen-ui/node.js";
-import { channelReplyHostRequestSchema, channelReplyResultSchema } from "@zcode/shared";
+// import { channelReplyHostRequestSchema, channelReplyResultSchema } from "@zcode/shared";
 /* eslint-disable max-lines -- host process 服务注册和启动装配需要集中维护，拆散后会更难追踪依赖注入顺序 */
 // Node.js service implementations — NOT safe to import in browser code
 import { randomBytes } from "node:crypto";
@@ -49,7 +50,7 @@ import {
 import {
   buildLocalMediaPreviewUrl,
   type DynamicWorkflowMode,
-  type ProviderProvisioningTrigger,
+  type ProviderProvisioningSourceTrigger,
 } from "@zcode/shared";
 
 export {
@@ -111,6 +112,12 @@ export type {
   FsFaultRuleConfig,
   InjectedFsFaultError,
 } from "./fs/fsFaultInjection.js";
+// config.json 多写入方共用的「严格读取 + 写前重读 + 原子替换（0600）」（主进程 MCP 设置页也用）。
+export {
+  JsonObjectFileUnreadableError,
+  readJsonObjectFileForUpdate,
+  updateJsonObjectFile,
+} from "./fs/atomicFileUtils.js";
 export {
   setDataBaseDir,
   getDataBaseDir,
@@ -285,6 +292,8 @@ export { createClientConfigService } from "./client-config/clientConfigService.j
 export { createClientScenesService } from "./client-scenes/clientScenesService.js";
 export { createSkillsService } from "./skills/skillsService.js";
 export { createSkillSyncService } from "./skill-sync/skillSyncService.js";
+export { createDeviceSyncStateService, createUserConfigSyncService } from "./data-sync/node.js";
+export { createHostProviderProvisioningStatus } from "./provider-provisioning-status/node.js";
 export { createMcpSyncService } from "./mcp-sync/mcpSyncService.js";
 export { createPluginSyncService } from "./plugin-sync/pluginSyncService.js";
 export { createPluginsService } from "./plugins/pluginsService.js";
@@ -402,6 +411,8 @@ import { ISkillsService } from "./skills/skills.js";
 import { ISkillSyncService } from "./skill-sync/skillSync.js";
 import { IMcpSyncService } from "./mcp-sync/mcpSync.js";
 import { IPluginSyncService } from "./plugin-sync/pluginSync.js";
+import { IUserConfigSyncService } from "./data-sync/contract.js";
+import { createUserConfigSyncService } from "./data-sync/userConfigSyncService.js";
 import { IPluginsService } from "./plugins/plugins.js";
 import { IPluginManagementService } from "./plugins/pluginManagement.js";
 import { ISubagentsService } from "./subagents/subagents.js";
@@ -418,6 +429,7 @@ import type { WorkspaceFileSearchFilter } from "./file/workspaceFileMentionFilte
 import { createGitService } from "./git/gitService.js";
 import { GitCommitMessageGenerator } from "./git/gitCommitMessageGenerator.js";
 import { createGitCheckpointService } from "./git/gitCheckpointService.js";
+import { getWorkspaceCheckpointDirectory } from "./git/repo/gitCheckpointStore.js";
 import { createSystemService } from "./system/systemService.js";
 import { createTerminalService } from "./terminal/terminalService.js";
 import {
@@ -545,6 +557,7 @@ import {
 import { ensureAppCaCert } from "./runtime-tools/appCaCert.js";
 import { buildHelperOpenArgs, isCuaLocalDevelopmentRuntime } from "@zcode/zcode-cua/broker/server";
 import { createServiceLogger, type ServiceLogger } from "#src/logger/serviceLogger.js";
+import { ensureTelemetryDeviceMid } from "#src/telemetry/telemetryCore.js";
 import { IOffPeakTaskService } from "./session/offPeakTask.js";
 import type { HighspeedMockScenario } from "@zcode/shared";
 import { IHighspeedCardService } from "./highspeed/highspeedCard.js";
@@ -1249,9 +1262,7 @@ export function createLocalServices(options: {
   /** HTTP Server 只有在调用方明确配置认证时才暴露跨 Environment Provisioning target。 */
   providerProvisioningTargetEnabled?: boolean;
   /** Desktop Host 私有通知；只在 Source 成功持久化后请求 Main 调度远端镜像。 */
-  onProviderProvisioningSourceChanged?: (
-    trigger: Exclude<ProviderProvisioningTrigger, "environment-online">,
-  ) => void;
+  onProviderProvisioningSourceChanged?: (trigger: ProviderProvisioningSourceTrigger) => void;
   serviceAuthorityMode?: ServiceAuthorityMode;
   /** 可信 Server Core 注入，区分物理持库 Host 与历史 workspace canonical route。 */
   projectStorageHostId?: string;
@@ -1664,6 +1675,7 @@ export function createLocalServices(options: {
   const mcpSyncService = createMcpSyncService({
     // mcp/list 的 host 消费点收拢到 mcpSync 服务；真实状态检查仍在 agent 进程。
     listMcpServerStatuses: (params) => zcodeAgentService.listMcpServerStatuses(params),
+    setWorkspaceMcpTrust: (params) => zcodeAgentService.setWorkspaceMcpTrust(params),
   });
   const pluginSyncService = createPluginSyncService();
   const pluginUiAccounts = createPluginUiAccountBindings({
@@ -1867,10 +1879,15 @@ export function createLocalServices(options: {
     // Helper 启动参数统一由 buildHelperOpenArgs 构造，避免多处手写导致漏传或漂移。
     // 设置页只读权限探测不承载 PiP，不传 --launcher-pid 和 --pip-mode；
     // exit-log 使用 .settings.exit.log。新增参数应定义在 HelperLaunchSpec 中供调用方共用。
+    // ghostCursorOverlay 必须传：overlay 是进程级开关，Helper 常驻，设置页先拉起后
+    // 真实 CUA 动作会复用同一进程 —— 漏传则整轮操作没有虚拟光标（2026-10-27 本机实测，
+    // 第 6 次 argv 漏传，见 docs/cua/producer/ghost-cursor-revival-and-polish.md §0）。
+    // PiP 不同：它依赖 --launcher-pid 的生命周期绑定，按原设计仍不传。
     const args = buildHelperOpenArgs({
       appPath,
       socketPath,
       exitLogPath: `${socketPath}.settings.exit.log`,
+      ghostCursorOverlay: true,
       ...(isCuaLocalDevelopmentRuntime(process.env)
         ? { allowUnsignedLauncherLocalDev: true, allowExternalBrokerClientLocalDev: true }
         : {}),
@@ -2201,8 +2218,26 @@ export function createLocalServices(options: {
     repository: () => taskIndexRepo.getProjectRepository(projectRepositoryOptions),
     workspaceDirectory: join(projectDataRoot(), "workspace"),
     afterChange: publishProjectChange,
+    // 独立云端 Web 的工作区策略：装配层显式开启时才允许非项目会话与 0 目录新建项目。
     allowStandaloneCloudWorkspaces: options?.allowStandaloneCloudWorkspaces,
     standaloneWorkspaceRoot: options?.standaloneWorkspaceRoot,
+    // zcodeAgentService 在下方创建；端口只在命令执行时取用它。
+    data: {
+      repository: () => taskIndexRepo.getProjectDataRepository(),
+      port: createProjectDataPort({
+        agent: {
+          measure: (params) => {
+            if (!zcodeAgentService.measureSessionData) throw new Error("project.data-unavailable");
+            return zcodeAgentService.measureSessionData(params);
+          },
+          purge: (params) => {
+            if (!zcodeAgentService.purgeSessionData) throw new Error("project.data-unavailable");
+            return zcodeAgentService.purgeSessionData(params);
+          },
+        },
+        checkpointDirectory: (workspacePath) => getWorkspaceCheckpointDirectory(workspacePath),
+      }),
+    },
   });
   const taskGroupService = createTaskGroupService({
     database: () => taskIndexRepo.getOrganizationDatabase(),
@@ -2234,13 +2269,15 @@ export function createLocalServices(options: {
               let fact = facts.find((task) => groupTaskKey(task) === key);
               if (!fact && allowAlias)
                 fact = facts.find(
-                  (task) =>
-                    task.taskId === ref.taskId && task.workspacePath === ref.workspacePath,
+                  (task) => task.taskId === ref.taskId && task.workspacePath === ref.workspacePath,
                 );
               if (!fact) return [];
               // 只回传 Host 的权威事实：绝不用请求侧 hostId/identity 覆盖存储键，
               // 否则仓储写入的 workspace_key 与前端 tree.tasks 的 taskGroupKey 会分叉。
-              if (ownerHostIdOf(fact.hostId) !== targetHostId || fact.workspacePath !== ref.workspacePath)
+              if (
+                ownerHostIdOf(fact.hostId) !== targetHostId ||
+                fact.workspacePath !== ref.workspacePath
+              )
                 return [];
               return [{ ...fact, deleted: Boolean(fact.deleted) }];
             });
@@ -2256,15 +2293,29 @@ export function createLocalServices(options: {
     workspaceIdentity: undefined,
   });
   const zcodeAgentService = createZCodeAgentService({
+    useSharedTaskRuntime: async (target) => {
+      if (options?.projectStorageHostId && options.projectStorageHostId !== "local") return false;
+      return !(await taskIndexRepo.getProjectRepository()).hasProjectWorkspace(target);
+    },
     prepareProjectExecution,
-    prepareSessionCreation: async (target) =>
-      (
+    // fork 归属在 ACK 返回前交接；普通创建在 CLI 首发前预留。两者都透传独立云端仓储策略。
+    prepareForkCreation: async (target) => {
+      (await taskIndexRepo.getProjectRepository(projectRepositoryOptions)).reserveCreatedTask({
+        task: { ...target, taskId: target.sessionId },
+        parentTaskId: target.parentSessionId,
+      });
+    },
+    prepareSessionCreation: async (target) => {
+      const prepared = (
         await taskIndexRepo.getProjectRepository(projectRepositoryOptions)
       ).reserveCreatedTask({
         task: { ...target, taskId: target.sessionId },
         projectId: target.projectId,
+        creationCommand: target.creationCommand,
         additionalDirectories: target.additionalDirectories,
-      }).additionalDirectories,
+      });
+      return { sessionId: prepared.taskId, additionalDirectories: prepared.additionalDirectories };
+    },
     resolveSessionDirectories: async (target) =>
       (await projectService.resolveSessionDirectories({ ...target, taskId: target.sessionId }))
         .additionalDirectories,
@@ -2272,6 +2323,8 @@ export function createLocalServices(options: {
       ? { accountProviderConfigSource: agentAccountProviderConfigSource }
       : {}),
     accountRequestAuthService,
+    readRequestVerificationConfig: () =>
+      codingPlanSubscriptionService.getRequestVerificationConfig(),
     ...(modelSelectionReadinessSource ? { modelSelectionReadinessSource } : {}),
     authorizeLocalMediaPreviewPath: options?.authorizeLocalMediaPreviewPath,
     ...offPeakToolWiring,
@@ -2297,20 +2350,21 @@ export function createLocalServices(options: {
     // browser-use：host→main 执行桥透传给 agent service 的 onRequest browserExecute 路由。
     browserControlExecutor: options?.browserControlExecutor,
     // 机器人凭据只归属于授权 Host；远端独立服务不能借用本机配置扩大读取范围。
-    channelReplyExecutor: async (value) => {
-      const request = channelReplyHostRequestSchema.parse(value);
-      if (
-        options?.topicResourceRelayChannel &&
-        (isDesktopAttachedRemote || request.remoteSessionId)
-      )
-        return channelReplyResultSchema.parse(
-          await options.topicResourceRelayChannel(request).call("reply", request),
-        );
-      if (isDesktopAttachedRemote) throw new Error("Desktop channel reply peer unavailable");
-      const bots = services.getOptional(IBotsService);
-      if (!bots?.replyToChannel) throw new Error("Bot channel reply unavailable");
-      return bots.replyToChannel(request);
-    },
+    // 渠道工具等待插件入口接入，仅停用默认发送接线，保留完整实现。
+    // channelReplyExecutor: async (value) => {
+    //   const request = channelReplyHostRequestSchema.parse(value);
+    //   if (
+    //     options?.topicResourceRelayChannel &&
+    //     (isDesktopAttachedRemote || request.remoteSessionId)
+    //   )
+    //     return channelReplyResultSchema.parse(
+    //       await options.topicResourceRelayChannel(request).call("reply", request),
+    //     );
+    //   if (isDesktopAttachedRemote) throw new Error("Desktop channel reply peer unavailable");
+    //   const bots = services.getOptional(IBotsService);
+    //   if (!bots?.replyToChannel) throw new Error("Bot channel reply unavailable");
+    //   return bots.replyToChannel(request);
+    // },
     topicResourceExecutor: async (request, signal) => {
       if (
         options?.topicResourceRelayChannel &&
@@ -2376,8 +2430,6 @@ export function createLocalServices(options: {
     // 覆盖模型 API / MCP / Bash 出口流量并信任用户显式配置的证书；改动后下次启动 agent 生效。
     resolveSpawnEnv: async (context) => {
       const [settings] = await Promise.all([settingService.get(), providerRuntime.start()]);
-      // 本地 Host 准备解析快照；远程 CLI 继续由自己的文件 loader 读取和迁移配置。
-      if (!isDesktopAttachedRemote) await subagentsService.prepareRuntimeState(context);
       const agentNetwork =
         isDesktopAttachedRemote && options?.remoteAgentNetwork
           ? options.remoteAgentNetwork
@@ -2449,7 +2501,10 @@ export function createLocalServices(options: {
       };
     },
     ...(!isDesktopAttachedRemote
-      ? { readSubagentRuntimeConfig: subagentsService.readRuntimeConfig }
+      ? {
+          prepareRuntimeWorkspace: subagentsService.prepareRuntimeState,
+          readSubagentRuntimeConfig: subagentsService.readRuntimeConfig,
+        }
       : {}),
     ...(isDesktopAttachedRemote
       ? { sessionRuntimePreferencesAuthority: "external" as const }
@@ -2959,6 +3014,8 @@ export function createLocalServices(options: {
     // 合并 MCP/Plugin Management 服务装配时误删了 plugin-sync 注册，
     // RemoteServiceAccess 仍会请求该频道，导致本地候选枚举超时、远端同步无法开始。
     .register(IPluginSyncService, pluginSyncService)
+    // 数据同步：子智能体 / 命令 / 钩子共用的用户配置同步通道，本机与远端 Host 都经此注册。
+    .register(IUserConfigSyncService, createUserConfigSyncService())
     .register(IPluginsService, createPluginsService({ isDesktopRuntime: true }))
     // 设置页插件管理薄服务——plugins/* 旧协议词的 host 侧唯一消费点。
     .register(
@@ -3254,7 +3311,10 @@ export async function migrateApplicationStorage(
   }
 }
 
-export { bindRemoteProjectIdentities } from "#src/project/index.js";
+export {
+  bindRemoteProjectIdentities,
+  createRemoteIdentityRegistrationCache,
+} from "#src/project/index.js";
 
 export { startupStorage } from "#src/startup-storage/index.js";
 
@@ -3271,6 +3331,17 @@ export async function createServerHostServices(options: {
     buildServerRemoteWorkspaceIdentity({ serverId: options.sourceServerId, workspacePath: "/" }),
   );
   if (!projectStorageHostId) throw new Error("Invalid Source Server storage identity");
+  // Bug 原因：billing/balance 把 X-Device-Mid 当必填，而独立 Server 主机没有 Desktop main 写设备身份，
+  // buildZCodeSourceHeaders() 又只读不生成。原修复只放在旧 stdio entry，SSH/WSL/Docker 的 Core 与
+  // Lite HTTP 入口共用本装配却没有确保，首次 Start Plan 权益查询返回 400，Start 模型被判为不可用。
+  // 收口到本装配，所有独立 Server 入口在创建 services 前得到本机自己的 deviceMid；失败只告警、不阻断启动、不伪造 ID。
+  await ensureTelemetryDeviceMid().catch((error: unknown) => {
+    createServiceLogger("server-host").warn(
+      undefined,
+      "deviceMid 初始化失败，ZCode endpoint 请求将不带 X-Device-Mid:",
+      error instanceof Error ? error.message : String(error),
+    );
+  });
   await migrateApplicationStorage(await createSettingService().get(), projectStorageHostId);
   const workspaceAliasRepo = new SourceServerWorkspaceAliasRepo();
   const workspaceIdentityMapper = new SourceServerWorkspaceIdentityMapper();

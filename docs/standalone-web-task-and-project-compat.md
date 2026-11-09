@@ -8,13 +8,13 @@
 
 ## 状态所有者与接口
 
-| 事实 | 唯一所有者 | 写入接口 |
-| --- | --- | --- |
-| 任务组织态（archived / pinned / unread / title） | 所属 Host 的 tasks-index（`taskIndexRepo`） | `zcodeTaskService`（独立 Web）/ `windowControllerService`（桌面） |
-| CLI 会话删除事实 | CLI（经 `zcodeTaskIndexSyncer` → `deleteSession`） | `taskIndexSyncer.mutateSessionFacts({type:"delete"})` |
-| 归档条件删除裁决 | `zcodeTaskServiceAdapter.deleteArchivedTask(s)` | 先读归档事实，再 CLI，最后 tombstone |
-| 项目 root 与归属 | 所属 Host 的 project 库 | `projectService.saveProject` / `prepareSession` |
-| 非项目草稿目录 | 服务端按 `draftId` 分配 | `projectService.prepareSession({draftId})` |
+| 事实                                             | 唯一所有者                                         | 写入接口                                                          |
+| ------------------------------------------------ | -------------------------------------------------- | ----------------------------------------------------------------- |
+| 任务组织态（archived / pinned / unread / title） | 所属 Host 的 tasks-index（`taskIndexRepo`）        | `zcodeTaskService`（独立 Web）/ `windowControllerService`（桌面） |
+| CLI 会话删除事实                                 | CLI（经 `zcodeTaskIndexSyncer` → `deleteSession`） | `taskIndexSyncer.mutateSessionFacts({type:"delete"})`             |
+| 归档条件删除裁决                                 | `zcodeTaskServiceAdapter.deleteArchivedTask(s)`    | 先读归档事实，再 CLI，最后 tombstone                              |
+| 项目 root 与归属                                 | 所属 Host 的 project 库                            | `projectService.saveProject` / `prepareSession`                   |
+| 非项目草稿目录                                   | 服务端按 `draftId` 分配                            | `projectService.prepareSession({draftId})`                        |
 
 ### 第一项：服务暴露与回退
 
@@ -39,6 +39,7 @@ sequenceDiagram
 - 独立 Web 下 `useGlobalTaskList` 不再因缺失 Controller 直接报错返回：`refresh` 改用 `zcodeTaskService.listTaskList(query)`，并保留请求序号防竞态、排序与 `onSnapshotLoaded`；`useEffect` 在缺 Controller 时同时订阅 `refreshEventName` 与每个 `workspaceScopes` 的 `zcodeTaskService.onDynamicWorkspaceEvent(scope)`，保证顶栏置顶状态与全局搜索刷新。
 - 任务 mutation 复用既有 `task-mutation` 回退：`readProjectTaskMeta` / `mutateProjectTask` 在无 Controller 时走 `zcodeTaskService`（归档、取消归档、重命名、置顶、已读/未读）。
 - 归档管理删除复用带归档条件检查的 `deleteArchivedTask`，不把普通 `deleteTask` 当作归档删除。
+- 3.17.2 的列表查询可使用 `workspaceScopes: "host"`；它不代替工作区事件目标。独立 Web 的事件订阅仍使用按 path/identity 去重的已知工作区列表，避免把 Host 查询标记当作目录数组遍历；查询与订阅继续共用现有任务服务。
 
 ### 第一项：删除的顺序保障（失败项不提前隐藏）
 
