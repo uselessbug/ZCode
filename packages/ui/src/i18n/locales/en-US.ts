@@ -213,7 +213,8 @@ const enUS: Record<string, string> = {
   "project.remoteSingleRootRequired": "A remote project supports exactly one source folder.",
   "project.remoteProjectRequired": "This workspace requires selecting or creating a project first.",
   "project.remoteRootImmutable": "A saved project's source folder cannot be changed.",
-  "project.standaloneAutoRootHint": "With no folder selected, a dedicated project folder is created under the server workspace's projects directory.",
+  "project.standaloneAutoRootHint":
+    "With no folder selected, a dedicated project folder is created under the server workspace's projects directory.",
   "project.unresolved": "Select a project",
   "project.removeEntry": "Remove from this device",
   "project.addFolder": "Add folder to project",
@@ -3392,6 +3393,8 @@ const enUS: Record<string, string> = {
   "settings.personalization.title": "Personalization",
   "settings.personalization.description":
     "Add custom instructions to personalize Agent responses. Instructions apply to future conversations of the local Agent; remote devices need separate configuration.",
+  "settings.personalization.serverDescription":
+    "Add custom instructions to personalize Agent responses. Instructions apply to future conversations of the Agent on this server and are shared across your phone and computer.",
   "settings.personalization.placeholder": "Add custom instructions...",
   "settings.personalization.editorLabel": "Custom instructions editor",
   "settings.personalization.saved": "Saved; effective for new conversations",

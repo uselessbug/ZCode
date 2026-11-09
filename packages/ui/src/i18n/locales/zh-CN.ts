@@ -200,7 +200,8 @@ const zhCN: Record<string, string> = {
   "project.remoteSingleRootRequired": "远端项目只能有一个源文件夹。",
   "project.remoteProjectRequired": "此工作区要求先选择或创建一个项目。",
   "project.remoteRootImmutable": "已创建项目的源文件夹不可更改。",
-  "project.standaloneAutoRootHint": "未选择文件夹时，将在服务器工作区的 projects 目录下自动创建专用项目目录。",
+  "project.standaloneAutoRootHint":
+    "未选择文件夹时，将在服务器工作区的 projects 目录下自动创建专用项目目录。",
   "project.unresolved": "请选择项目",
   "project.removeEntry": "从本机移除",
   "project.edit": "编辑项目",
@@ -3172,6 +3173,8 @@ const zhCN: Record<string, string> = {
   "settings.personalization.title": "个性化",
   "settings.personalization.description":
     "添加自定义指令来个性化 Agent 的回复，指令会应用到你本机 Agent 的后续会话；远程设备需单独配置。",
+  "settings.personalization.serverDescription":
+    "添加自定义指令来个性化 Agent 的回复，指令会应用到当前服务器 Agent 的后续会话；手机和电脑共用这份配置。",
   "settings.personalization.placeholder": "添加自定义指令…",
   "settings.personalization.editorLabel": "个性化指令编辑器",
   "settings.personalization.saved": "已保存，新会话生效",

@@ -8,12 +8,12 @@
 
 ## 状态所有者与接口
 
-| 事实 | 唯一所有者 | 读取接口 |
-| --- | --- | --- |
-| 项目记忆 catalog（按 workspace 的 Markdown） | 所属 Host 数据根 `<dataRoot>/cli/memories/projects` 的 `IMemoryService` | `SettingsPage` 的 `localHostServices.memoryService` |
-| `localHostServices` 的归属 | 各入口注入的 base Host（桌面本机 Host / 云端 server Host / 手机远控被控桌面 Host） | `useBaseWorkspaceServices()` |
-| 记忆开关与存储格式 | 各 base Host 的 `settingService`（`memoryEnabled`） | `useSettings({ services: localHostServices })` |
-| 设置页手机导航态 | `SettingsPage` 局部状态（一个布尔） | `mobileSettingsDetailOpen` |
+| 事实                                         | 唯一所有者                                                                         | 读取接口                                            |
+| -------------------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
+| 项目记忆 catalog（按 workspace 的 Markdown） | 所属 Host 数据根 `<dataRoot>/cli/memories/projects` 的 `IMemoryService`            | `SettingsPage` 的 `localHostServices.memoryService` |
+| `localHostServices` 的归属                   | 各入口注入的 base Host（桌面本机 Host / 云端 server Host / 手机远控被控桌面 Host） | `useBaseWorkspaceServices()`                        |
+| 记忆开关与存储格式                           | 各 base Host 的 `settingService`（`memoryEnabled`）                                | `useSettings({ services: localHostServices })`      |
+| 设置页手机导航态                             | `SettingsPage` 局部状态（一个布尔）                                                | `mobileSettingsDetailOpen`                          |
 
 ### 记忆浏览：按服务边界判定，不按平台
 
@@ -33,13 +33,19 @@ sequenceDiagram
 - 不伪造桌面平台，不改 `memoryEnabled` 开关与存储格式，不读手机本机文件；服务读取、禁用开关、错误显示沿用 `MemorySettingsSection` 既有实现。
 - 已知边角：手机远控 home-only 未连桥时 catalog 返回空，展示“空”而非“仅本地”。
 
+### 个性化指令：复用官方编辑器
+
+- 独立 Web（电脑与手机）通过 base Host 的 `settingService` 读写服务器 `~/.zcode/AGENTS.md`，复用官方保存/取消、草稿恢复及 100KB 限制；界面说明明确指向当前服务器 Agent。
+- 桌面端仍编辑本机用户指令；官方 relay 手机远控仍保留仅桌面端提示。入口边界及验收场景见 [个性化规格](ui/settings-personalization.md)。
+- 不新增 API、配置文件或持久化目录，已有用户指令不作迁移或初始化覆盖。
+
 ### 浏览器数据：区分三类浏览器
 
-| 概念 | 运行位置 | 设置页行为 |
-| --- | --- | --- |
+| 概念                | 运行位置                                             | 设置页行为                                   |
+| ------------------- | ---------------------------------------------------- | -------------------------------------------- |
 | Electron 内置浏览器 | 桌面主进程 `<webview>` guest，`browser-use` 插件驱动 | Chrome 数据导入/清理、忽略证书校验仅桌面可用 |
-| Chromium MCP | 服务端/Agent 运行所在 Host 的无头 Chromium（MCP） | 不受内置浏览器数据设置限制，Web 上仍可用 |
-| Web 页面自身浏览器 | 渲染 Web UI 的手机/电脑浏览器 | 无控制桥；`openExternal` 仅 `window.open` |
+| Chromium MCP        | 服务端/Agent 运行所在 Host 的无头 Chromium（MCP）    | 不受内置浏览器数据设置限制，Web 上仍可用     |
+| Web 页面自身浏览器  | 渲染 Web UI 的手机/电脑浏览器                        | 无控制桥；`openExternal` 仅 `window.open`    |
 
 - `BrowserSettingsSection` 在 `!nativeActionsAvailable` 时按平台区分提示：桌面缺方法用 `settings.browser.desktopOnly`；Web/手机用 `settings.browser.webUnsupported`，明确当前网页无法导入用户电脑 Chrome 数据/清理 Electron 内置浏览器数据，且服务端 Agent 的 Chromium MCP 不受此限制。
 - 保留已有 `browser-use` 插件开关与安全区（`isDesktop` 门禁），不新增远程浏览器界面或导入协议。
