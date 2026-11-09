@@ -1,5 +1,6 @@
 import type {
   ProjectRepositoryContract,
+  ProjectRepositoryOptions,
   ProjectTaskRef,
 } from "#src/project-storage/repository-contract.js";
 export * from "#src/project-storage/repository-contract.js";
@@ -23,6 +24,10 @@ export interface ProjectMigrationContext {
 export interface ProjectStorageContract {
   /** 加法升级后同事务交接旧版本新增行/删除/标题意图；每次启动调用，不重算已处理的 NULL。 */
   migrate(db: DatabaseSync, context: ProjectMigrationContext): Promise<MigrationResult>;
-  repository(db: DatabaseSync, hostId?: string): ProjectRepositoryContract;
+  repository(
+    db: DatabaseSync,
+    hostId?: string,
+    options?: ProjectRepositoryOptions,
+  ): ProjectRepositoryContract;
   admitTaskIdentity(db: DatabaseSync, task: ProjectTaskRef, hostId?: string): void;
 }

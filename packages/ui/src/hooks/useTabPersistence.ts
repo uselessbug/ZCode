@@ -134,6 +134,11 @@ export function useTabPersistence({
     completed: !shouldRestoreSession,
     fullyCompleted: !shouldRestoreSession,
   }));
+  // 只读镜像：恢复 effect 需要判断“同一 Host 是否已完整恢复”，但 restoreLifecycle 不能进
+  // 依赖数组 —— 每次 setRestoreLifecycle 都会换引用，会让恢复 effect 变成自触发循环，
+  // 还会打断 deferred inactive 的补齐。这里仅在 render 时镜像，effect 里读取当前值。
+  const restoreLifecycleRef = useRef(restoreLifecycle);
+  restoreLifecycleRef.current = restoreLifecycle;
   // provider/OAuth gate 从 false 切到 true 的同一轮 render 里，
   // 恢复会话 effect 还没来得及把 isRestoring 设为 true。这里把完成态绑定到
   // 当前 settingService + restoreSession，避免 initialWorkspacePath 抢在 restoreTabs 前 addTab。
@@ -165,6 +170,27 @@ export function useTabPersistence({
 
     let cancelled = false;
     let cancelDeferredRestore: (() => void) | null = null;
+
+    // Bugfix: Root 的 restorePersistedSession 依赖 services.fileService，独立 Web 重连后
+    // fresh services 会让该 callback 换引用，从而让本 effect 重跑。若同一 Host 的首次恢复
+    // 已经真正完整成功（initialRestoreFullyCompletedRef 只在成功/补齐后置 true），就不能再
+    // 从磁盘 restoreTabs 覆盖当前 tabs —— 否则用户已打开的 settings tab 会被清掉、切回工作台。
+    // 这里只按 persistSession 同步写回门禁，不重置恢复中/完成态，避免出现第二个事实源。
+    // 失败（ref 保持 false）或 deferred inactive 尚未补齐时不会命中此分支，callback 变化仍可重试；
+    // 真实 settingService 换实例（Host 变更）或 restoreSession false→true 时 lifecycle 目标不一致，
+    // 也不会命中，保持必须恢复的语义。
+    if (
+      initialRestoreFullyCompletedRef.current &&
+      hasCompletedTabPersistenceInitialRestore({
+        settingService,
+        restoreSession,
+        restoreLifecycle: restoreLifecycleRef.current,
+      })
+    ) {
+      openWorkspacePersistenceGate(persistenceGate, persistSession);
+      return;
+    }
+
     initialRestoreFullyCompletedRef.current = false;
     if (persistenceGate) {
       persistenceGate.canPersist = false;

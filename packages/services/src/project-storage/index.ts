@@ -28,6 +28,7 @@ import {
 
 export type {
   ProjectMigrationContext,
+  ProjectRepositoryOptions,
   ProjectStorageContract,
 } from "#src/project-storage/contract.js";
 export type { ProjectDataRepositoryContract } from "#src/project-storage/purge/contract.js";
@@ -104,5 +105,5 @@ export const projectStorage: ProjectStorageContract = {
     return result;
   },
   admitTaskIdentity,
-  repository: (db, hostId) => new ProjectRepository(db, hostId),
+  repository: (db, hostId, options) => new ProjectRepository(db, hostId, options),
 };

@@ -210,6 +210,10 @@ const enUS: Record<string, string> = {
   "project.offline": "Offline",
   "project.legacySingleRoot": "Single folder",
   "project.legacyUpgradeRequired": "Upgrade the server to create and edit projects",
+  "project.remoteSingleRootRequired": "A remote project supports exactly one source folder.",
+  "project.remoteProjectRequired": "This workspace requires selecting or creating a project first.",
+  "project.remoteRootImmutable": "A saved project's source folder cannot be changed.",
+  "project.standaloneAutoRootHint": "With no folder selected, a dedicated project folder is created under the server workspace's projects directory.",
   "project.unresolved": "Select a project",
   "project.removeEntry": "Remove from this device",
   "project.addFolder": "Add folder to project",
@@ -3261,6 +3265,7 @@ const enUS: Record<string, string> = {
   "settings.subtitle":
     "Switch major settings on the left and edit the details in the panel on the right.",
   "settings.navLabel": "Sections",
+  "settings.mobileBackToList": "Back to settings list",
   "settings.sidebar.group.basics": "Basics",
   "settings.sidebar.group.agentCapabilities": "Agent capabilities",
   "settings.sidebar.group.dataAndStats": "Data and statistics",
@@ -3699,6 +3704,8 @@ const enUS: Record<string, string> = {
     "Certificate setting saved. Restart the app to take effect.",
   "settings.browser.data.section": "Browser data",
   "settings.browser.desktopOnly": "Browser data can only be managed in the ZCode desktop app.",
+  "settings.browser.webUnsupported":
+    "This web page cannot import Chrome sign-in data from your computer or clear the ZCode desktop app's built-in browser data; those are only available in the ZCode desktop app. The server-side agent's Chromium MCP headless browser is not affected.",
   "settings.browser.import.title": "Import Chrome sign-in state",
   "settings.browser.import.description":
     "Bring your Chrome sign-in state into the built-in browser once, so the AI can open sites you are already signed in to and work more smoothly.",

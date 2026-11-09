@@ -197,6 +197,10 @@ const zhCN: Record<string, string> = {
   "project.offline": "离线",
   "project.legacySingleRoot": "单目录",
   "project.legacyUpgradeRequired": "升级服务端后可创建和编辑项目",
+  "project.remoteSingleRootRequired": "远端项目只能有一个源文件夹。",
+  "project.remoteProjectRequired": "此工作区要求先选择或创建一个项目。",
+  "project.remoteRootImmutable": "已创建项目的源文件夹不可更改。",
+  "project.standaloneAutoRootHint": "未选择文件夹时，将在服务器工作区的 projects 目录下自动创建专用项目目录。",
   "project.unresolved": "请选择项目",
   "project.removeEntry": "从本机移除",
   "project.edit": "编辑项目",
@@ -3045,6 +3049,7 @@ const zhCN: Record<string, string> = {
   "settings.breadcrumbLabel": "设置路径",
   "settings.subtitle": "从左侧切换主要设置项，右侧查看详细配置。",
   "settings.navLabel": "主要项",
+  "settings.mobileBackToList": "返回设置列表",
   "settings.sidebar.group.basics": "基础设置",
   "settings.sidebar.group.agentCapabilities": "Agent 能力",
   "settings.sidebar.group.dataAndStats": "数据与统计",
@@ -3462,6 +3467,8 @@ const zhCN: Record<string, string> = {
     "证书校验设置已保存，重启应用后生效",
   "settings.browser.data.section": "浏览器数据",
   "settings.browser.desktopOnly": "浏览器数据只能在 ZCode 桌面端管理。",
+  "settings.browser.webUnsupported":
+    "当前网页无法导入你电脑上 Chrome 的登录数据，也无法清理 ZCode 桌面端内置浏览器的数据，这两项仅在 ZCode 桌面端可用。服务端 Agent 使用的 Chromium MCP 无头浏览器不受此限制。",
   "settings.browser.import.title": "导入 Chrome 登录状态",
   "settings.browser.import.description":
     "一次性把 Chrome 登录状态带到内置浏览器，AI 就能直接打开你已经登录的网站，操作更流畅。",

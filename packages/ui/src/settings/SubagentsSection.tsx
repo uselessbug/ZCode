@@ -52,6 +52,7 @@ import { useConfirmDialog } from "@/hooks/useConfirmDialog.js";
 import { useModelSelectionServiceView } from "@/hooks/useModelSelectionView.js";
 import { useConfigWorkspaceServicesResolution as useWorkspaceServicesResolution } from "@/workspace-config-catalog/index.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+import { useIsMobileCompactViewport } from "@/lib/mobileTextInput.js";
 import {
   buildRegistryModelSelectGroups,
   resolveModelDisplayName,
@@ -625,6 +626,9 @@ function SubagentModelOverrideControl({
 }) {
   const recommendStartPlan = useStartPlanRecommendation(modelSelectionView, "subagent");
   const { intl } = useZCodeIntl();
+  // 手机设置页复用 ModelConfigSelect 既有的手机菜单视口样式（44px 触控高度）；
+  // 不传时按桌面 32px 渲染。桌面为 false，渲染与既有行为一致。
+  const isMobileViewport = useIsMobileCompactViewport();
   const [pending, setPending] = useState(false);
   const [config, setConfig] = useState<{
     model?: string;
@@ -760,6 +764,7 @@ function SubagentModelOverrideControl({
           className="inline-flex min-w-0"
         >
           <ModelConfigSelect
+            isMobileViewport={isMobileViewport}
             modelGroups={modelGroups}
             normalizedValue={value}
             triggerLabel={triggerLabel}
@@ -1085,8 +1090,9 @@ function SubagentForm({
             role="radiogroup"
             className="relative inline-grid w-56 grid-cols-8 rounded-lg border border-input-border bg-input p-1"
           >
+            {/* 手机按钮的触控高度为 44px，选中圈不能沿用 24px 桌面按钮的固定顶部偏移。 */}
             <span
-              className="pointer-events-none absolute top-1 size-6 rounded-full border border-border-hover bg-surface shadow-xs transition-[left]"
+              className="pointer-events-none absolute top-1/2 size-6 -translate-y-1/2 rounded-full border border-border-hover bg-surface shadow-xs transition-[left]"
               style={{
                 left: `calc(0.25rem + ((100% - 0.5rem) / ${AGENT_COLORS.length}) * ${selectedColorIndex})`,
               }}

@@ -63,6 +63,19 @@ import {
   type IServiceAccessor,
 } from "@zcode/services";
 
+export interface RemoteServiceAccessOptions {
+  sourceServerManagementService?: boolean;
+  /** 仅桌面 base 连接开启：数据同步页的设备同步状态与 provisioning 状态共用此开关。 */
+  deviceSyncStateService?: boolean;
+  windowProjectDirectory?: boolean;
+  /**
+   * 是否暴露 windowControllerService。独立 Web 的 Host（Headless）不注册该通道，
+   * 而 ProxyChannel 是惰性的，会构造出"看似存在"的代理，首次调用才报 Unknown channel。
+   * 因此 scope 创建时必须显式声明该能力；缺省保持 true，兼容桌面与桌面远控。
+   */
+  exposeWindowController?: boolean;
+}
+
 /**
  * RemoteServiceAccess — 通过 ChannelClient 自动创建类型安全的服务代理
  *
@@ -81,7 +94,8 @@ export class RemoteServiceAccess implements IServiceAccessor {
   readonly credentialService: ICredentialService;
   readonly broadcastService: IBroadcastService;
   readonly zcodeTaskService: IZCodeTaskService;
-  readonly windowControllerService: IWindowControllerService;
+  /** 独立 Web 的 Host 不注册该通道；消费方必须按可选能力回退到 zcodeTaskService。 */
+  readonly windowControllerService?: IWindowControllerService;
   readonly zcodeAgentService: IZCodeAgentService;
   readonly zcodeSessionService: IZCodeSessionService;
   readonly taskGroupService: ITaskGroupService;
@@ -134,11 +148,8 @@ export class RemoteServiceAccess implements IServiceAccessor {
 
   constructor(
     channelClient: IChannelClient,
-    options: {
-      sourceServerManagementService?: boolean;
-      deviceSyncStateService?: boolean;
-      windowProjectDirectory?: boolean;
-    } = {},
+    // 命名选项类型为 fork 兼容基础；合并上游 3.17.2 的 deviceSyncStateService 声明。
+    options: RemoteServiceAccessOptions = {},
   ) {
     // 远端工作区的 project 必须保留 Source 语义；只有显式能力才创建完整窗口目录组。
     if (options.windowProjectDirectory) {
@@ -189,9 +200,15 @@ export class RemoteServiceAccess implements IServiceAccessor {
     this.zcodeTaskService = ProxyChannel.toService<IZCodeTaskService>(
       channelClient.getChannel(IZCodeTaskService.channelName),
     );
-    this.windowControllerService = ProxyChannel.toService<IWindowControllerService>(
-      channelClient.getChannel(IWindowControllerService.channelName),
-    );
+    // Bug 原因：ProxyChannel 是惰性的，无论服务端是否注册 channel 都能构造出“看似存在”
+    // 的对象，optional 合同因此在首次调用时才失败。独立 Web 的 Headless Host 不注册
+    // window-controller，必须显式声明能力；只有明确要求时才构造代理。
+    this.windowControllerService =
+      options?.exposeWindowController !== false
+        ? ProxyChannel.toService<IWindowControllerService>(
+            channelClient.getChannel(IWindowControllerService.channelName),
+          )
+        : undefined;
     this.zcodeAgentService = ProxyChannel.toService<IZCodeAgentService>(
       channelClient.getChannel(IZCodeAgentService.channelName),
     );

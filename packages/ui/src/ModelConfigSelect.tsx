@@ -144,6 +144,8 @@ export function getModelTriggerLabelClassName({
 }
 
 interface ModelConfigSelectProps {
+  /** 手机保留可读的模型名称和触控尺寸，不退化成桌面的图标压缩态。 */
+  isMobileViewport?: boolean;
   /** Composer 合并入口；其他使用点保持原有模型选择交互。 */
   composerOptions?: ComposerModelOptions;
   modelGroups: readonly ModelSelectGroup[];
@@ -198,6 +200,7 @@ interface ModelConfigSelectProps {
 }
 
 export const ModelConfigSelect = memo(function ModelConfigSelectComponent({
+  isMobileViewport = false,
   composerOptions,
   modelGroups,
   normalizedValue,
@@ -539,20 +542,29 @@ export const ModelConfigSelect = memo(function ModelConfigSelectComponent({
     <>
       <span
         data-composer-open-label
-        className="absolute inset-x-1.5 truncate text-center text-foreground-subtle group-data-[composer-model-icon=true]/toolbar:hidden"
+        className={cn(
+          "absolute inset-x-1.5 truncate text-center text-foreground-subtle",
+          !isMobileViewport && "group-data-[composer-model-icon=true]/toolbar:hidden",
+        )}
       >
         {composerOptions!.selectModelLabel}
       </span>
       <span
         data-composer-open-icon
         aria-hidden="true"
-        className="hidden size-4 shrink-0 items-center text-foreground-subtle group-data-[composer-model-icon=true]/toolbar:inline-flex"
+        className={cn(
+          "hidden size-4 shrink-0 items-center text-foreground-subtle",
+          !isMobileViewport && "group-data-[composer-model-icon=true]/toolbar:inline-flex",
+        )}
       >
         {triggerIcon ?? <PackageIcon className="size-4" />}
       </span>
       <span
         data-composer-open-thought
-        className="hidden group-data-[composer-model-icon=true]/toolbar:inline-flex"
+        className={cn(
+          "hidden",
+          !isMobileViewport && "group-data-[composer-model-icon=true]/toolbar:inline-flex",
+        )}
       >
         <ComposerThoughtIndicator options={composerOptions!} highspeed={highspeed} />
       </span>
@@ -620,8 +632,11 @@ export const ModelConfigSelect = memo(function ModelConfigSelectComponent({
         className={cn(
           "w-fit justify-between gap-1 rounded-lg pl-2 pr-1.5 text-ui-base whitespace-nowrap",
           triggerClassName,
+          isMobileViewport &&
+            "min-h-11 w-40 min-w-0 max-w-[42vw] [&_[data-composer-thought-label]]:hidden [&_[data-testid=composer-thought-meter]]:block",
           composerOptions && "group/combined relative",
           showSelectionLabel &&
+            !isMobileViewport &&
             "px-2 w-(--composer-model-open-width) min-w-32 max-w-(--composer-model-open-width) group-data-[composer-model-icon=true]/toolbar:w-auto group-data-[composer-model-icon=true]/toolbar:min-w-0 group-data-[composer-model-icon=true]/toolbar:max-w-none",
           composerOptions &&
             !hasSelectedModel &&
@@ -680,6 +695,7 @@ export const ModelConfigSelect = memo(function ModelConfigSelectComponent({
                 ? "w-max min-w-48 max-w-[calc(100vw-2rem)]"
                 : "w-48 max-h-72 overflow-y-auto",
           )}
+          data-mobile-model-picker={isMobileViewport ? "true" : undefined}
           collisionPadding={composerOptions ? 12 : undefined}
           align={contentAlign}
           side={contentSide}

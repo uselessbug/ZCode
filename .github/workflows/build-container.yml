@@ -1,0 +1,92 @@
+name: Build and publish container
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build ARM64 image from this checkout
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          docker build --platform linux/arm64 \
+            --build-arg VERSION="$version" \
+            --build-arg REVISION="$GITHUB_SHA" \
+            -t zcode:build .
+      - name: Check native modules and browser tools
+        run: |
+          docker run --rm --entrypoint node zcode:build --input-type=module -e '
+            import { DatabaseSync } from "node:sqlite";
+            import { createRequire } from "node:module";
+            const db = new DatabaseSync(":memory:");
+            if (db.prepare("select 1 as ok").get().ok !== 1) process.exit(1);
+            db.close();
+            const pty = createRequire("/app/zcode/server/entry-http.js")("node-pty");
+            const p = pty.spawn("/bin/echo", ["pty-ok"], {cols:80, rows:24});
+            let output = "";
+            p.onData(data => output += data);
+            p.onExit(() => process.exit(output.includes("pty-ok") ? 0 : 1));
+            setTimeout(() => process.exit(1), 10000).unref();'
+          docker run --rm --entrypoint gh zcode:build --version
+          docker run --rm --entrypoint /opt/browser-mcp/node_modules/.bin/playwright-mcp zcode:build --help
+          docker run --rm --entrypoint /usr/bin/chromium zcode:build --version
+      - name: Check standalone startup and authentication
+        run: |
+          docker run -d --name zcode-smoke \
+            -e ZCODE_SERVER_AUTH_TOKEN=ci-smoke-token \
+            -e ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS=1 zcode:build
+          trap 'docker rm -f zcode-smoke >/dev/null 2>&1' EXIT
+          docker exec -i zcode-smoke node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { createRequire } from 'node:module';
+          const { WebSocket } = createRequire('/app/zcode/server/entry-http.js')('ws');
+          const base = 'http://127.0.0.1:3030';
+          let response;
+          for (let attempt = 0; attempt < 60; attempt++) {
+            try {
+              response = await fetch(base + '/api/server-info', {
+                headers: { Authorization: 'Bearer ci-smoke-token' },
+              });
+              if (response.ok) break;
+            } catch {}
+            await new Promise(resolve => setTimeout(resolve, 250));
+          }
+          assert.equal(response?.status, 200, 'authenticated server-info');
+          assert.equal((await fetch(base + '/api/server-info')).status, 401);
+          assert.equal((await fetch(base + '/')).status, 200, 'Web assets');
+          await new Promise((resolve, reject) => {
+            const socket = new WebSocket('ws://127.0.0.1:3030/ws', {
+              headers: { Authorization: 'Bearer ci-smoke-token' },
+            });
+            const timer = setTimeout(() => { socket.terminate(); reject(new Error('WebSocket timeout')); }, 10000);
+            socket.once('error', reject);
+            socket.once('open', () => { clearTimeout(timer); socket.close(); resolve(); });
+          });
+          console.log('Standalone HTTP, Web assets, authentication and WebSocket passed');
+          JS
+      - name: Publish latest
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag zcode:build "$image:latest"
+          docker push "$image:latest"
