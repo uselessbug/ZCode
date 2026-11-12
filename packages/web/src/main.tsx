@@ -790,6 +790,9 @@ export function createHomeOnlyWebRemoteControlServices(): RootServices {
     memoryService: createEmptyHomeOnlyService<RootServices["memoryService"]>({
       loadMemory: async () => ({ memory: null }),
       listProjectMemories: async () => [],
+      // 未连 bridge 前没有本机 Host，页内项目记忆查看/保存明确报不可用，避免返回假成功。
+      readProjectMemoryFile: unsupported("memoryService.readProjectMemoryFile"),
+      saveProjectMemoryFile: unsupported("memoryService.saveProjectMemoryFile"),
     }),
     outputStyleService: createEmptyHomeOnlyService<RootServices["outputStyleService"]>({
       listStyles: async () => ({ styles: [] }),

@@ -468,6 +468,22 @@ export const TID_SETTINGS_MEMORY_FILE_UPDATED_AT = "settings-memory-file-updated
 export const TID_SETTINGS_MEMORY_FILE_EDITOR_ACTIONS = "settings-memory-file-editor-actions";
 /** Memory 原始 Markdown 预览 */
 export const TID_SETTINGS_MEMORY_PREVIEW = "settings-memory-preview";
+/** Memory 文件行主区（页内查看入口，动态后缀为文件名） */
+export const TID_SETTINGS_MEMORY_FILE_OPEN = "settings-memory-file-open";
+/** Memory 页内查看/编辑对话框外壳 */
+export const TID_SETTINGS_MEMORY_VIEWER_DIALOG = "settings-memory-viewer-dialog";
+/** Memory 正文编辑框 */
+export const TID_SETTINGS_MEMORY_CONTENT = "settings-memory-content";
+/** Memory 进入编辑按钮 */
+export const TID_SETTINGS_MEMORY_EDIT = "settings-memory-edit";
+/** Memory 保存按钮 */
+export const TID_SETTINGS_MEMORY_SAVE = "settings-memory-save";
+/** Memory 取消编辑按钮 */
+export const TID_SETTINGS_MEMORY_CANCEL = "settings-memory-cancel";
+/** Memory 复制路径按钮（动态后缀为文件名） */
+export const TID_SETTINGS_MEMORY_COPY_PATH = "settings-memory-copy-path";
+/** Memory 保存冲突提示 */
+export const TID_SETTINGS_MEMORY_CONFLICT = "settings-memory-conflict";
 /** 常规设置中的 AskUserQuestion 自动继续开关 */
 export const TID_SETTINGS_ASK_USER_QUESTION_AUTO_RESOLUTION_SWITCH =
   "settings-ask-user-question-auto-resolution-switch";

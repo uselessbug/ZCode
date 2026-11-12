@@ -3449,6 +3449,19 @@ const enUS: Record<string, string> = {
   "settings.memory.viewer.fileChanged":
     "This memory file was updated while being read. Reopen it or refresh the file list.",
   "settings.memory.viewer.noSelection": "Select a memory file to preview it.",
+  "settings.memory.viewer.openFile": "View",
+  "settings.memory.viewer.edit": "Edit",
+  "settings.memory.viewer.save": "Save",
+  "settings.memory.viewer.saving": "Saving…",
+  "settings.memory.viewer.copyPath": "Copy path",
+  "settings.memory.viewer.pathCopied": "Path copied",
+  "settings.memory.viewer.saveConflict":
+    "This memory file changed elsewhere and was not overwritten. Your edits are kept — refresh and try again.",
+  "settings.memory.viewer.saveFailed": "Failed to save: {error}",
+  "settings.memory.viewer.reload": "Reload",
+  "settings.memory.viewer.discardConfirmTitle": "Discard unsaved changes?",
+  "settings.memory.viewer.discardConfirmDescription": "Your unsaved changes will be lost.",
+  "settings.memory.viewer.discardConfirm": "Discard changes",
   "settings.httpProxy": "HTTP Proxy",
   "settings.httpProxyDescription":
     "Route model, MCP, command-tool, and app renderer egress traffic through this proxy; system environment variables are not read. Leave blank and that traffic connects directly, while the embedded browser follows your system proxy settings. Restart the app to take effect.",
@@ -3987,6 +4000,8 @@ const enUS: Record<string, string> = {
     "{device} is offline. Its configuration cannot be read or changed until it reconnects.",
   "settings.scope.deviceConnecting": "Connecting to {device}…",
   "settings.scope.localDevice": "This computer",
+  // In standalone Web / mobile remote control the user/local scope is backed by the current server Host.
+  "settings.scope.server": "Current server",
   "settings.scope.label": "Scope",
   "settings.scope.user": "User",
   "settings.scope.workspace": "Workspace",

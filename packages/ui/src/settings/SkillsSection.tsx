@@ -14,6 +14,7 @@ import {
 import { ControlHintTooltip } from "@/ControlHintTooltip.js";
 import { Button } from "@/components/ui/button.js";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog.js";
+import { DirectoryBrowser } from "@/DirectoryBrowser.js";
 import { Switch } from "@/components/ui/switch.js";
 import type {
   ZCodeProvider,
@@ -27,8 +28,10 @@ import type { IServiceAccessor } from "@zcode/services";
 import { ZCODE_AGENT_PROVIDER } from "@zcode/shared";
 import type { CreateTaskRequest } from "@/app-shell/types.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
-import { toast } from "@/components/ui/toast.js";
-import { usePlatform } from "@/hooks/usePlatform.js";
+import {
+  useIsServerHostedSettingsScope,
+  useOpenHostDirectory,
+} from "@/hooks/useFileContextActions.js";
 import { useConfigWorkspaceServicesResolution as useWorkspaceServicesResolution } from "@/workspace-config-catalog/index.js";
 import { useConfirmDialog } from "@/hooks/useConfirmDialog.js";
 import { buildSkillMentionMarkdown } from "@/mentions/mentionMarkdown.js";
@@ -182,7 +185,19 @@ export function SkillsSection({
   cacheAuthorityKey,
 }: SkillsSectionProps) {
   const { intl, locale } = useZCodeIntl();
-  const platform = usePlatform();
+  // “打开路径”统一走 useOpenHostDirectory：桌面本机走文件管理器（WSL 按既有 UNC 转换），
+  // 独立 Web / 远端 Host 走页内目录面板；远端目录不能交给本机文件管理器。
+  const openDirectoryRemoteTarget =
+    remoteTarget && remoteTarget.kind !== "server" ? remoteTarget : undefined;
+  const openHostDirectory = useOpenHostDirectory({
+    isRemoteWorkspace: Boolean(remoteSessionId) || Boolean(remoteTarget),
+    remoteTarget: openDirectoryRemoteTarget,
+  });
+  // 无活动 workspace 时的技能目录浏览：页内 Dialog + DirectoryBrowser，复用远端服务解析，
+  // 不新建临时 workspace 状态（否则 requestFileManager 会拿技能目录当 workspace 建持久 tab）。
+  const [browseDirectoryPath, setBrowseDirectoryPath] = useState<string | null>(null);
+  // 独立 Web / 手机远控下 user 作用域背后是当前服务器 Host；文案统一为「当前服务器」。
+  const serverHostedScope = useIsServerHostedSettingsScope();
   const plugins = usePluginManagementStore((state) => state.plugins);
   const installedPlugins = usePluginManagementStore((state) => state.installedPlugins);
   const availablePlugins = usePluginManagementStore((state) => state.availablePlugins);
@@ -293,10 +308,12 @@ export function SkillsSection({
             : intl.formatMessage({ id: "settings.skills.scope.plugin" });
         case "user":
         default:
-          return intl.formatMessage({ id: "settings.skills.scope.personal" });
+          return intl.formatMessage({
+            id: serverHostedScope ? "settings.scope.server" : "settings.skills.scope.personal",
+          });
       }
     },
-    [availablePlugins, intl, locale, pluginListingById, workspaceLabel],
+    [availablePlugins, intl, locale, pluginListingById, serverHostedScope, workspaceLabel],
   );
 
   const renderDiagnosticCodeLabel = useCallback(
@@ -500,10 +517,19 @@ export function SkillsSection({
     return groupScopedSkillsBySource(
       [...groupedSkills.local, ...groupedSkills.plugin],
       scopeFilter === "user"
-        ? intl.formatMessage({ id: "settings.scope.user" })
+        ? intl.formatMessage({
+            id: serverHostedScope ? "settings.scope.server" : "settings.scope.user",
+          })
         : workspaceLabel || intl.formatMessage({ id: "settings.scope.workspace" }),
     );
-  }, [groupedSkills.local, groupedSkills.plugin, intl, scopeFilter, workspaceLabel]);
+  }, [
+    groupedSkills.local,
+    groupedSkills.plugin,
+    intl,
+    scopeFilter,
+    serverHostedScope,
+    workspaceLabel,
+  ]);
   const filteredSkillCount = groupedSkills.local.length + groupedSkills.plugin.length;
   const hasEmptySearchResult = Boolean(query.trim()) && filteredSkillCount === 0;
   const directInstalledSkillCount = scopedProviderSkills.filter(
@@ -564,12 +590,16 @@ export function SkillsSection({
   const selectedSkillPublishedAt = formatSkillPublishedAt(detailSkill?.metadata?.publishedAt);
   const openSkillFilePath = useCallback(
     async (path: string) => {
-      const result = await platform.openInFileManager(path);
-      if (!result.success) {
-        toast(intl.formatMessage({ id: "appHeader.openInFileManagerFailed" }));
-      }
+      // 技能目录在 Host 上：桌面走本机文件管理器（WSL 转 UNC），独立 Web / 远端走页内目录面板；
+      // 无活动 workspace 时改在页内 Dialog 浏览，避免为技能目录建持久 workspace tab。
+      await openHostDirectory({
+        path,
+        workspacePath,
+        workspaceIdentity,
+        onBrowseWithoutWorkspace: setBrowseDirectoryPath,
+      });
     },
-    [intl, platform],
+    [openHostDirectory, workspaceIdentity, workspacePath],
   );
 
   // 诊断条数不等于加载失败的技能数；同一次扫描可以返回可用技能和多个目录级警告。
@@ -994,6 +1024,32 @@ export function SkillsSection({
           await refresh();
         }}
       />
+      {/* 无活动 workspace 的技能目录浏览：页内服务端目录面板，不建持久 workspace tab。 */}
+      <Dialog
+        open={browseDirectoryPath !== null}
+        onOpenChange={(open) => {
+          if (!open) setBrowseDirectoryPath(null);
+        }}
+      >
+        <DialogContent className="flex max-h-[min(80dvh,640px)] max-w-xl flex-col overflow-hidden p-0">
+          <DialogHeader className="border-b border-popover-border px-4 pt-4 pb-3">
+            <DialogTitle className="truncate pr-8 font-mono text-ui-base">
+              {browseDirectoryPath}
+            </DialogTitle>
+          </DialogHeader>
+          {browseDirectoryPath && targetServiceResolution.rpcReady ? (
+            <div className="min-h-0 flex-1 overflow-hidden">
+              <DirectoryBrowser
+                embedded
+                initialPath={browseDirectoryPath}
+                services={targetServiceResolution.services}
+                onSelect={() => setBrowseDirectoryPath(null)}
+                onCancel={() => setBrowseDirectoryPath(null)}
+              />
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
       {dataSync.dialog}
     </div>
   );

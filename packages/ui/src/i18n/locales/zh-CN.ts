@@ -3225,6 +3225,19 @@ const zhCN: Record<string, string> = {
   "settings.memory.viewer.fileTooLarge": "该记忆文件超过 5 MiB 预览上限。",
   "settings.memory.viewer.fileChanged": "该记忆文件在读取期间已更新，请重新打开或刷新文件列表。",
   "settings.memory.viewer.noSelection": "选择一个记忆文件以查看内容。",
+  "settings.memory.viewer.openFile": "查看",
+  "settings.memory.viewer.edit": "编辑",
+  "settings.memory.viewer.save": "保存",
+  "settings.memory.viewer.saving": "保存中…",
+  "settings.memory.viewer.copyPath": "复制路径",
+  "settings.memory.viewer.pathCopied": "已复制路径",
+  "settings.memory.viewer.saveConflict":
+    "该记忆文件已在别处改动，未覆盖保存。已保留你的修改，刷新后可重试。",
+  "settings.memory.viewer.saveFailed": "保存失败：{error}",
+  "settings.memory.viewer.reload": "重新加载",
+  "settings.memory.viewer.discardConfirmTitle": "放弃未保存的修改？",
+  "settings.memory.viewer.discardConfirmDescription": "未保存的修改将丢失。",
+  "settings.memory.viewer.discardConfirm": "放弃修改",
   "settings.httpProxy": "HTTP 代理",
   "settings.httpProxyDescription":
     "模型、MCP、命令工具与应用渲染层的出口流量将经此代理，不读取系统环境变量。留空时这些流量直连，内置浏览器则跟随系统代理设置。修改后需重启应用生效。",
@@ -3724,6 +3737,8 @@ const zhCN: Record<string, string> = {
     "「{device}」已离线，无法读取或修改它的配置。设备重新连接后再试。",
   "settings.scope.deviceConnecting": "正在连接「{device}」…",
   "settings.scope.localDevice": "本机",
+  // 独立 Web / 手机远控下，user/local 作用域背后其实是当前服务器 Host；文案统一为「当前服务器」。
+  "settings.scope.server": "当前服务器",
   "settings.scope.label": "作用域",
   "settings.scope.user": "用户",
   "settings.scope.workspace": "工作区",
