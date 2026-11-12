@@ -1,5 +1,5 @@
-FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8 AS build
-RUN apt-get update && apt-get install -y --no-install-recommends git python3 make g++ ca-certificates \
+FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8 AS build-base
+RUN apt-get update && apt-get install -y --no-install-recommends git python3 make g++ ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
 WORKDIR /src
@@ -9,6 +9,17 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV NODE_OPTIONS=--max-old-space-size=8192
 RUN pnpm install --frozen-lockfile
 RUN pnpm typecheck && pnpm lint
+# 依赖就绪即可运行、不需要构建产物的门禁：发行包收集器契约与两个真实 server 验收脚本。
+RUN node --test scripts/zcode-distribution.test.mjs
+RUN pnpm exec tsx packages/web/test/e2e/manual-review/pending/standalone-memory-files.mjs \
+    && pnpm exec tsx packages/web/test/e2e/manual-review/pending/standalone-multi-root-projects.mjs
+
+# ci-deps 是给 CI 复用的依赖层边界：workflow 以 --target ci-deps 构建到这里，
+# 在运行期只读挂载 .git（.dockerignore 排除了它）跑 architecture:check --changed，
+# 复用同一份已安装依赖，避免在 runner 上再做一次全量 pnpm install。
+FROM build-base AS ci-deps
+
+FROM ci-deps AS build
 RUN pnpm --filter @zcode/server... build
 # shared is source-exported and has no build script; the distribution collector
 # nevertheless requires its emitted files. Match the other runtime transpilation.
@@ -18,6 +29,8 @@ RUN pnpm exec tsc -p packages/shared/tsconfig.json --noCheck \
 RUN pnpm build:zcode --base-url https://github.com/uselessbug/ZCode/releases/download \
     && mkdir /runtime \
     && tar -xzf dist/zcode/releases/*/zcode-*.tar.gz -C /runtime
+# 发行包端到端验收：直接用刚生成的 tar 跑一次 TUI/native/web 与内置资产检查（不调用模型）。
+RUN node scripts/zcode-distribution-smoke.mjs "$(ls dist/zcode/releases/*/zcode-*.tar.gz)"
 
 FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8
 ARG VERSION=dev

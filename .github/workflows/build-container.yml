@@ -18,11 +18,58 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
+      # fetch-depth 0：架构检查需要真实 git 基线（merge-base 目标提交），浅克隆会拿不到基准。
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # ci-deps 目标只构建到依赖 + typecheck/lint + 发行包契约测试，
+      # 供架构检查在镜像内复用同一份依赖，避免 runner 上再装一次全量依赖。
+      - name: Build dependency stage for CI checks
+        run: docker build --target ci-deps -t zcode:ci-deps .
+      - name: Architecture check against the real diff baseline
+        # 事件负载一律经 env 传入，避免不可信值被拼进 shell（SHA 另做 40 位十六进制校验）。
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          is_sha() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{40}$'; }
+          # 基线选择：push 用 before（上一次 tip），PR 用 base.sha。
+          base="${PULL_REQUEST_BASE_SHA:-${PUSH_BEFORE_SHA:-}}"
+          if ! is_sha "$base" || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            # 事件未给出可用基线（workflow_dispatch、分支首次 push）。退到 HEAD^ 只作为兜底，显式告警。
+            echo "::warning::event ${EVENT_NAME} has no usable base sha; falling back to HEAD^"
+            base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+          if ! is_sha "$base"; then
+            echo "::error::no usable architecture base commit; refusing to approximate the diff baseline"
+            exit 1
+          fi
+          # force push 后旧 tip 已不属于任何可达 ref，fetch-depth 0 也拿不到；按 SHA 直接取回。
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "base ${base} not present locally, fetching it from origin"
+            git fetch --no-tags origin "$base" || true
+          fi
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            # 拿不到真基线时不能退回 HEAD（那样会静默丢改动），直接失败。
+            echo "::error::architecture base ${base} is unreachable and could not be fetched"
+            exit 1
+          fi
+          echo "architecture base: ${base} ($(git rev-parse --short "${base}^{commit}"))"
+          # .git 被 .dockerignore 排除，这里只读挂载；.agents 同样被忽略，一并挂载避免脚本读不到追踪文件。
+          docker run --rm \
+            -v "$PWD/.git:/src/.git:ro" \
+            -v "$PWD/.agents:/src/.agents:ro" \
+            -e ARCHITECTURE_BASE="$base" \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0='*' \
+            --entrypoint node zcode:ci-deps \
+            scripts/architecture/architecture-check.mjs check --changed
       - name: Build ARM64 image from this checkout
         run: |
           version="$(node -p "require('./package.json').version")"
@@ -47,6 +94,14 @@ jobs:
           docker run --rm --entrypoint gh zcode:build --version
           docker run --rm --entrypoint /opt/browser-mcp/node_modules/.bin/playwright-mcp zcode:build --help
           docker run --rm --entrypoint /usr/bin/chromium zcode:build --version
+      # 内置插件（含默认 skill-creator）与 bundled-skills 资产必须在镜像内真实落盘。
+      # 清单只从只读挂载的仓库读取；命中路径限定在 /app/zcode，避免源码资源造成假通过。
+      - name: Check bundled resources inside the runtime image
+        run: |
+          docker run --rm \
+            -v "$PWD:/src-ro:ro" \
+            --entrypoint node zcode:build \
+            /src-ro/scripts/verify-standalone-bundled-assets.mjs /app/zcode
       - name: Check standalone startup and authentication
         run: |
           docker run -d --name zcode-smoke \
@@ -81,12 +136,25 @@ jobs:
           });
           console.log('Standalone HTTP, Web assets, authentication and WebSocket passed');
           JS
+      # 发布只在 main 上、且以上检查全部通过后执行；同时打 latest 与 sha-<8>，并输出 digest 便于回滚。
       - name: Publish latest
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha_tag="sha-${GITHUB_SHA:0:8}"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker tag zcode:build "$image:latest"
+          docker tag zcode:build "$image:$sha_tag"
           docker push "$image:latest"
+          docker push "$image:$sha_tag"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$image:$sha_tag")"
+          {
+            echo "### Container published"
+            echo ""
+            echo "- image: \`$image:latest\` (also \`$image:$sha_tag\`)"
+            echo "- digest: \`$digest\`"
+            echo "- commit: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "published digest: $digest commit: $GITHUB_SHA"
