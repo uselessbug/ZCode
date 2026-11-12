@@ -50,9 +50,9 @@ sequenceDiagram
 - `BrowserSettingsSection` 在 `!nativeActionsAvailable` 时按平台区分提示：桌面缺方法用 `settings.browser.desktopOnly`；Web/手机用 `settings.browser.webUnsupported`，明确当前网页无法导入用户电脑 Chrome 数据/清理 Electron 内置浏览器数据，且服务端 Agent 的 Chromium MCP 不受此限制。
 - 保留已有 `browser-use` 插件开关与安全区（`isDesktop` 门禁），不新增远程浏览器界面或导入协议。
 
-## 记忆正文：页内查看与最小编辑
+## 记忆正文：页内查看与最小编辑（本仓新增）
 
-历史症状（见[问题清单](maintenance/issues.md)）：设置页“记忆”分区已能列出服务端项目记忆文件，但点击文件仍调用本机外部编辑器，独立 Web 下没有可达入口。修复原则是**页内查看 + 最小编辑**，不引入完整 IDE。
+背景（见[问题清单](maintenance/issues.md)）：官方原有“记忆”设置分区仅提供项目记忆文件列表与调用本机外部编辑器（`WorkspaceEditorButtonGroup`），且后端无记忆文件删除接口；独立 Web 下无法调用本机外部编辑器。本仓新增**页内 Markdown 预览 + 最小编辑保存**，不引入完整 IDE，也不新增后端删除接口（如需删除记忆文件交由对话 Agent 处理，尽量少改后端；列表项直接“编辑”菜单暂不实施）。
 
 ### 状态所有者与接口
 
@@ -64,9 +64,9 @@ sequenceDiagram
 
 ### 契约
 
-- **复用官方只读路径**：正文查看走既有 `readProjectMemoryFile`，继续复用 `projectMemoryStableRead` 的稳定句柄、5 MiB 上限、大小写精确匹配与 `path` 越界校验；不新增第二套读取。
-- **新增最小写入** `saveProjectMemoryFile(params)`，`params = { workspaceId, fileName, content, expectedUpdatedAt, expectedContentHash }`：
-  - 只允许写已存在的项目记忆 Markdown（`requireExactProjectMemoryFile`），**不新建文件、不接受任意路径**，因此不构成通用任意文件写 API。
+- **复用既有只读底层**：正文读取走 `readProjectMemoryFile`，复用 `projectMemoryStableRead` 的稳定句柄、5 MiB 上限、大小写精确匹配与 `path` 越界校验；在此基础上由本仓新增页内 `MemorySettingsViewer` 预览与编辑界面。
+- **本仓新增最小写入** `saveProjectMemoryFile(params)`，`params = { workspaceId, fileName, content, expectedUpdatedAt, expectedContentHash }`：
+  - 只允许写已存在的项目记忆 Markdown（`requireExactProjectMemoryFile`），**不新建文件、不提供删除接口、不接受任意路径**，因此不构成通用任意文件写删 API。
   - 写入前用稳定读取重新取当前 `updatedAt` + `contentHash`，与期望值不一致（文件被改动、删除或替换）时抛 `PROJECT_MEMORY_FILE_CHANGED`，**不覆盖**，UI 保留草稿并提示。
   - 写入采用同目录临时文件 + `rename` 的原子替换，正文超限按 `PROJECT_MEMORY_FILE_CHANGED` 同级的写上限错误拒绝。
   - **诚实边界**：检查与 `rename` 之间存在窗口，外部写手仍可能在该窗口替换文件；本实现只保证“读取时刻已变化则拒绝覆盖”，不以锁或超时掩盖这一竞态。
@@ -81,18 +81,14 @@ sequenceDiagram
 3. 读取后文件被外部改写/删除，再保存：提示冲突（`PROJECT_MEMORY_FILE_CHANGED`），**不写入**，编辑框保留草稿；可刷新后重新编辑。
 4. 桌面端行为不变，外部编辑器按钮组在该分区不再出现。
 
-## 技能“打开路径”：服务端目录浏览
+## 技能“打开路径”与工作区 `.zcodeignore`“打开文件位置”状态说明
 
-历史症状：技能详情“打开路径”在独立 Web 下调用桌面文件管理器接口，没有可达行为。
-
-- 桌面端保持既有 `platform.openInFileManager`（本机文件管理器，远端非 WSL 目录不交给本机）。
-- 独立 Web / 手机远控：有活动工作区时走页内服务端目录浏览，复用 `openFileManagerSidePane`（通过 window 级 `requestFileManager` 提交目标，由 workspace shell 消费并打开右侧文件管理面板）；无活动工作区时改用页内 `DirectoryBrowser` 弹窗浏览，避免把技能目录当成持久工作区新建标签。
-- 入口判定复用既有 `useFileContextActions.canRevealInFileManager`：只有“可打开本机文件管理器”的宿主才走系统接口，其余走页内面板或目录浏览弹窗。**不把浏览器所在电脑路径当服务端路径**，目录选择与浏览一律使用服务端 Host 的能力。
-
-### 验收场景
-
-1. 独立 Web：技能详情点击“打开路径”，有活动工作区时右侧打开文件管理面板定位到该目录，无活动工作区时打开页内目录浏览弹窗且不残留持久工作区标签。
-2. 桌面端：点击“打开路径”仍调用本机文件管理器，行为不变。
+- **技能详情“打开路径”（已撤回适配，待新版部署验证；Web 暂不支持）**：
+  - 2026-11-12 实机验证发现，在有活动工作区时点击技能详情路径虽能打开右侧「文件管理」栏，但无法定位到技能目录。
+  - **已确认根因**：`SkillsSection` 调用 `useOpenHostDirectory` 时传入当前项目的 `workspacePath` 与外部技能目录 `revealPath`；`WorkspaceFileTree`（286-289 行）在 `revealPath` 不属于当前 `workspacePath` 根目录时直接 `return`，且 `temporaryExternalDirectory` 不会改变文件树根目录。
+  - **当前合同**：`SkillsSection` 的技能路径网页适配及无工作区时的 `DirectoryBrowser` 弹窗已撤回适配，待新版部署验证，恢复为原有的 `platform.openInFileManager` + 失败 Toast 提示；独立 Web 下技能打开路径暂不支持（仍弹原有失败提示），技能页“当前服务器” Scope 文案等其余改动保留。
+- **工作区文件搜索 `.zcodeignore`“打开文件位置”（单列保留）**：
+  - `WorkspaceFileSearchSection` 中点击「打开文件位置」传入的目标路径本身就是当前工作区根目录 `workspacePath`，不存在跨出项目根目录的问题，因此继续保留 `useOpenHostDirectory` 打开右侧「文件管理」面板，未随技能路径一同回退。
 
 ## 插件来源：服务端目录选择
 
