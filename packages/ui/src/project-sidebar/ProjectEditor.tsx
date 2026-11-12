@@ -141,11 +141,13 @@ export function ProjectEditor({
     project?.hostId ?? fixedFolder?.hostId ?? host?.id ?? (devices ? selectedDeviceId : undefined);
   const remote = Boolean(hostId && hostId !== "local");
   // 能力必须来自当前平台而不是 hostId 标签：独立云端 Web 的 host alias 会把 owner 显示为
-  // "local"，但存储策略仍是 remote owner（单 root、root 固定）。缺少本机目录选择器即说明
-  // 这是云端 Web，前端要和后端 remote policy 保持一致，避免提交后才报原始错误码。
+  // "local"。是否限制为单 root 由下面的 singleRootMode 决定：只有真实远端 Source / 桌面远控
+  // 受限，独立云端 Web 由 standalone 装配开启多 root。缺少本机目录选择器即说明这是云端 Web。
   const nativeDirectoryPicker = Boolean(platform?.selectDirectories);
   const isStandaloneWeb = !nativeDirectoryPicker && !remote;
-  const singleRootMode = remote || isStandaloneWeb;
+  // 单 root 限制只属于真实远端 Source / 桌面远控：它们没有多 root 能力。
+  // 独立云端 Web 由 standalone 装配显式开启多 root（allowStandaloneMultiRoot），可在网页内增删 root。
+  const singleRootMode = remote;
   const msg = (id: string) => intl.formatMessage({ id: `project.${id}` });
   const [name, setName] = useState(
     project?.name ?? (fixedFolder ? getPathLeaf(fixedFolder.path) : ""),
@@ -213,8 +215,8 @@ export function ProjectEditor({
   };
   const addRoots = (values: string[]) => {
     if (remote && project) return;
-    // 单 root 模式（真实远端 Source 与独立云端 Web）最多保留 1 个目录，
-    // 防止选多个目录触发后端 remote-single-root-required。
+    // 真实远端 Source / 桌面远控最多保留 1 个目录，防止选多个目录触发后端 remote-single-root-required；
+    // 独立云端 Web 允许累积多个 root（后端 allowStandaloneMultiRoot 同步放开）。
     const next = singleRootMode
       ? values.filter(Boolean).slice(0, 1)
       : [...new Set([...roots, ...values.filter(Boolean)])];
@@ -404,6 +406,11 @@ export function ProjectEditor({
   };
   const browserEpoch = epoch.current;
   const needsConnection = remote && Boolean(devices) && selectedDevice?.status !== "online";
+  // 目录编辑入口：真实远端既有项目 root 固定不可改；本地 / 独立 Web 可增删。
+  const canEditFolders = !fixedFolder && (!singleRootMode || !project);
+  // 独立 Web 项目至少要保留 1 个 root：后端对 roots: [] 会沿用旧 root，
+  // 若仍显示移除按钮，用户移除最后一个后保存会「没有任何变化」而困惑，故最后一个 root 不给移除入口。
+  const canRemoveRoot = canEditFolders && !(isStandaloneWeb && project && roots.length <= 1);
   return (
     <Dialog
       open={!suspended}
@@ -615,7 +622,7 @@ export function ProjectEditor({
                             {msg("setPrimary")}
                           </Button>
                         )}
-                        {!fixedFolder && (!singleRootMode || !project) ? (
+                        {canRemoveRoot ? (
                           <Button
                             size="icon-sm"
                             variant="ghost"
@@ -633,7 +640,7 @@ export function ProjectEditor({
                         ) : null}
                       </div>
                     ))}
-                    {!fixedFolder && (!singleRootMode || !project) ? (
+                    {canEditFolders ? (
                       <button
                         type="button"
                         data-testid="virtual-project-browse"

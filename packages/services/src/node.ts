@@ -1273,6 +1273,8 @@ export function createLocalServices(options: {
   allowStandaloneCloudWorkspaces?: boolean;
   /** 独立云端工作区根；缺省 /workspace。 */
   standaloneWorkspaceRoot?: string;
+  /** 独立云端 Web 多 root：允许项目拥有多个 root 并允许移动任务增补 root；普通远端仍单 root。 */
+  allowStandaloneMultiRoot?: boolean;
   sourceServerWorkspaceService?: ISourceServerWorkspaceService;
   resolveProjectHostService?: (hostId: string) => Promise<IProjectService>;
   /** Bot 复用窗口已有 Source 连接；不经 main 创建 workspace attachment。 */
@@ -2206,6 +2208,7 @@ export function createLocalServices(options: {
       ? {
           allowStandaloneCloudWorkspaces: true,
           standaloneWorkspaceRoot: options.standaloneWorkspaceRoot?.trim() || "/workspace",
+          allowStandaloneMultiRoot: Boolean(options.allowStandaloneMultiRoot),
         }
       : undefined;
   const projectService = createProjectService({
@@ -2221,6 +2224,8 @@ export function createLocalServices(options: {
     // 独立云端 Web 的工作区策略：装配层显式开启时才允许非项目会话与 0 目录新建项目。
     allowStandaloneCloudWorkspaces: options?.allowStandaloneCloudWorkspaces,
     standaloneWorkspaceRoot: options?.standaloneWorkspaceRoot,
+    // 独立云端 Web 多 root：与工作区策略同源显式开启，普通远端保持单 root。
+    allowStandaloneMultiRoot: options?.allowStandaloneMultiRoot,
     // zcodeAgentService 在下方创建；端口只在命令执行时取用它。
     data: {
       repository: () => taskIndexRepo.getProjectDataRepository(),
@@ -3370,6 +3375,8 @@ export async function createServerHostServices(options: {
     sourceServerWorkspaceService,
     allowStandaloneCloudWorkspaces: standaloneWebCompat,
     standaloneWorkspaceRoot: process.env.ZCODE_DEFAULT_WORKSPACE_DIR?.trim() || "/workspace",
+    // 同一个 standalone 兼容开关显式开启多 root；未开启的远端 owner 仍单 root、root 不可变。
+    allowStandaloneMultiRoot: standaloneWebCompat,
   });
   return { services, workspaceIdentityMapper, migrationFailedPathCount };
 }

@@ -24,6 +24,8 @@ import type { ProjectDataRepositoryContract } from "#src/project-storage/purge/c
 import {
   assertRemoteProjectRoots,
   assertRemoteTaskDirectories,
+  assertRemoteTaskMoveTarget,
+  assertStoredTaskDirectories,
   type StandaloneNonProjectPolicy,
 } from "#src/project-storage/remote-policy.js";
 
@@ -102,7 +104,8 @@ function resolveDirectories(
   const workspacePath = row ? String(row.root_path) : task.workspacePath;
   const project = row?.project_id ? requireProject(db, String(row.project_id)) : null;
   if (project && row?.host_id !== project.hostId) throw new Error("project.host-mismatch");
-  assertRemoteTaskDirectories(
+  // 读取已持久化目录：独立多 root 下 root 可能被用户改过，历史任务 cwd 允许已不在 roots 内。
+  assertStoredTaskDirectories(
     ownerHostId,
     project,
     workspacePath,
@@ -169,12 +172,13 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
     private readonly options?: ProjectRepositoryOptions,
   ) {}
 
-  /** 独立云端非项目策略只转译给 remote-policy，不改写其它 owner 判定。 */
+  /** 独立云端策略只转译给 remote-policy，不改写其它 owner 判定。 */
   private get standalonePolicy(): StandaloneNonProjectPolicy | undefined {
     return this.options
       ? {
           allowStandaloneNonProject: this.options.allowStandaloneCloudWorkspaces,
           standaloneWorkspaceRoot: this.options.standaloneWorkspaceRoot,
+          allowStandaloneMultiRoot: this.options.allowStandaloneMultiRoot,
         }
       : undefined;
   }
@@ -261,7 +265,7 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
       if (old && old.hostId !== hostId) throw new Error("project.cross-host-move");
       if (input.hostId && input.hostId !== hostId) throw new Error("project.host-immutable");
       const roots = [...new Set(input.roots ?? old?.roots.map((root) => root.rootPath) ?? [])];
-      assertRemoteProjectRoots(this.ownerHostId, roots, old);
+      assertRemoteProjectRoots(this.ownerHostId, roots, old, this.standalonePolicy);
       if (input.reuseExistingRoot) {
         if (hostId !== "local" || old || roots.length !== 1)
           throw new Error("project.invalid-directory-open");
@@ -343,7 +347,7 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
       if (project.hostId !== (this.ownerHostId ?? "local"))
         throw new Error("project.cross-host-move");
       if (project.deleted) throw new Error("project.deleted");
-      assertRemoteProjectRoots(this.ownerHostId, [path], project);
+      assertRemoteProjectRoots(this.ownerHostId, [path], project, this.standalonePolicy);
       if (!project.roots.length) {
         this.db
           .prepare(
@@ -463,15 +467,20 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
       if (!task) throw new Error("project.task-not-found");
       if (project.hostId !== (this.ownerHostId ?? "local") || task.host_id !== project.hostId)
         throw new Error("project.cross-host-move");
-      assertRemoteTaskDirectories(
+      // 只校验 root 数量合法性；缺 root 时由下方 root-confirmation-required + addMissingRoot 处理，
+      // 独立云端 Web 放行该流程，普通远端仍要求 cwd 已是唯一 root。
+      assertRemoteTaskMoveTarget(
         this.ownerHostId,
         project,
         String(task.root_path),
-        [],
         this.standalonePolicy,
       );
       if (!project.roots.some((root) => root.rootPath === task.root_path)) {
         if (!input.addMissingRoot) throw new Error("project.root-confirmation-required");
+        // 增补的 root 取自任务行已持久化的 root_path（服务端事实），不是请求参数：
+        // 请求里的 workspacePath 只参与定位任务行，找不到就 task-not-found。
+        // 因此独立 Web 的多 root 不会因此变成「客户端可指定任意宿主路径」，无需再加工作区根限制
+        // （那会破坏 cwd 已在工作区外合法 root 的任务移动）。
         this.db
           .prepare(
             "INSERT INTO project_roots(project_id,root_path,position,is_primary) VALUES(?,?,?,?)",

@@ -73,6 +73,8 @@ export interface AutoArchiveInput {
 export interface ProjectRepositoryOptions {
   allowStandaloneCloudWorkspaces?: boolean;
   standaloneWorkspaceRoot?: string;
+  /** 独立云端 Web 多 root：只放开这份装配的 root 数量与增删限制，普通远端仍单 root、root 不可变。 */
+  allowStandaloneMultiRoot?: boolean;
 }
 
 /** 项目组织态仓储契约；迁移与装配契约保留在 contract.ts，公开导入路径不变。 */

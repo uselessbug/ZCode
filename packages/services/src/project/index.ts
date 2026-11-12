@@ -148,6 +148,8 @@ export function createProjectService(options: {
    */
   allowStandaloneCloudWorkspaces?: boolean;
   standaloneWorkspaceRoot?: string;
+  /** 独立云端 Web 多 root：允许已有项目拥有多个 root；普通远端 owner 仍单 root。 */
+  allowStandaloneMultiRoot?: boolean;
 }): IProjectService {
   const route = async (hostId?: string) => {
     if (!hostId || hostId === (options.ownerHostId ?? "local")) return null;
@@ -161,6 +163,7 @@ export function createProjectService(options: {
   // 独立云端工作区根：与容器实际工作区一致，避免把项目/对话目录建到进程内部 home。
   const standaloneWorkspaceRoot = () => options.standaloneWorkspaceRoot?.trim() || "/workspace";
   const standaloneCloudWorkspaces = () => Boolean(options.allowStandaloneCloudWorkspaces);
+  const standaloneMultiRoot = () => Boolean(options.allowStandaloneMultiRoot);
   const service: IProjectService = {
     ...createProjectDataCommands({ ...options, changed }),
     async readDirectory(params = {}) {
@@ -354,7 +357,8 @@ export function createProjectService(options: {
           .readTree({ includeTasks: false })
           .projects.find((item) => item.id === id);
         if (!project) throw new Error("project.not-found");
-        if (remoteOwner && project.roots.length !== 1)
+        // 独立云端 Web 多 root 项目允许多个 root；普通远端 owner 仍要求恰好 1 个。
+        if (remoteOwner && project.roots.length !== 1 && !standaloneMultiRoot())
           throw new Error("project.remote-single-root-required");
         if (!project.roots.length) {
           // 多窗口为同一空项目生成同一个目录，不依赖进程间定时锁。

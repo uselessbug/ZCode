@@ -95,8 +95,8 @@ sequenceDiagram
 - `assertRemoteTaskDirectories` 增加可选策略：仅当 `allowStandaloneNonProject` 为真、`additionalDirectories` 为空、`workspacePath` 非空且位于 `standaloneWorkspaceRoot` 之内时放行无项目会话；否则维持 `project.remote-project-required`。跨 Host 与 canonical owner 不变。
 - `ProjectRepository` / `createProjectService` 透传 `allowStandaloneCloudWorkspaces` 与 `standaloneWorkspaceRoot`；`node.ts` 仅在 standalone server 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"` 时开启，root 取 `ZCODE_DEFAULT_WORKSPACE_DIR || /workspace`。
 - `prepareSession` 无 `projectId`：普通本地模式仍用原 `workspaceDirectory`；独立云端开启时用 `<root>/.zcode/conversations`，按 `draftId` 分配稳定目录（相同 `draftId` 幂等复用）。remote owner 未开启策略时仍抛 `project.remote-project-required`。
-- `saveProject` 0 目录新建项目：remote owner 且开启策略时在 `<root>/projects` 下自动创建专用目录并固定为唯一 root（相同项目 ID 重试复用同一 root）；1 个目录正常保存；>1 个目录抛 `project.remote-single-root-required`；改动既有 root 抛 `project.remote-root-immutable`。
-- 前端：非项目草稿绑定稳定 `draftId`，切换时显式 `projectId: null` 并保留转移中的草稿；`ProjectEditor` 单 root 模式下选择目录最多保留 1 个、既有项目 root 固定不可移除，独立云端新建项目允许 0 目录并给出说明文案；`formatProjectError` 为三个错误码提供可读国际化文案，不向用户暴露原始错误码。
+- `saveProject` 0 目录新建项目：remote owner 且开启策略时在 `<root>/projects` 下自动创建专用目录并固定为唯一 root（相同项目 ID 重试复用同一 root）；1 个目录正常保存；多于 1 个目录在 `allowStandaloneMultiRoot` 未开启时抛 `project.remote-single-root-required`，改动既有 root 抛 `project.remote-root-immutable`。独立 Web 的多 root 能力（`allowStandaloneMultiRoot`）与任务移动增补 root 见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
+- 前端：非项目草稿绑定稳定 `draftId`，切换时显式 `projectId: null` 并保留转移中的草稿；`ProjectEditor` 对真实远端仍限制为单 root（选择目录最多保留 1 个、既有项目 root 固定不可移除），独立 Web 允许增删多个 root，独立云端新建项目允许 0 目录并给出说明文案；`formatProjectError` 为三个错误码提供可读国际化文案，不向用户暴露原始错误码。
 
 ## 验收场景
 
@@ -111,6 +111,6 @@ sequenceDiagram
 **Area B**
 
 6. 开启策略时无 `projectId` 的 `prepareSession({draftId})` 在 `<root>/.zcode/conversations` 下分配稳定目录，相同 `draftId` 幂等复用；`reserveCreatedTask` / `resolveDirectories` 允许 `projectId:null` 且 `additionalDirectories:[]`。
-7. 0 目录新建项目自动分配并固定唯一 root（相同项目 ID 重试幂等）；1 目录成功；>1 目录抛 `project.remote-single-root-required`；改既有 root 抛 `project.remote-root-immutable`。
+7. 0 目录新建项目自动分配并固定唯一 root（相同项目 ID 重试幂等）；1 目录成功；未开启 `allowStandaloneMultiRoot` 时多于 1 目录抛 `project.remote-single-root-required`、改既有 root 抛 `project.remote-root-immutable`。独立 Web 多 root 与移动增补 root 的验收见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
 8. 未开启策略的普通远端 owner 仍抛 `project.remote-project-required` 与 `project.remote-single-root-required`；跨 Host 仍被拒绝。
 9. 既有独立 Web host alias 与连接恢复补丁仍生效；仅替换 ZCode 镜像，AGM、Access checker、Caddy 与其他服务不变。
