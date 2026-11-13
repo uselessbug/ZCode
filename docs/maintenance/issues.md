@@ -2,6 +2,13 @@
 
 本文是独立 Web 与移动端适配问题的唯一维护入口，按用户可见症状记录当前状态。
 
+## 源码已修复 -> 待 CI 构建与部署实机验收（1 项）
+
+1. **独立 Web 设置页“当前服务器”MCP 已安装列表为空（2026-11-13）**
+   - **症状**：独立云端 Web 进入「设置 -> MCP」选择“当前服务器”时，顶栏显示插件 MCP 计数（如 `MCP 7`），但“已安装”分组显示 `0`（用户级 `browser`、`rea` 等均不展示）。
+   - **已确认根因**：服务端原生 `mcp-sync.loadMcpFromUserDirectory` 正常返回用户级 MCP，问题在于 `useMcpStore` 的 `resolveTargetDirectoryService` 将无 `workspaceIdentity` 且无 `authorityKey` 直接当作桌面本机探测并返回 `null`，回退到无桌面代理的 Web `platform` 读取硬编码 `{ servers: [] }` 并误标 ready。
+   - **状态**：源码已修复，本地非 GUI 运行时回归（`node packages/web/test/e2e/manual-review/pending/standalone-mcp-routing.mjs`，13 项）已通过；**待 CI 构建与线上实机验收**。
+
 ## 实机验证未通过 -> 已撤回适配，待新版部署验证（1 项）
 
 1. **技能详情“打开路径”打开服务器目录（3.1，Web 暂不支持）**

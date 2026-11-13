@@ -16,7 +16,16 @@ import {
   RequestSecurityWorkspaceBridge,
   setRequestSecurityReporter,
 } from "@/request-security-edition/index.js";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { LucideProvider, RefreshCw } from "lucide-react";
 import {
   APP_RUNTIME_PREFERENCES_CHANGED_BROADCAST_CHANNEL,
@@ -219,11 +228,23 @@ function RootInner({
   initialWebRemoteControlMobileNavigationIntent,
   webRemoteControlTerminalTransportState,
   initialWorkspaceLoadingFallback,
+  mcpBaseHostDirectoryService,
 }: RootProps) {
   useInterfaceModeTelemetry(platform, isDesktop === true);
+  // MCP 归属绑定必须早于子组件的 passive 读取 effect：父 layout effect 虽在子 layout 之后，
+  // 但同一 commit 内所有 layout effect 都先于任何 passive effect 执行，因此单独用
+  // useLayoutEffect 绑定，不能和下面的 telemetry 上报 effect（passive）混在一起。
+  useLayoutEffect(() => {
+    setMcpStorePlatform(platform, mcpBaseHostDirectoryService);
+    return () => {
+      // 保持入口归属、只清空平台引用：独立 Web base Host 需要保持 base-required，
+      // 避免卸载/重绑间隙回退成 platform 模式读到假空。
+      setMcpStorePlatform(null, mcpBaseHostDirectoryService === undefined ? undefined : null);
+    };
+  }, [platform, mcpBaseHostDirectoryService]);
+
   useEffect(() => {
     setRequestSecurityReporter(platform);
-    setMcpStorePlatform(platform);
     // 对话 UI perf 只属于 desktop-continuous；Web/mobile 即使能看到权威状态也不装 reporter。
     setUiPerfArmsReporter(isDesktop ? platform : null);
     setSessionOpenArmsReporter(isDesktop ? platform : null);
@@ -231,7 +252,6 @@ function RootInner({
     setSendFunnelArmsReporter(isDesktop ? platform : null);
     return () => {
       setRequestSecurityReporter(null);
-      setMcpStorePlatform(null);
       setUiPerfArmsReporter(null);
       setSessionOpenArmsReporter(null);
       setSendFunnelArmsReporter(null);

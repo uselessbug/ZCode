@@ -44,9 +44,35 @@ import { isRemoteWorkspaceDisconnectedError } from "@/lib/remoteWorkspaceService
 import { mergeMcpServerStatusSnapshots } from "@/store/mcpStoreStatusList.js";
 
 let mcpPlatformService: McpPlatformService | null = null;
+/**
+ * 入口显式注入的 base Host MCP 目录服务归属（仅独立 Web 设置），三态：
+ * - `undefined`：非 base Host 入口（桌面本机 / 官方手机 relay），无 identity/authority 时走 platform；
+ * - `null`：base Host 入口但服务尚未绑定，读取必须 fail-closed；
+ * - service：base Host 已绑定，无 identity/authority 时读写都用它。
+ *
+ * Bug 原因：旧逻辑把「无 workspaceIdentity 且无 authorityKey」当成桌面本机探测，丢弃已绑定的
+ * currentDirectoryService，独立 Web 因此回退到无桌面代理的 Web platform，拿到硬编码 `{servers: []}`
+ * 并被标记 ready，表现为「顶栏 MCP 7 / 已安装 0」。
+ */
+let mcpBaseHostDirectoryService: McpDirectoryService | null | undefined;
 
-export function setMcpStorePlatform(platform: McpPlatformService | null): void {
+/**
+ * MCP 目录绑定版本。放在模块级：入口 setter（platform / base Host 归属）与 store 内的目标绑定
+ * （目标 key、同目标换服务对象）都会改变归属，任一处改绑都必须让在途读取在「复用」与「提交」
+ * 两处同时失效，否则旧 Host 的延迟结果会覆盖新 snapshot（例如 Root layout setter 已换成 baseB，
+ * 但旧 baseA 的 load 晚到并提交）。
+ */
+let mcpBindingRevision = 0;
+
+export function setMcpStorePlatform(
+  platform: McpPlatformService | null,
+  baseHostDirectoryService: McpDirectoryService | null | undefined = undefined,
+): void {
+  if (mcpPlatformService !== platform || mcpBaseHostDirectoryService !== baseHostDirectoryService) {
+    mcpBindingRevision += 1;
+  }
   mcpPlatformService = platform;
+  mcpBaseHostDirectoryService = baseHostDirectoryService;
 }
 
 interface UpdateServerStatusOptions {
@@ -149,6 +175,8 @@ interface McpStoreState {
 export const useMcpStore = create<McpStoreState>((set, get) => {
   let loadMcpPromise: Promise<boolean> | null = null;
   let loadMcpWorkspaceKey: string | null = null;
+  /** 已启动 load 捕获的绑定版本。 */
+  let loadMcpRevision = 0;
   const statusListEpochs: Record<ZCodeMcpListMode, number> = {
     connect: 0,
     status: 0,
@@ -170,19 +198,33 @@ export const useMcpStore = create<McpStoreState>((set, get) => {
    * Bug 原因：远端「用户」目标只有 home 路径与 authority、没有 workspace identity。旧逻辑无 identity
    * 就丢弃传入的服务走本机 platform；写入又用当前 tab 设置的全局目录服务。结果是在本机 tab 选
    * 「B · 用户」读写本机，在远端 A tab 选「B · 用户」读 B 写 A、选「本机 · 用户」写 A。
-   * 修法：服务与路径 / identity / authority 作为一组绑定，读写都只用这一组。本机目标（无 identity、
-   * 无 authority：本机项目、本机「用户」）走 desktop platform，保留旧 common MCP 迁移；
-   * 远端目标没有绑定服务时 fail-closed，不回退本机。
+   * 修法：服务与路径 / identity / authority 作为一组绑定，远端目标只用这一组，缺绑定 fail-closed。
+   * 无 identity/authority 时不再一律当桌面本机：由入口归属决定（见 setMcpStorePlatform 三态），
+   * 独立 Web base Host 走注入的服务器目录服务并跳过桌面 legacy common 迁移，桌面本机 / 官方手机
+   * relay 才走 desktop platform 并保留旧 common MCP 迁移。
    */
   function resolveTargetDirectoryService(): McpDirectoryService | null {
     const { currentAuthorityKey, currentDirectoryService, currentWorkspaceIdentity } = get();
-    if (!currentWorkspaceIdentity && !currentAuthorityKey) {
+    if (currentWorkspaceIdentity || currentAuthorityKey) {
+      // 跨 Host 远端目标（SSH / Docker / WSL 项目与远端「用户」）必须使用该目标绑定的目录服务；
+      // 缺绑定直接 fail-closed，绝不回退读写桌面本机 platform。
+      if (!currentDirectoryService) {
+        throw new Error("MCP directory service is not bound to the remote target");
+      }
+      return currentDirectoryService;
+    }
+    // 无 identity/authority 时有且只有两种入口：
+    // 1) 桌面本机 / 官方手机 relay：走 desktop platform，并保留旧 common MCP 迁移；
+    // 2) 独立 Web base Host：入口通过 setMcpStorePlatform 显式注入本机 Host 目录服务，直接用它。
+    // 归属由入口决定，不从 workspaceIdentity 推断，也不为独立 Web 伪造 identity。
+    if (mcpBaseHostDirectoryService === undefined) {
       return null;
     }
-    if (!currentDirectoryService) {
-      throw new Error("MCP directory service is not bound to the remote target");
+    if (!mcpBaseHostDirectoryService) {
+      // base Host 入口但服务尚未绑定：fail-closed，不得回退无桌面代理的 Web platform 冒充成功。
+      throw new Error("MCP base host directory service is not bound");
     }
-    return currentDirectoryService;
+    return mcpBaseHostDirectoryService;
   }
 
   function commitState(partial: {
@@ -303,24 +345,35 @@ export const useMcpStore = create<McpStoreState>((set, get) => {
       }
 
       const requestWorkspaceKey = currentTargetKey();
-      if (loadMcpPromise && loadMcpWorkspaceKey === requestWorkspaceKey) {
+      const requestRevision = mcpBindingRevision;
+      if (
+        loadMcpPromise &&
+        loadMcpWorkspaceKey === requestWorkspaceKey &&
+        loadMcpRevision === requestRevision
+      ) {
         return await loadMcpPromise;
       }
       if (loadMcpPromise) {
         await loadMcpPromise;
       }
 
-      if (currentTargetKey() !== requestWorkspaceKey) {
-        // 该调用等待上一轮 load 时已从 B 切到 C；交给 C 自己发起的 ensure/load 调用处理。
+      if (currentTargetKey() !== requestWorkspaceKey || mcpBindingRevision !== requestRevision) {
+        // 该调用等待上一轮 load 时已从 B 切到 C，或同一目标换了目录服务对象（重连）；
+        // 交给新绑定自己发起的 ensure/load 调用处理，不复用旧服务的结果。
         return false;
       }
-      if (loadMcpPromise && loadMcpWorkspaceKey === requestWorkspaceKey) {
+      if (
+        loadMcpPromise &&
+        loadMcpWorkspaceKey === requestWorkspaceKey &&
+        loadMcpRevision === requestRevision
+      ) {
         return await loadMcpPromise;
       }
 
       const { currentProjectPath, currentWorkspaceIdentity } = get();
       const latestWorkspacePath = currentProjectPath || undefined;
       loadMcpWorkspaceKey = requestWorkspaceKey;
+      loadMcpRevision = requestRevision;
       loadMcpPromise = (async () => {
         try {
           // 等待上一目标 load 期间可能再次切换；目录服务取等待后的最新绑定，
@@ -335,15 +388,21 @@ export const useMcpStore = create<McpStoreState>((set, get) => {
             activeDirectoryService,
           );
           if (!activeDirectoryService) {
+            // base Host 目标始终有绑定服务，因此不会进入桌面 legacy common 迁移；
+            // 独立 Web 不得把 localStorage 旧 common 写进服务器配置。
             servers = await migrateStoredCommonMcpToZCodeAgent(
               mcpPlatformService,
               servers,
               latestWorkspacePath,
             );
           }
-          if (currentTargetKey() !== requestWorkspaceKey) {
-            // workspace A 的异步目录读取可能晚于切换到 B 才返回；
-            // 旧结果包含 env/header/OAuth secret，不能写回共享 store 后被 B 的 Agent 消费。
+          if (
+            currentTargetKey() !== requestWorkspaceKey ||
+            mcpBindingRevision !== requestRevision
+          ) {
+            // workspace A 的异步目录读取可能晚于切换到 B 才返回，同一目标也可能在
+            // 重连后换了目录服务对象；旧结果包含 env/header/OAuth secret，
+            // 不能写回共享 store 后被新 Host 的 Agent 消费。
             return false;
           }
           set(commitState({ nativeServers: servers }));
@@ -391,7 +450,16 @@ export const useMcpStore = create<McpStoreState>((set, get) => {
           normalizedAuthorityKey,
         );
       } else if ((directoryService ?? null) !== get().currentDirectoryService) {
-        // 同一目标换了服务对象（例如 attachment 换代）：只换绑服务，不清空列表。
+        // 同一目标换了服务对象（例如 attachment 换代 / 重连）：只换绑服务，不清空列表。
+        const { currentAuthorityKey, currentWorkspaceIdentity } = get();
+        if (currentWorkspaceIdentity || currentAuthorityKey) {
+          // 只有远端目标的目录服务才是路由来源，换服务对象必须让在途读取失效，
+          // 否则旧 Host 的延迟结果会覆盖新 Host 的 snapshot。
+          mcpBindingRevision += 1;
+        }
+        // 无 identity/authority 时路由来源是入口注入的 base Host：base 换服务的失效由
+        // setMcpStorePlatform 负责；这里若也自增，设置页与会话调用方传入不同 wrapper 对象
+        // 会互相取消真实 base 读取，导致 loading 卡住。
         set({ currentDirectoryService: directoryService ?? null });
       }
 
@@ -642,6 +710,11 @@ export const useMcpStore = create<McpStoreState>((set, get) => {
         normalizedWorkspaceIdentity !== currentWorkspaceIdentity ||
         normalizedAuthorityKey !== currentAuthorityKey;
       const nextNativeServers = workspaceChanged ? [] : nativeServers;
+      if (workspaceChanged) {
+        // 目标 key 变化同样是一次绑定版本变化；配合 in-flight 读取的版本校验，
+        // 保证旧目标的结果不会在新目标的路径/服务上被复用。
+        mcpBindingRevision += 1;
+      }
       set({
         currentProjectPath: path,
         currentWorkspaceIdentity: normalizedWorkspaceIdentity,
@@ -772,6 +845,11 @@ export const useMcpStore = create<McpStoreState>((set, get) => {
     setCurrentSessionId: (sessionId) => set({ currentSessionId: sessionId }),
 
     migrateLegacyCommonMcp: async () => {
+      if (mcpBaseHostDirectoryService !== undefined) {
+        // base Host 入口（独立 Web）没有桌面 legacy common 迁移语义：它读的是 platform 通道，
+        // 误走会读错通道并用空结果覆盖真实服务器列表。这里显式 no-op，保持 not-migrated。
+        return { totalCount: 0, importedCount: 0, skippedCount: 0 };
+      }
       const result = await migrateLegacyCommonMcpFromDesktop(mcpPlatformService);
       const latestWorkspacePath = get().currentProjectPath || undefined;
       const currentNativeServers =

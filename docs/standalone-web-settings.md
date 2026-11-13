@@ -114,6 +114,61 @@ sequenceDiagram
 1. 独立 Web：设置页技能、子代理、MCP 的 user/local 选项文案显示“当前服务器”，project 显示“当前项目”。
 2. 桌面端：文案与作用域行为不变。
 
+## MCP 配置读写与目标服务归属
+
+历史症状：`useMcpStore` 曾将 `!currentWorkspaceIdentity && !currentAuthorityKey` 当作桌面本机探测并返回 `null`，导致独立 Web 丢弃已绑定服务、回退到无桌面代理的 Web `platform` 读取硬编码空列表 `{ servers: [] }` 并误标 ready（表现为顶栏计入插件 MCP，但“已安装”用户级 MCP 为 0）。
+
+### 状态所有者与接口
+
+| 事实                   | 唯一所有者                                                                                                                                 | 接口与约束                                                                                                                                                                                                                                                           |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Base Host 目录归属三态 | 入口 `packages/web/src/main.tsx` → `Root`（`useLayoutEffect`）→ `setMcpStorePlatform`                                                      | `mcpBaseHostDirectoryService`：默认 `undefined`（Desktop / `/remote` 走 `platform`）；`null`（独立 Web base-required 未就绪或卸载清理间隙，fail-closed）；`service`（独立 Web 已绑定 `services.mcpSyncService`）                                                     |
+| 目标绑定与代际版本     | `useMcpStore` 四元组 `(currentProjectPath, currentWorkspaceIdentity, currentAuthorityKey, currentDirectoryService)` + `mcpBindingRevision` | 目标 key 变化、远端目标换服务对象或 `setMcpStorePlatform` 更换 base Host / pending 状态均递增 `mcpBindingRevision` 使在途旧读取失效（无 identity/authority 下两处 wrapper 仍指向同一 base Host 时不误取消）；独立 Web 下手动 `migrateLegacyCommonMcp` 同样保持 no-op |
+| Store 投影与就绪门禁   | `useMcpStore` 与 `McpSettingsSection`（`mcpConfigReadyWorkspaceKey`）                                                                      | 仅当目标 key 与 `mcpBindingRevision` 未变且读取成功时才提交 store 并标记 ready；读取失败保持 not-ready                                                                                                                                                               |
+| Host 磁盘配置与运行态  | 目标所属 Host 的 `IMcpSyncService`（或桌面本机 `IPlatformService`）                                                                        | 复用既有 `loadMcpFromUserDirectory`、`saveMcpToUserDirectory`、`listWorkspaceMcpServerStatuses`；不新增后端 API                                                                                                                                                      |
+
+### 四类目标环境矩阵
+
+`workspaceIdentity` 仅用于工作区身份隔离，`workspacePath` 用于文件操作、命令 `cwd`、Git 与路径展示；无 `workspaceIdentity` 的入口归属由 `mcpBaseHostDirectoryService` 决定，不伪造 `workspaceIdentity`：
+
+| 目标场景                                          | `workspaceIdentity` / `authorityKey` | `mcpBaseHostDirectoryService` | 目标目录通道                                                                  | Legacy Common 迁移                             | 缺服务行为                                          |
+| ------------------------------------------------- | ------------------------------------ | ----------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------- | --------------------------------------------------- |
+| 独立 Web base server Host（当前服务器与项目）     | 均为空                               | `service`（未就绪为 `null`）  | 使用 `mcpBaseHostDirectoryService` 读取（会话/设置）与写入（增删改/启停）     | 跳过（浏览器旧 `localStorage` 不写云端也不删） | `null` 时 fail-closed 报错，不回退 Web `platform`   |
+| Desktop 本机（本机用户与本机项目）                | 均为空                               | `undefined`                   | 返回 `null`，走 Desktop `IPlatformService`                                    | 执行（保留本机旧 `common` 迁移）               | `platform` 失败返回 `false`                         |
+| 官方手机 relay `/remote`（被控桌面）              | 均为空                               | `undefined`                   | 返回 `null`，经 `platformProxy` 转发被控桌面；Plain Web 无代理走空/不支持兜底 | 随 `platformProxy` 既有契约                    | 未连桥/断连按既有门禁处理                           |
+| 跨 Host 远端（SSH / Docker / WSL 项目与远端用户） | 存在其一或全部                       | 任意                          | 使用目标绑定的 `currentDirectoryService`                                      | 跳过                                           | Fail-closed：缺服务直接抛错，不回退本机或 base Host |
+
+```mermaid
+sequenceDiagram
+    participant Root as Root (useLayoutEffect)
+    participant UI as McpSettingsSection / App
+    participant Store as useMcpStore (mcpBindingRevision)
+    participant Sync as IMcpSyncService
+    participant Plat as IPlatformService
+
+    Root->>Store: setMcpStorePlatform(platform, mcpBaseHostDirectoryService)
+    UI->>Store: ensureLoadedForWorkspace(path, mcpSyncService, identity, authorityKey)
+    alt 跨 Host 远端 (含 identity 或 authorityKey)
+        Store->>Sync: currentDirectoryService.loadMcpFromUserDirectory (缺服务则 fail-closed)
+    else 无 identity 且无 authorityKey
+        alt mcpBaseHostDirectoryService 为 service (独立 Web)
+            Store->>Sync: mcpBaseHostDirectoryService.loadMcpFromUserDirectory (跳过 legacy 迁移)
+        else mcpBaseHostDirectoryService 为 null (独立 Web 未就绪)
+            Store-->>UI: Fail-closed 返回 false
+        else mcpBaseHostDirectoryService 为 undefined (Desktop / /remote)
+            Store->>Plat: platform.loadMcpFromUserDirectory + legacy 迁移
+        end
+    end
+    Store-->>UI: 目标 key 与 mcpBindingRevision 未变则提交并标 ready，否则丢弃旧结果
+```
+
+### 验收场景
+
+1. 独立 Web：进入设置页 MCP 选择“当前服务器”或服务器项目，用户级与项目级 MCP 在“已安装”分组正常展示并刷新连接状态；会话 `ensureLoadedForWorkspace` 读取同一目标配置。
+2. 独立 Web：新增、编辑、删除、启停 MCP 经当前服务器 `mcpSyncService` 持久化，刷新后保持；浏览器旧 `localStorage` common MCP 不写入服务器也不被删除。
+3. 首次加载与重连换绑：首屏不因 passive effect 早于注入而读到假空；重连更换服务实例或快速切换目标时，在途旧读取被 `mcpBindingRevision` 丢弃。
+4. Desktop、`/remote` 与跨 Host 远端：Desktop 本机读写与 legacy 迁移、手机 `/remote` 代理、跨 Host 远端读写及缺服务 fail-closed 行为不变。
+
 ## 手机设置页单栏布局
 
 - 生效条件：`!isDesktop && useIsMobileCompactViewport()`（`max-width: 767px`）。宽屏桌面与窄窗口桌面保持原双栏。

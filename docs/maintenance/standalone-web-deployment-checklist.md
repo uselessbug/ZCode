@@ -9,13 +9,14 @@
   - `node --test scripts/zcode-distribution.test.mjs`：10 项通过（启动器路由、安装脚本、`node-pty` 预编译保护、15 个官方插件与 `bundled-skills` 组装及运行时门禁）。
   - `pnpm exec tsx packages/web/test/e2e/manual-review/pending/standalone-multi-root-projects.mjs`：7 项通过（多 root 增删、任务移动缺 root 确认与增补、普通远端单 root 门禁、跨 Host 拒绝）。
   - `pnpm exec tsx packages/web/test/e2e/manual-review/pending/standalone-memory-files.mjs`：5 项通过（项目记忆读取与保存、权限保留、乐观并发冲突拒绝、越界与超限拦截）。
-  - 根级 `pnpm typecheck`、`pnpm lint`、`pnpm architecture:check --changed` 均已通过。
+  - `node packages/web/test/e2e/manual-review/pending/standalone-mcp-routing.mjs`：13 项非 GUI 运行时回归通过（真实模块 + 临时 `HOME`，覆盖独立 Web base Host 读写/启停、首屏 pending fail-closed 与 0 写入、同 base wrapper 并发不误取消、`setMcpStorePlatform` 换绑丢弃旧结果、跳过浏览器旧 `localStorage` 迁移与手动迁移 no-op、Desktop 本机迁移及跨 Host 远端 fail-closed；日志 `/home/agent/.local/state/zcode-mcp-validation-UonqMRyk/runtime-final.log`）。
+  - 2026-11-13 校验状态：`pnpm architecture:check --changed` 通过，改动文件格式检查通过，根级 `pnpm lint` exit 0（含既有 warnings）；根级 `pnpm typecheck` 在当前环境因缺少全量 workspace/node 类型依赖 exit 2；尚未执行 GUI / CI 镜像构建与线上部署。
 - **CI 构建与镜像标签**：
   - 完整打包与镜像构建统一由 GitHub Actions 执行，不要求扩容本地构建内存；部署只使用 GitHub Actions 在目标提交上成功构建出的镜像。
   - 镜像工作流 `sha-<8位>` 标签接线已完成；推送 `main` 后将自动触发 GitHub Actions 执行，待 Actions 成功后拉取对应提交镜像部署。
 - **回退与数据保护**：如需回退，切回基线提交 `364e6c55` 对应镜像（不单靠可变的 `latest` 标签），保持服务端持久化数据目录挂载不变，避免覆盖部署后新增的会话、记忆或配置数据。
 
-## 2. 本轮改动实机验证项（6 项）
+## 2. 本轮改动实机验证项（7 项）
 
 ### (1) 项目多目录保存/编辑与任务移入、跨项目移动（2026-11-12 实机验证通过）
 
@@ -48,6 +49,12 @@
 ### (6) 内置 `skill-creator` 默认加载与动态工作流资源（`dynamic-workflows`）随包就绪（2026-11-12 实机验证通过）
 
 - **实机验证结果（2026-11-12）**：已通过。用户确认内置官方插件与内置技能资源均齐全可用。
+
+### (7) 独立 Web 设置页“当前服务器”与项目 MCP 读写、启停与重连（2026-11-13 源码已修，待 CI 构建与部署实机验收）
+
+- **待实机验证要点**（待 CI 构建与部署后验收）：
+  - 打开「设置 -> MCP」，在“当前服务器”与具体项目间切换，用户级 MCP（如 `browser`、`rea`）与项目级 MCP 在“已安装”分组正常展示并刷新连接状态，不再显示“已安装 0”。
+  - 新增、编辑、删除、启停 MCP 持久化到当前服务器，刷新页面或重连后保持；首次加载不闪现假空列表；Desktop 本机、手机 `/remote` 与跨 Host 远端行为不退化。
 
 ## 3. 保留待确认、待复核与暂缓项
 

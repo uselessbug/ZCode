@@ -2157,6 +2157,10 @@ async function bootstrapWebApp() {
                 <Root
                   services={services}
                   platform={platform}
+                  // 独立 Web：入口显式声明本页 user/project MCP 归属当前服务器 base Host。
+                  // 无 workspaceIdentity 时 store 必须走该 Host 的 mcpSyncService，
+                  // 不得回退无桌面代理的 Web platform 空实现。
+                  mcpBaseHostDirectoryService={services.mcpSyncService}
                   initialWorkspaceAbsPath={bootstrap.initialWorkspaceAbsPath}
                   initialWorkspaceIdentity={bootstrap.initialWorkspaceIdentity}
                   initialTaskId={bootstrap.initialTaskId}
