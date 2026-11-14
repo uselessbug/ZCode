@@ -72,6 +72,8 @@ jobs:
             scripts/architecture/architecture-check.mjs check --changed
       # ci-browser 是 ci-deps 的同级 stage，复用同一份已安装依赖的层缓存，
       # 只额外装系统 Chromium 并跑定向浏览器回归；不进入 build 与发布镜像。
+      - name: Run targeted browser regression
+        run: docker build --target ci-browser -t zcode:ci-browser .
       - name: Build ARM64 image from this checkout
         run: |
           version="$(node -p "require('./package.json').version")"

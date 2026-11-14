@@ -184,7 +184,7 @@ export function InlineEditableProviderCard({
   settingsRevision?: number;
 }) {
   const { intl } = useZCodeIntl();
-  const { dismissFeedback, showFeedback } = useProviderDetailFeedback();
+  const { beginOperation, dismissFeedback, showFeedback } = useProviderDetailFeedback();
   const [editingName, setEditingName] = useState(false);
   const [nameValue, setNameValue] = useState(getProviderFormLabel(provider));
   const [apiFormat, setApiFormat] = useState<ProviderApiType>(
@@ -218,6 +218,7 @@ export function InlineEditableProviderCard({
     providerId: provider.providerId,
     providerDisplayName,
     formatMessage: intl.formatMessage,
+    beginOperation,
     dismissFeedback,
     showFeedback,
   });
@@ -225,6 +226,7 @@ export function InlineEditableProviderCard({
     providerId: provider.providerId,
     providerDisplayName,
     formatMessage: intl.formatMessage,
+    beginOperation,
     dismissFeedback,
     showFeedback,
   };
@@ -275,12 +277,17 @@ export function InlineEditableProviderCard({
   const runSaveOperation = useCallback(
     async (operation: () => Promise<void>, target: ProviderSaveNotificationTarget = {}) => {
       selfSaveRequestedRef.current = true;
-      const revision = draftRevisionRef.current + 1;
-      draftRevisionRef.current = revision;
       const notification = saveNotificationRef.current;
       const dedupeKey = target.modelId
         ? `model-save:${notification.providerId}:${target.modelId}`
         : `provider-save:${notification.providerId}`;
+      // 反馈归属：通知 key 的最新操作实例（由 Boundary 唯一持有，过期实例的反馈会被它丢弃）。
+      // draftRevision 只保护 Provider 表单草稿对应的 provider-save 通知，不得抑制独立的模型级通知。
+      const operationId = notification.beginOperation(dedupeKey);
+      const draftRevision = draftRevisionRef.current;
+      const shouldApplyCompletion = () =>
+        Boolean(target.modelId) ||
+        shouldApplyProviderSaveCompletion(draftRevisionRef.current, draftRevision);
       const messageValues = {
         provider: notification.providerDisplayName,
         model: target.modelId ?? "",
@@ -304,6 +311,7 @@ export function InlineEditableProviderCard({
           };
       notification.showFeedback({
         key: dedupeKey,
+        operationId,
         message: notification.formatMessage(
           {
             id: messageIds.pending,
@@ -315,9 +323,10 @@ export function InlineEditableProviderCard({
       });
       try {
         await operation();
-        if (!shouldApplyProviderSaveCompletion(draftRevisionRef.current, revision)) return;
+        if (!shouldApplyCompletion()) return;
         notification.showFeedback({
           key: dedupeKey,
+          operationId,
           message: notification.formatMessage(
             {
               id: messageIds.success,
@@ -328,9 +337,10 @@ export function InlineEditableProviderCard({
         });
       } catch (error) {
         selfSaveRequestedRef.current = false;
-        if (shouldApplyProviderSaveCompletion(draftRevisionRef.current, revision)) {
+        if (shouldApplyCompletion()) {
           notification.showFeedback({
             key: dedupeKey,
+            operationId,
             message: notification.formatMessage(
               {
                 id: messageIds.failure,

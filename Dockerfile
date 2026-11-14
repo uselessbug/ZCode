@@ -21,6 +21,17 @@ RUN pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pe
 # 复用同一份已安装依赖，避免在 runner 上再做一次全量 pnpm install。
 FROM build-base AS ci-deps
 
+# ci-browser 只服务于定向浏览器回归：在 ci-deps 之上补系统 Chromium 与中文字库。
+# 刻意做成 ci-deps 的同级 stage（而非 build 的中间层），正式 build 仍从 ci-deps 出发，
+# 不把浏览器依赖带进 build 与最终 runtime 镜像。
+FROM ci-deps AS ci-browser
+RUN apt-get update && apt-get install -y --no-install-recommends chromium fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+ENV CHROME_EXECUTABLE_PATH=/usr/bin/chromium
+# 定向 Provider 详情反馈竞态回归（src 修复随源码进入本 stage）。
+# 测试自身用 chromium.launch() 且未开 chromiumSandbox，Playwright 默认即 --no-sandbox，容器 root 可直接跑。
+RUN node --test packages/ui/test/browser/manual-review/pending/provider-feedback-race.test.mjs
+
 FROM ci-deps AS build
 RUN pnpm --filter @zcode/server... build
 # shared is source-exported and has no build script; the distribution collector
