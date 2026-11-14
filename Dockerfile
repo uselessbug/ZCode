@@ -59,6 +59,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git openssh-client bash python3 python3-venv ca-certificates curl ripgrep \
     chromium fonts-noto-cjk unzip zip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Docker CLI and Compose V2 from Docker's official Debian repository.
+# The host Docker daemon is accessed through a mounted socket; do not install Docker Engine.
+RUN set -eux; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
+    chmod a+r /etc/apt/keyrings/docker.asc; \
+    . /etc/os-release; \
+    printf 'Types: deb\nURIs: https://download.docker.com/linux/debian\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+      "$VERSION_CODENAME" "$(dpkg --print-architecture)" \
+      > /etc/apt/sources.list.d/docker.sources; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin; \
+    docker --version; \
+    docker compose version; \
+    rm -rf /var/lib/apt/lists/*
 # Install the official latest stable GH CLI whenever release metadata changes.
 # Remote ADD checks release metadata so this layer can refresh across builds.
 ADD https://api.github.com/repos/cli/cli/releases/latest /tmp/gh-cli-release.json
