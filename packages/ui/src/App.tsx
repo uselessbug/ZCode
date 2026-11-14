@@ -20,6 +20,11 @@ import { isWorkspaceReadOnly, isWorkspaceTab } from "@/store/tabStore.js";
 import type { TaskChatMessage as TestChatMessage } from "@/lib/taskChatMessageTypes.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { useIsOfficeMode } from "@/hooks/useInterfaceMode.js";
+import { useComposerClientNamespace } from "@/hooks/useServices.js";
+import {
+  rememberComposerWorkspaceScope,
+  resolveComposerScope,
+} from "@/v4/composer/composerDraftStore.js";
 import { getPathLeaf } from "@/lib/path.js";
 import {
   addPluginStoreOpenListener,
@@ -157,6 +162,8 @@ export function App({
   const platform = usePlatform();
   // 命令中心「重新加载扩展」：只有桌面本机 Host 提供扩展门面时才出现。
   const reloadExtensions = useReloadExtensions();
+  // 非项目工作区的草稿/scope 必须与编辑器侧使用同一命名空间，否则刷新后会另建目录。
+  const composerClientNamespace = useComposerClientNamespace();
   // 进程内存本地诊断日志：每窗口一个 60s 采样器，
   // 经门控后写桌面主日志；Web 端无日志桥时为 no-op。同一次读数还经 preload 桥把 heap 送 main 的
   // renderer_main 资源事件，无桥时同样 no-op。
@@ -837,17 +844,35 @@ export function App({
         useWorkbenchGroupStore.getState().deactivateActiveGroup();
         usePaneLayoutStore.getState().resetToPrimaryPane();
       }
+      const conversationScope =
+        targetWorkspacePurpose === "conversation"
+          ? resolveComposerScope(null, resolvedTargetWorkspaceIdentity, composerClientNamespace)
+          : null;
+      if (conversationScope) {
+        // 非项目工作区先固定 scope 归属；否则草稿读取会把上次项目归属带进来。
+        rememberComposerWorkspaceScope(
+          targetWorkspacePath,
+          resolvedTargetWorkspaceIdentity,
+          conversationScope,
+        );
+      }
       store.startDraft(
         targetWorkspacePath,
         targetSelectedProvider,
         resolvedTargetWorkspaceIdentity,
-        { createSource: createSource ?? "project" },
+        {
+          createSource: createSource ?? "project",
+          // 从项目切换到“不在项目中工作”或点击项目 chip 的 X 时必须显式清空归属，
+          // 否则草稿仍按旧 projectId 读取，转移过来的内容会落到原项目。
+          ...(conversationScope ? { projectId: null } : {}),
+        },
       );
     },
     [
       activateTabByPath,
       addTab,
       tabStoreApi,
+      composerClientNamespace,
       workspaceShellZCodeState.selectedProvider,
       webRemoteControlWorkspaceSwitcher,
     ],

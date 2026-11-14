@@ -7,7 +7,11 @@ import { resolve } from "node:path";
 
 import {
   copyRuntimeNodeModules,
+  officialPluginStagingTargets,
   patchNodePtyPrebuilds,
+  stageBundledSkillAssets,
+  stageOfficialPluginAssets,
+  stagePluginNativeRuntimeDependencies,
   stageTuiRuntime,
 } from "./zcode-distribution/assets.mjs";
 import { installScriptSource } from "./zcode-distribution/installer.mjs";
@@ -146,12 +150,26 @@ async function buildOutputs(skipBuild) {
   }
 
   run("pnpm", ["--filter", "@zcode/cli...", "build"]);
+  buildOfficialPluginRuntimes();
   await rm(resolve(root, "packages", "server", "dist"), {
     force: true,
     recursive: true,
   });
   run("pnpm", ["--filter", "@zcode/server", "build"]);
   run("pnpm", ["--filter", "@zcode/web", "build"]);
+}
+
+// 官方运行时插件不在 @zcode/cli 的依赖闭包里，`--filter @zcode/cli...` 不会构建它们；
+// 而 stage 阶段要求每个 requiresRuntime 插件都有 dist/mcp/server.js。清单取自同一份 SEA 官方清单。
+function buildOfficialPluginRuntimes() {
+  const runtimePlugins = officialPluginStagingTargets().filter((target) => target.requiresRuntime);
+  if (runtimePlugins.length === 0) return;
+  run("pnpm", [
+    "--dir",
+    "apps/zcode-cli",
+    ...runtimePlugins.flatMap((target) => ["--filter", target.packageName]),
+    "build",
+  ]);
 }
 
 async function stageZCodePackage({ packageRoot, version }) {
@@ -161,6 +179,8 @@ async function stageZCodePackage({ packageRoot, version }) {
   const agentProvider = resolve(root, "apps/zcode-cli/packages/cli/dist/provider");
 
   await assertDirectory(webDist, "web dist");
+  // 中断的 Vite 构建可能留下空 dist；不能仅凭目录存在就发布缺少网页入口的 tar。
+  await assertFile(resolve(webDist, "index.html"), "web HTML entry");
   await assertDirectory(serverDist, "server dist");
   await assertFile(resolve(serverDist, "entry-http.js"), "server HTTP entry");
   await assertFile(agentBundle, "agent app-server bundle");
@@ -193,6 +213,11 @@ async function stageZCodePackage({ packageRoot, version }) {
   await chmod(resolve(packageRoot, "agent", "zcode.cjs"), 0o755);
 
   await stageTuiRuntime(packageRoot);
+  // 内置官方插件与技能包：bootstrap 沿 agent/zcode.cjs 旁的 packages/* 定位并 seed。
+  // 复用 SEA 采集器的官方清单，缺清单/必需资产/运行时会在此中止，不会归档半成品。
+  await stageOfficialPluginAssets(packageRoot);
+  await stageBundledSkillAssets(packageRoot);
+  await stagePluginNativeRuntimeDependencies(packageRoot);
   await copyRuntimeNodeModules(packageRoot);
   await patchNodePtyPrebuilds(packageRoot);
 

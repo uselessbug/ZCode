@@ -1,17 +1,67 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { patchNodePtyPrebuilds } from "./zcode-distribution/assets.mjs";
+import {
+  copyRuntimeNodeModules,
+  officialPluginStagingTargets,
+  patchNodePtyPrebuilds,
+  stageBundledSkillAssets,
+  stageOfficialPluginAssets,
+  stagePluginNativeRuntimeDependencies,
+} from "./zcode-distribution/assets.mjs";
 import { installScriptSource } from "./zcode-distribution/installer.mjs";
 
 const exec = promisify(execFile);
 const runnerSource = new URL("./zcode-distribution/runner.mjs", import.meta.url);
+const repoRoot = resolve(import.meta.dirname, "..");
+const cliRoot = resolve(repoRoot, "apps/zcode-cli");
+const cliPackagesRoot = resolve(cliRoot, "packages");
+
+async function stageRoot(t) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "zcode-builtin-assets-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const packageRoot = join(directory, "zcode");
+  await mkdir(packageRoot, { recursive: true });
+  return packageRoot;
+}
+
+async function assertSameFile(stagedFile, sourceFile) {
+  assert.deepEqual(await readFile(stagedFile), await readFile(sourceFile), stagedFile);
+}
+
+// 递归找出不应出现的目录名，验证内置资产不是靠整份 node_modules 拷贝来的。
+async function findDirectories(rootPath, name) {
+  const found = [];
+  async function visit(current) {
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const child = join(current, entry.name);
+      if (entry.name === name) {
+        found.push(child);
+        continue;
+      }
+      await visit(child);
+    }
+  }
+  await visit(rootPath);
+  return found;
+}
 
 async function fixture(t) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "zcode-distribution-")));
@@ -190,4 +240,140 @@ test("node-pty prebuild patch keeps the official native that matches the officia
   assert.equal(await readFile(join(prebuilds, "darwin-arm64/pty.node"), "utf8"), "official-1.1.0");
   // 官方包缺失的平台仍由平台包补齐。
   assert.ok((await readFile(join(prebuilds, "linux-x64/pty.node"))).length > 0);
+});
+
+// 内置技能包不进市场、没有版本身份，bootstrap 在 agent/zcode.cjs 旁按 packages/bundled-skills
+// 原地读取；漏 stage 会让 Node 发行包的 /workflow 展开后加载不到技能。
+test("bundled skill pack is staged next to the agent entry", async (t) => {
+  const packageRoot = await stageRoot(t);
+  await stageBundledSkillAssets(packageRoot);
+  const stagedRoot = join(packageRoot, "agent/packages/bundled-skills");
+  for (const relativePath of [
+    "skills/dynamic-workflows/SKILL.md",
+    "skills/dynamic-workflows/patterns.md",
+    "skills/dynamic-workflows/examples.md",
+  ]) {
+    await assertSameFile(
+      join(stagedRoot, ...relativePath.split("/")),
+      join(cliPackagesRoot, "bundled-skills", ...relativePath.split("/")),
+    );
+  }
+  // 重复 stage 必须清理上一轮残留，避免发行包带上已删除的技能文件。
+  const stale = join(stagedRoot, "skills/dynamic-workflows/stale.md");
+  await writeFile(stale, "stale");
+  await stageBundledSkillAssets(packageRoot);
+  assert.equal(await stat(stale).catch(() => null), null);
+});
+
+// 官方插件的期望清单只能来自 SEA 采集器；这里验证 stage 出的目录布局就是 bootstrap
+// filesystem seed 的 rootCandidates（agent/packages/<x>-plugin），且不带插件 node_modules。
+test("official plugin assets are staged under agent/packages from the SEA list", async (t) => {
+  const packageRoot = await stageRoot(t);
+  const stagedNames = await stageOfficialPluginAssets(packageRoot, { requireRuntime: false });
+  const targets = officialPluginStagingTargets();
+  assert.deepEqual(stagedNames.toSorted(), targets.map((target) => target.name).toSorted());
+
+  for (const target of targets) {
+    assert.match(target.directory, /^packages\//u);
+    const pluginRoot = join(packageRoot, "agent", target.directory);
+    assert.ok((await stat(join(pluginRoot, ".zcode-plugin/plugin.json"))).isFile(), target.name);
+    for (const relativePath of target.requiredSeedPaths) {
+      assert.ok(
+        (await stat(join(pluginRoot, ...relativePath.split("/"))).catch(() => null))?.isFile(),
+        `${target.name} missing seed asset ${relativePath}`,
+      );
+    }
+    assert.deepEqual(await findDirectories(pluginRoot, "node_modules"), []);
+  }
+
+  await assertSameFile(
+    join(packageRoot, "agent/packages/visualize-plugin/skills/visualize/SKILL.md"),
+    join(cliPackagesRoot, "visualize-plugin/skills/visualize/SKILL.md"),
+  );
+});
+
+// 插件 native 依赖（sharp/koffi）只按 desktop 的官方 producer 门禁 stage：当前仓库的
+// @zcode/zcode-cua 不声明 sharp，因此必须整体跳过，且绝不在插件目录里塞 node_modules。
+test("plugin native dependency staging follows the official producer gate", async (t) => {
+  const packageRoot = await stageRoot(t);
+  await stageOfficialPluginAssets(packageRoot, { requireRuntime: false });
+  const staged = await stagePluginNativeRuntimeDependencies(packageRoot);
+  const pluginRoots = officialPluginStagingTargets().map((target) =>
+    join(packageRoot, "agent", target.directory),
+  );
+  const declaredByComputerUse = await readFile(
+    join(repoRoot, "packages/zcode-cua/package.json"),
+    "utf8",
+  )
+    .then(JSON.parse)
+    .then((manifest) =>
+      ["dependencies", "optionalDependencies", "peerDependencies"].some(
+        (field) => typeof manifest[field]?.sharp === "string",
+      ),
+    )
+    .catch(() => false);
+  if (declaredByComputerUse) {
+    assert.ok(staged.length > 0, "sharp-declaring Computer Use SDK must stage native deps");
+  } else {
+    assert.deepEqual(staged, []);
+    for (const pluginRoot of pluginRoots) {
+      assert.equal(
+        await stat(join(pluginRoot, "node_modules")).catch(() => null),
+        null,
+        pluginRoot,
+      );
+    }
+  }
+});
+
+// 运行时插件缺少 producer 产物时必须让发行包构建失败，而不是归档一个启动即坏的插件。
+// 期望值直接取仓库里 producer 产物的真实状态，因此「缺 dist 报错」与「已构建则通过」两种状态都被覆盖。
+test("official plugin runtime gate matches the producer state", async (t) => {
+  const packageRoot = await stageRoot(t);
+  const runtimesMissing = [];
+  for (const target of officialPluginStagingTargets()) {
+    for (const relativePath of target.requiredRuntimePaths) {
+      // target.directory 已经是相对 apps/zcode-cli 的 packages/<x>-plugin。
+      const runtime = join(cliRoot, target.directory, ...relativePath.split("/"));
+      if (!(await stat(runtime).catch(() => null))?.isFile()) {
+        runtimesMissing.push(`${target.name}/${relativePath}`);
+      }
+    }
+  }
+  if (runtimesMissing.length > 0) {
+    await assert.rejects(
+      () => stageOfficialPluginAssets(packageRoot),
+      /Missing .*(MCP runtime|runtime asset)/u,
+    );
+    return;
+  }
+  await stageOfficialPluginAssets(packageRoot);
+  for (const target of officialPluginStagingTargets()) {
+    for (const relativePath of target.requiredRuntimePaths) {
+      assert.ok(
+        (
+          await stat(join(packageRoot, "agent", target.directory, ...relativePath.split("/")))
+        ).isFile(),
+        `${target.name} runtime ${relativePath}`,
+      );
+    }
+  }
+});
+
+// server 与 agent 均将 @napi-rs/keyring 设为 external；发行包 node_modules 必须携带包装器及可用平台原生包。
+test("runtime node_modules includes externalized @napi-rs/keyring for server and agent", async (t) => {
+  const packageRoot = await stageRoot(t);
+  await mkdir(join(packageRoot, "agent"), { recursive: true });
+  await copyRuntimeNodeModules(packageRoot);
+  const keyringManifest = JSON.parse(
+    await readFile(join(packageRoot, "node_modules/@napi-rs/keyring/package.json"), "utf8"),
+  );
+  assert.equal(keyringManifest.name, "@napi-rs/keyring");
+  const suffix =
+    process.platform === "linux" ? "-gnu" : process.platform === "win32" ? "-msvc" : "";
+  const hostNativePackage = `@napi-rs/keyring-${process.platform}-${process.arch}${suffix}`;
+  const nativeManifest = JSON.parse(
+    await readFile(join(packageRoot, "node_modules", hostNativePackage, "package.json"), "utf8"),
+  );
+  assert.equal(nativeManifest.name, hostNativePackage);
 });

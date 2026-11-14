@@ -1,17 +1,24 @@
+import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import {
   PROJECT_MEMORY_FILE_CHANGED_ERROR_CODE,
+  PROJECT_MEMORY_FILE_MAX_BYTES,
   PROJECT_MEMORY_PREVIEW_LIMIT_EXCEEDED_ERROR_CODE,
 } from "#src/memory/memory.js";
 
-const PROJECT_MEMORY_PREVIEW_MAX_BYTES = 5 * 1024 * 1024;
+const PROJECT_MEMORY_PREVIEW_MAX_BYTES = PROJECT_MEMORY_FILE_MAX_BYTES;
+
+/** 正文 sha256（hex），供保存时做乐观并发校验；与读取保持同一编码。 */
+export function hashProjectMemoryContent(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
 
 export async function readProjectMemoryFileFromStableHandle(params: {
   fileName: string;
   filePath: string;
   validatePath: () => Promise<void>;
-}): Promise<{ content: string; updatedAt: number }> {
+}): Promise<{ content: string; updatedAt: number; contentHash: string }> {
   const preOpenStat = await lstat(params.filePath, { bigint: true });
   if (!preOpenStat.isFile() || preOpenStat.isSymbolicLink()) {
     throw new Error(`Project Memory file is not a regular file: ${params.filePath}`);
@@ -54,6 +61,8 @@ export async function readProjectMemoryFileFromStableHandle(params: {
     return {
       content: content.toString("utf-8"),
       updatedAt: Number(finalStat.mtimeNs) / 1_000_000,
+      // hash 原始字节，保证与保存端对 utf8 字节的 hash 一致；损坏编码也保持稳定比较。
+      contentHash: createHash("sha256").update(content).digest("hex"),
     };
   } finally {
     await handle.close();

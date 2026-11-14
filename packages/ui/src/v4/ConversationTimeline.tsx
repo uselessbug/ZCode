@@ -270,7 +270,7 @@ function getUnitHeightCacheKey(unit: ConversationTurnRenderUnit | undefined): st
 
 export interface ConversationTimelineProps {
   rows: readonly ConversationRow[];
-  /** 手机远控窄屏允许整条会话 flex 链按抽屉宽度收缩；桌面布局保持原样。 */
+  /** 保留调用方契约；时间线自身对所有端无条件 min-w-0，不再依赖该标志收缩。 */
   compactForRemoteControl?: boolean;
   /** CLI 权威 queue 中等待 model-step 注入的 guide；只改变 renderer 落位。 */
   pendingGuides?: readonly QueueItem[];
@@ -382,7 +382,6 @@ export interface ConversationTimelineProps {
  */
 function ConversationTimelineImpl({
   rows,
-  compactForRemoteControl = false,
   pendingGuides = EMPTY_PENDING_GUIDES,
   apiRetry = null,
   totalCount,
@@ -1970,7 +1969,8 @@ function ConversationTimelineImpl({
       ref={timelineRootRef}
       className={cn(
         "relative flex min-h-0 flex-1 flex-col",
-        compactForRemoteControl && "min-w-0",
+        // 独立 Web 的窄屏不走 compactForRemoteControl，时间线仍必须允许收缩，否则长内容撑出横向滚动。
+        "min-w-0",
         // 原先消息层的 mask 靠 scroll 回调追赶合成滚动，快速滚动会闪黑并漏字。
         // 把底部留白移到视口外，由原生 overflow 裁剪；输入框仍在同一视口内 sticky。
         hasBottomDock && !centeredEmptyLayout && !floatingComposerDock && "pb-4",
@@ -2039,7 +2039,7 @@ function ConversationTimelineImpl({
           // 分享选择面板展开时改为 overflow-hidden：scrollTop 与 scrollbar-gutter 都保持不变，
           // 但原生滚动条、滚轮和键盘翻页都不再能移动背景，勾选目标不会漂走。
           backgroundScrollLocked && "!overflow-y-hidden",
-          compactForRemoteControl && "min-w-0",
+          "min-w-0",
           // 浮窗形态：滚动容器止于输入框上方 12px，消息底部再留 16px 空白。
           floatingComposerDock &&
             "mb-[calc(var(--v4-floating-composer-dock-height,0px)+12px)] pb-4",

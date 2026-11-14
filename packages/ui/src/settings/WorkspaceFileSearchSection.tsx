@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button.js";
 import { Textarea } from "@/components/ui/textarea.js";
 import { toast } from "@/components/ui/toast.js";
 import { usePlatform } from "@/hooks/usePlatform.js";
+import { useOpenHostDirectory } from "@/hooks/useFileContextActions.js";
 import { useWorkspaceServicesResolution } from "@/hooks/useWorkspaceServices.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { SettingsGroupCard } from "@/settings/SettingsPageParts.js";
@@ -60,8 +61,14 @@ function ActiveWorkspaceFileSearchEditor({
   workspaceIdentity?: string;
 }) {
   const { intl } = useZCodeIntl();
+  // intl 每次语言切换都会换引用；读取/保存只应在 workspace/目标变化时重跑，
+  // 不能因语言变化重新 load 覆盖草稿，故用 ref 取最新文案。
+  const intlRef = useRef(intl);
+  intlRef.current = intl;
   const platform = usePlatform();
   const resolution = useWorkspaceServicesResolution(workspacePath, undefined, workspaceIdentity);
+  // 远端判定用真实解析目标，不只看 workspaceIdentity：本地路径也可能是 remote tab 的 path-only 调用。
+  const openHostDirectory = useOpenHostDirectory({ isRemoteWorkspace: resolution.isRemoteTarget });
   const services = resolution.services;
   const rpcReady = resolution.rpcReady;
 
@@ -94,13 +101,13 @@ function ActiveWorkspaceFileSearchEditor({
       logger.warn("[WorkspaceFileSearchSection] 读取 .zcodeignore 失败", {
         error: error instanceof Error ? error.message : String(error),
       });
-      toast(intl.formatMessage({ id: "settings.workspaceFileSearch.loadFailed" }));
+      toast(intlRef.current.formatMessage({ id: "settings.workspaceFileSearch.loadFailed" }));
     } finally {
       if (loadVersionRef.current === version) {
         setLoading(false);
       }
     }
-  }, [intl, rpcReady, services, workspacePath]);
+  }, [rpcReady, services, workspacePath]);
 
   // 分区操作：只重写对应标记区（sync-gitignore 重写 gitignore 同步区；reset-defaults
   // 重置默认排除段），用户自定义规则区不受影响；结果填充编辑框，保存才落盘。
@@ -129,10 +136,12 @@ function ActiveWorkspaceFileSearchEditor({
           transform,
           error: error instanceof Error ? error.message : String(error),
         });
-        toast(intl.formatMessage({ id: "settings.workspaceFileSearch.transformFailed" }));
+        toast(
+          intlRef.current.formatMessage({ id: "settings.workspaceFileSearch.transformFailed" }),
+        );
       }
     },
-    [intl, rpcReady, services, workspacePath],
+    [rpcReady, services, workspacePath],
   );
 
   useEffect(() => {
@@ -151,23 +160,32 @@ function ActiveWorkspaceFileSearchEditor({
     if (!workspacePath) {
       return;
     }
+    // 保存期间 workspace 切换会让 load 递增 version；旧结果不能落到新编辑区，与 load 共用守卫。
+    const version = loadVersionRef.current;
+    const savedWorkspacePath = workspacePath;
     setSaving(true);
     try {
       await services.fileService.writeWorkspaceFileSearchIgnore({
-        rootPath: workspacePath,
+        rootPath: savedWorkspacePath,
         content: draft,
       });
+      if (loadVersionRef.current !== version) {
+        return;
+      }
       setLoaded({ content: draft, source: "file" });
-      toast(intl.formatMessage({ id: "settings.workspaceFileSearch.saved" }));
+      toast(intlRef.current.formatMessage({ id: "settings.workspaceFileSearch.saved" }));
     } catch (error) {
+      if (loadVersionRef.current !== version) {
+        return;
+      }
       logger.warn("[WorkspaceFileSearchSection] 保存 .zcodeignore 失败", {
         error: error instanceof Error ? error.message : String(error),
       });
-      toast(intl.formatMessage({ id: "settings.workspaceFileSearch.saveFailed" }));
+      toast(intlRef.current.formatMessage({ id: "settings.workspaceFileSearch.saveFailed" }));
     } finally {
       setSaving(false);
     }
-  }, [draft, intl, services, workspacePath]);
+  }, [draft, services, workspacePath]);
 
   // 保存语义是"把编辑框内容落盘"：template 态（.zcodeignore 尚未创建）即使未编辑也允许保存，
   // 否则用户第一次进页面什么都不改就永远无法创建文件；已落盘态才按"有修改才可保存"门控。
@@ -175,17 +193,12 @@ function ActiveWorkspaceFileSearchEditor({
   // "有未保存的修改"提示只表达真实差异（template 态未编辑时不显示）。
   const dirty = loaded !== null && loaded.source === "file" && draft !== loaded.content;
 
-  // 「打开文件位置」：.zcodeignore 位于 workspace 根，打开根目录即所在位置
-  // （与 WindowsCaptionMenuButton/ModelTrajectoryPane 先例一致传目录）。
-  // 远程 workspace 的规则文件在远端机器，本地文件管理器无法打开，按钮不展示。
-  const isLocalWorkspace = !workspaceIdentity?.trim();
+  // Web 的规则文件在服务器，复用页内目录浏览；桌面远端目录（真实 remote 目标）不能交给本机文件管理器。
+  const canReveal = !platform.canOpenLocalFiles || !resolution.isRemoteTarget;
   const revealTargetReady = loaded?.source === "file";
   const handleReveal = useCallback(async () => {
-    const result = await platform.openInFileManager(workspacePath);
-    if (!result.success) {
-      toast(intl.formatMessage({ id: "appHeader.openInFileManagerFailed" }));
-    }
-  }, [intl, platform, workspacePath]);
+    await openHostDirectory({ path: workspacePath, workspacePath, workspaceIdentity });
+  }, [openHostDirectory, workspaceIdentity, workspacePath]);
 
   return (
     // 排版对齐设置页统一规范：导语 + SettingsGroupCard 卡片，
@@ -216,7 +229,7 @@ function ActiveWorkspaceFileSearchEditor({
             }}
             spellCheck={false}
             disabled={loading || saving}
-            className="min-h-64 w-full font-mono text-ui-base"
+            className="min-h-64 w-full font-mono text-ui-base max-md:text-mobile-input-safe"
             aria-label={intl.formatMessage({ id: "settings.workspaceFileSearch.editorLabel" })}
             data-testid="workspace-file-search-ignore-editor"
           />
@@ -251,7 +264,7 @@ function ActiveWorkspaceFileSearchEditor({
               <Undo2 className="size-4" />
               {intl.formatMessage({ id: "settings.workspaceFileSearch.restoreDefaults" })}
             </Button>
-            {isLocalWorkspace ? (
+            {canReveal ? (
               <Button
                 variant="outline"
                 size="sm"

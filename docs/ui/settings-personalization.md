@@ -22,8 +22,10 @@
 - **建目录在取锁之前（CR-01 回归修复）**：`acquireFileLock` 以不带 recursive 的 `mkdir` 创建锁文件，`~/.zcode` 不存在时取锁直接 ENOENT 失败；因此「按需创建目录」必须发生在取锁前。桌面 Host 启动即写 `~/.zcode/v2`，实际很难遇到目录缺失，但该顺序保证任何环境（如 CLI 从未运行过的 home）首次保存仍能成功。UI 级 E2E 无法构造「应用已启动但 `~/.zcode` 缺失」（启动本身会创建目录），该分支由顺序结构保证。
 - **文件权限固定私有（CR-01 权限）**：写入用 `atomicWritePrivateTextFile`（临时文件 `0600` 后 rename）。不能用不带 mode 的 `atomicWriteText`：rename 换 inode 后既有 `0600` 文件会放宽为 umask 默认（常见 `0644`），同机其他账号可读用户指令。固定 `0600` 只会收紧、不会放宽既有权限。
 - **字节上限与 Agent 读取一致（SG-01）**：共享常量 `USER_INSTRUCTIONS_MAX_BYTES`（`packages/shared/src/userInstructions.ts`，100KB，与 CLI adapter 的 DEFAULT_MAX_BYTES 对齐、两侧改动须同步）。服务端 `saveUserInstructions` 超限抛 `user_instructions_too_large`（最终防线，防其他 RPC 调用方绕过 UI）；UI 显示 UTF-8 字节计数（`x KB / 100 KB`），超限阻断保存并提示，防止「保存成功但 Agent 静默截断」的误判。
-- UI **仅桌面本地入口**渲染编辑器（`isDesktop`）：手机远控的 base services 可能归属远程 Source——`remoteWorkspaceServiceCollection` 把远程 Source 的 `settingService` 注册进该 workspace 的服务集合，文件路径不是跨机器身份，编辑会写错机器。Web 端只显示「前往本地桌面端设置」的指引（同 Memory 分区 localOnly 先例），不发起任何读写。桌面端激活远程 workspace 时编辑的仍是本机文件（远程 agent 的指令文件属于远端机器，本功能不覆盖）。界面文案明确「应用到你本机 Agent 的后续会话；远程设备需单独配置」。
-- Web/手机远控始终只显示前往本地桌面端的指引，不调用个性化读写服务；未连 bridge 前的本地 stub 抛 unsupported 错误仅作防御。
+- 桌面本地入口与独立 Web 复用同一编辑器：`isDesktop || isStandaloneWeb`。`SettingsPage` 使用既有入口标记 `!isDesktop && !isWebRemoteControl` 识别独立 Web，注入 `localHostServices.settingService`；独立 Web 的 base Host 是服务器，桌面入口的 base Host 是本机。指令归属由 Host 决定，不由浏览器设备决定。
+- 官方 relay 手机远控保持仅桌面指引，不发起个性化读写：该入口的 base services 可能归属远程 Source（`remoteWorkspaceServiceCollection`），不能仅按文件路径跨机器编辑。未连接的本地 stub 继续拒绝读写。
+- 桌面端描述仍指本机 Agent；独立 Web 明确说明应用于当前服务器 Agent 的后续会话，手机与电脑访问同一服务器配置。桌面端激活远程 workspace 时仍编辑本机文件，不覆盖其他机器。
+- 不新增服务、存储或写入路径：`编辑器 → base Host settingService → ~/.zcode/AGENTS.md → CLI 用户指令读取`；现有保存队列、草稿及读取失效边界保持不变。
 
 ## UI 行为
 
@@ -46,4 +48,6 @@
   - 超过 100KB（含多字节字符）保存被阻断并提示，回到限内后保存恢复；
   - 未保存草稿跨分区切换存活（PZ-05）；
   - 保存 in-flight 时切走分区、宿主持锁写入超时失败后，重进分区草稿恢复且重试保存成功（PZ-06，用测试进程持有 `AGENTS.md.lock` 构造确定性失败时序）。
+- 独立 Web 浏览器验收：电脑及手机进入设置 → 个性化应直接看到编辑器与服务器说明；读取既有指令，修改后显式保存，重开后回显相同内容。切换浏览器设备仍读取同一服务器文件；取消不写入文件，超过 100KB 仍阻止保存。验收时使用隔离数据或用户确认的文本，不覆盖真实指令作探针。
+- 官方 relay 远控仍只显示本地桌面端指引，不调用读写接口；桌面 E2E 同时验证本机描述不变。
 - 代码检查：typecheck、lint、architecture:check --changed。

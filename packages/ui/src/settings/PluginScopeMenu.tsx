@@ -24,6 +24,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu.js";
 import { InputGroup, InputGroupAddon } from "@/components/ui/input-group.js";
+import { useIsServerHostedSettingsScope } from "@/hooks/useFileContextActions.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { getContainingDirectoryPath, getPathLeaf } from "@/lib/path.js";
 import {
@@ -82,6 +83,8 @@ function DeviceScopeMenu({
 }: PluginScopeMenuProps) {
   const { intl } = useZCodeIntl();
   const { device: contextDevice, userAvailable } = useSettingsScopeDevice();
+  // 独立 Web / 手机远控下 user/local 作用域背后是当前服务器 Host；文案统一为「当前服务器」。
+  const serverHosted = useIsServerHostedSettingsScope();
   const menuGroups: readonly SettingsScopeGroup[] = groups ?? [
     {
       device: contextDevice,
@@ -95,11 +98,19 @@ function DeviceScopeMenu({
       ],
     },
   ];
+  const serverUserLabel = intl.formatMessage({ id: "settings.scope.server" });
+  // serverHosted 只适用于「当前服务器承载的 local 作用域」；远端设备仍显示其自身用户/设备名，
+  // 不能因为平台没有本机文件能力就把远端设备分组里的 user 项也写成「当前服务器」。
   const deviceName = (device: SettingsScopeDevice) =>
     device.kind === "local"
-      ? intl.formatMessage({ id: "settings.scope.localDevice" })
+      ? serverHosted
+        ? serverUserLabel
+        : intl.formatMessage({ id: "settings.scope.localDevice" })
       : device.name || intl.formatMessage({ id: "settings.machine.unknownRemote" });
-  const userLabel = intl.formatMessage({ id: "settings.plugin.scope.user" });
+  const deviceUserLabel = (device: SettingsScopeDevice) =>
+    serverHosted && device.kind === "local"
+      ? serverUserLabel
+      : intl.formatMessage({ id: "settings.plugin.scope.user" });
   const selectedGroup = menuGroups.find((group) =>
     group.options.some((option) => option.key === selectedScopeKey),
   );
@@ -109,9 +120,11 @@ function DeviceScopeMenu({
     ? selectedOption.kind === "user"
     : isUserScopeKey(selectedScopeKey);
   const triggerScopeLabel = triggerIsUser
-    ? userLabel
+    ? deviceUserLabel(triggerDevice)
     : (selectedOption?.target?.label ?? selectedLabel ?? selectedScopeKey);
   const TriggerIcon = triggerDevice.kind === "remote" ? Server : triggerIsUser ? Monitor : Folder;
+  // 服务端承载体下「当前服务器 · 当前服务器」会重复；user 作用域只保留单一标签。
+  const collapseServerUserLabel = serverHosted && triggerDevice.kind === "local" && triggerIsUser;
 
   return (
     <DropdownMenu>
@@ -127,15 +140,21 @@ function DeviceScopeMenu({
         >
           <TriggerIcon className="size-4" aria-hidden="true" data-testid={triggerIconTestId} />
           <span className="flex max-w-56 min-w-0 items-center gap-1">
-            <span className="truncate">{deviceName(triggerDevice)}</span>
-            <span
-              data-scope-trigger-separator="true"
-              className="text-foreground-subtlest"
-              aria-hidden="true"
-            >
-              ·
-            </span>
-            <span className="truncate">{triggerScopeLabel}</span>
+            {collapseServerUserLabel ? (
+              <span className="truncate">{serverUserLabel}</span>
+            ) : (
+              <>
+                <span className="truncate">{deviceName(triggerDevice)}</span>
+                <span
+                  data-scope-trigger-separator="true"
+                  className="text-foreground-subtlest"
+                  aria-hidden="true"
+                >
+                  ·
+                </span>
+                <span className="truncate">{triggerScopeLabel}</span>
+              </>
+            )}
           </span>
           <ChevronDown className="size-4 text-foreground-subtlest" aria-hidden="true" />
         </Button>
@@ -156,13 +175,16 @@ function DeviceScopeMenu({
             return (
               <Fragment key={groupId}>
                 {index > 0 ? <DropdownMenuSeparator /> : null}
-                <DropdownMenuLabel
-                  data-scope-device-heading="true"
-                  data-scope-device={groupId}
-                  className="truncate"
-                >
-                  {deviceName(group.device)}
-                </DropdownMenuLabel>
+                {/* 服务端承载体下 user 项已写作「当前服务器」，再渲染同名设备标题会重复。 */}
+                {serverHosted && group.device.kind === "local" ? null : (
+                  <DropdownMenuLabel
+                    data-scope-device-heading="true"
+                    data-scope-device={groupId}
+                    className="truncate"
+                  >
+                    {deviceName(group.device)}
+                  </DropdownMenuLabel>
+                )}
                 {userOption ? (
                   <DropdownMenuRadioItem
                     value={userOption.key}
@@ -171,7 +193,7 @@ function DeviceScopeMenu({
                   >
                     <CircleUserRound className="size-4" aria-hidden="true" />
                     <span className="truncate text-ui-base font-medium text-foreground">
-                      {userLabel}
+                      {deviceUserLabel(group.device)}
                     </span>
                   </DropdownMenuRadioItem>
                 ) : null}

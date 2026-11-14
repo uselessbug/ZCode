@@ -5,6 +5,7 @@ import { usePlatform } from "@/hooks/usePlatform.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { getContainingDirectoryPath } from "@/lib/path.js";
 import { logger } from "@/logger.js";
+import { useOptionalTabStore } from "@/store/TabStoreProvider.js";
 import { getSystemFileLocatorEditorId } from "@/workspace-file-tree/helpers.js";
 
 interface FileContextActionOptions {
@@ -147,4 +148,83 @@ export function useFileContextActions(options: FileContextActionOptions = {}) {
     revealFileInFileManager,
     revealInFileManager,
   };
+}
+
+/**
+ * 当前设置页的 user/local 作用域是否由服务端 Host 承载（独立 Web / 手机远控）。
+ *
+ * 判据是平台是否具备本机文件能力：原生桌面为 true（作用域是「本机」），
+ * 独立 Web / 手机远控为 false（作用域背后是当前服务器 Host）。
+ * 只用于文案，不改变任何 scope 归属或读写目标。
+ */
+export function useIsServerHostedSettingsScope(): boolean {
+  const platform = usePlatform();
+  return !platform.canOpenLocalFiles;
+}
+
+/**
+ * 在“当前 Host”打开一个目录，用于设置页里指向 Host 侧路径的入口（技能目录、workspace 根等）。
+ *
+ * - 桌面端等可调用本机文件管理器的宿主：沿用 `useFileContextActions` 的本机语义与失败提示。
+ *   但当目标是远端（SSH/Docker 等）目录时，路径只在远端 Host 上，不能交给本机文件管理器；
+ *   WSL 例外，仍按既有 hook 转 UNC 处理（`remoteTarget.kind === "wsl"`）。
+ * - 独立 Web / 手机远控：没有本机文件管理器，改为打开页内服务端目录面板（复用 window 级
+ *   `requestFileManager`，由 workspace shell 消费并打开 `openFileManagerSidePane`）。
+ * - 无活动 workspace 时不能走 `requestFileManager`：它按 `workspacePath || path` 建/切换 tab，
+ *   会把技能目录当成持久 workspace。改为交给调用方在页内目录浏览 Dialog 中打开
+ *   （`onBrowseWithoutWorkspace`），不新建临时 workspace 状态。
+ *
+ * 统一在这里判定，避免各处直接调用 `platform.openInFileManager` 后在 Web 静默失败；
+ * 不新建文件管理框架，也不把浏览器/本机所在电脑的路径当成服务端/远端路径。
+ */
+export function useOpenHostDirectory(
+  options: {
+    isRemoteWorkspace?: boolean;
+    remoteTarget?: OpenInEditorRemoteTarget;
+  } = {},
+): (params: {
+  path: string;
+  workspacePath?: string | null;
+  workspaceIdentity?: string;
+  onBrowseWithoutWorkspace?: (path: string) => void;
+}) => Promise<void> {
+  const platform = usePlatform();
+  const { intl } = useZCodeIntl();
+  const requestFileManager = useOptionalTabStore((state) => state.requestFileManager);
+  const fileContextActions = useFileContextActions({
+    canOpenLocalFileManager: platform.canOpenLocalFiles,
+    isRemoteWorkspace: options.isRemoteWorkspace,
+    remoteTarget: options.remoteTarget,
+  });
+
+  return useCallback(
+    async ({ path, workspacePath, workspaceIdentity, onBrowseWithoutWorkspace }) => {
+      const target = { path, kind: "directory" as const };
+      if (fileContextActions.canRevealInFileManager(target)) {
+        await fileContextActions.revealInFileManager(target);
+        return;
+      }
+      if (!workspacePath) {
+        // 无活动项目：requestFileManager 会拿 path 当代建 tab 的 workspace，改成页内目录浏览。
+        if (onBrowseWithoutWorkspace) {
+          onBrowseWithoutWorkspace(path);
+          return;
+        }
+        toast(intl.formatMessage({ id: "appHeader.openInFileManagerFailed" }));
+        return;
+      }
+      if (!requestFileManager) {
+        toast(intl.formatMessage({ id: "appHeader.openInFileManagerFailed" }));
+        return;
+      }
+      requestFileManager({
+        // 有活动 workspace 时用 workspace 承载文件视图，不创建任务。
+        workspacePath,
+        ...(workspaceIdentity?.trim() ? { workspaceIdentity } : {}),
+        revealPath: path,
+        temporaryExternalDirectory: true,
+      });
+    },
+    [fileContextActions, intl, requestFileManager],
+  );
 }

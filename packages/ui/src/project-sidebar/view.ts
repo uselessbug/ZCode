@@ -368,5 +368,12 @@ export function formatProjectError(
   if (code === "project.data-delete-failed")
     return formatMessage({ id: "project.dataDeleteFailed" });
   if (code === "project.data-unavailable") return formatMessage({ id: "project.dataUnavailable" });
+  // remote owner 的存储策略错误必须以可读文案呈现，不能把原始错误码丢给用户。
+  if (code === "project.remote-single-root-required")
+    return formatMessage({ id: "project.remoteSingleRootRequired" });
+  if (code === "project.remote-project-required")
+    return formatMessage({ id: "project.remoteProjectRequired" });
+  if (code === "project.remote-root-immutable")
+    return formatMessage({ id: "project.remoteRootImmutable" });
   return String(cause);
 }

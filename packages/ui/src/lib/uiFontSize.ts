@@ -22,8 +22,11 @@ export function applyUiFontSizePx(fontSizePx: number): void {
   if (!rootStyle?.setProperty) {
     return;
   }
-  // 只更新 UI 字号 Token 的基准变量，避免根 font-size 连带缩放图标、间距和圆角。
-  rootStyle.setProperty("--ui-font-size", `${normalizeUiFontSizePx(fontSizePx)}px`);
+  // 只更新 UI 字号 Token；手机下限由媒体查询提供，保留更大偏好且不缩放图标、间距和圆角。
+  rootStyle.setProperty(
+    "--ui-font-size",
+    `max(${normalizeUiFontSizePx(fontSizePx)}px, var(--mobile-ui-font-floor, 0px))`,
+  );
 }
 
 export function subscribeToUiFontSizeStorageChanges(): () => void {

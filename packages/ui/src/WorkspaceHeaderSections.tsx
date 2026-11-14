@@ -39,6 +39,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+import { logger } from "@/logger.js";
 import {
   formatRemoteWorkspaceDisplayLabel,
   formatRemoteWorkspaceHeaderHostLabel,
@@ -651,6 +652,14 @@ export function WorkspaceHeaderTitleSection({
                         previousState: { pinned: isPinned, archived: false },
                         nextState: { pinned: isPinned, archived: false },
                       });
+                    })
+                    .catch((error) => {
+                      // 缺少失败处理会让"标记未读"在独立 Web 上静默失败，用户只看到"没反应"。
+                      logger.error(
+                        "[WorkspaceHeaderSections] Failed to mark task as unread",
+                        error,
+                      );
+                      toast(intl.formatMessage({ id: "taskList.markAsUnreadFailed" }));
                     });
                 }}
                 onOpenTaskFeedback={() => {

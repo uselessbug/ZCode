@@ -1216,6 +1216,13 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
   /** App 工具只在受信 Host 装配；handler 不接受模型自报权限。 */
   resolveAppControlService?: () => AppControlService | undefined;
   appControlSourceServerId?: string;
+  /**
+   * 仅用于归档永久删除（previewSessionDeletion / executeSessionDeletion）在目标工作区无活跃 CLI 时
+   * 判断是否属于当前独立 Host canonical 工作区；异域远端身份与 remoteSessionId 一律禁止回落控制面。
+   */
+  isDeletionWorkspaceOwnedByCurrentHost?: (
+    workspace: ZCodeAgentWorkspaceTarget,
+  ) => Promise<boolean> | boolean;
   channelReplyExecutor?: (request: ChannelReplyHostRequest) => Promise<ChannelReplyResult>;
   topicResourceExecutor?: (
     request: ZCodeTopicResourceReadParams &
@@ -4250,6 +4257,34 @@ export function createZCodeAgentService(
     return client;
   }
 
+  async function resolveSessionDeletionClient(
+    workspace: ZCodeAgentWorkspaceTarget,
+  ): Promise<ZCodeProtocolClient> {
+    try {
+      return await getReadOnlyClient(workspace, "existing-only");
+    } catch (error) {
+      const runtimeUnavailable =
+        error instanceof Error &&
+        "code" in error &&
+        error.code === ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE;
+      if (!runtimeUnavailable) {
+        throw error;
+      }
+      // 保留 isLocalActiveWorkspaceClient 原边界不变；仅对无远端标识的本机工作区，或由装配层
+      // 确认属于当前 standalone Host canonical 身份且无 remoteSessionId 的工作区回落控制面。
+      const hasWorkspaceIdentity = Boolean(workspace.workspaceIdentity?.trim());
+      const canFallback =
+        !workspace.remoteSessionId &&
+        (hasWorkspaceIdentity
+          ? Boolean(await options?.isDeletionWorkspaceOwnedByCurrentHost?.(workspace))
+          : isLocalActiveWorkspaceClient(workspace));
+      if (!canFallback) {
+        throw error;
+      }
+      return getPluginManagementClient();
+    }
+  }
+
   // 全局工作流的载体运行时选择：
   // 调用方只给 `{ scope: "global" }` 不带 workspace 时，先复用任一已活跃的**本地** runtime
   // （existing-only 语义：只看 activeClientsByWorkspaceKey，绝不为此拉起新进程），否则回落到
@@ -4926,11 +4961,7 @@ export function createZCodeAgentService(
     },
 
     async previewSessionDeletion(params) {
-      const client = isLocalActiveWorkspaceClient(params.workspace)
-        ? await getReadOnlyClient(params.workspace, "existing-only").catch(() =>
-            getPluginManagementClient(),
-          )
-        : await getReadOnlyClient(params.workspace, "existing-only");
+      const client = await resolveSessionDeletionClient(params.workspace);
       return client.request(
         V4_METHODS.sessionDeletionPreview,
         params,
@@ -4938,11 +4969,7 @@ export function createZCodeAgentService(
       );
     },
     async executeSessionDeletion(params) {
-      const client = isLocalActiveWorkspaceClient(params.workspace)
-        ? await getReadOnlyClient(params.workspace, "existing-only").catch(() =>
-            getPluginManagementClient(),
-          )
-        : await getReadOnlyClient(params.workspace, "existing-only");
+      const client = await resolveSessionDeletionClient(params.workspace);
       return client.request(
         V4_METHODS.sessionDeletionExecute,
         params,

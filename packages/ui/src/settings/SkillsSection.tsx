@@ -29,6 +29,7 @@ import type { CreateTaskRequest } from "@/app-shell/types.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { toast } from "@/components/ui/toast.js";
 import { usePlatform } from "@/hooks/usePlatform.js";
+import { useIsServerHostedSettingsScope } from "@/hooks/useFileContextActions.js";
 import { useConfigWorkspaceServicesResolution as useWorkspaceServicesResolution } from "@/workspace-config-catalog/index.js";
 import { useConfirmDialog } from "@/hooks/useConfirmDialog.js";
 import { buildSkillMentionMarkdown } from "@/mentions/mentionMarkdown.js";
@@ -183,6 +184,8 @@ export function SkillsSection({
 }: SkillsSectionProps) {
   const { intl, locale } = useZCodeIntl();
   const platform = usePlatform();
+  // 独立 Web / 手机远控下 user 作用域背后是当前服务器 Host；文案统一为「当前服务器」。
+  const serverHostedScope = useIsServerHostedSettingsScope();
   const plugins = usePluginManagementStore((state) => state.plugins);
   const installedPlugins = usePluginManagementStore((state) => state.installedPlugins);
   const availablePlugins = usePluginManagementStore((state) => state.availablePlugins);
@@ -293,10 +296,12 @@ export function SkillsSection({
             : intl.formatMessage({ id: "settings.skills.scope.plugin" });
         case "user":
         default:
-          return intl.formatMessage({ id: "settings.skills.scope.personal" });
+          return intl.formatMessage({
+            id: serverHostedScope ? "settings.scope.server" : "settings.skills.scope.personal",
+          });
       }
     },
-    [availablePlugins, intl, locale, pluginListingById, workspaceLabel],
+    [availablePlugins, intl, locale, pluginListingById, serverHostedScope, workspaceLabel],
   );
 
   const renderDiagnosticCodeLabel = useCallback(
@@ -500,10 +505,19 @@ export function SkillsSection({
     return groupScopedSkillsBySource(
       [...groupedSkills.local, ...groupedSkills.plugin],
       scopeFilter === "user"
-        ? intl.formatMessage({ id: "settings.scope.user" })
+        ? intl.formatMessage({
+            id: serverHostedScope ? "settings.scope.server" : "settings.scope.user",
+          })
         : workspaceLabel || intl.formatMessage({ id: "settings.scope.workspace" }),
     );
-  }, [groupedSkills.local, groupedSkills.plugin, intl, scopeFilter, workspaceLabel]);
+  }, [
+    groupedSkills.local,
+    groupedSkills.plugin,
+    intl,
+    scopeFilter,
+    serverHostedScope,
+    workspaceLabel,
+  ]);
   const filteredSkillCount = groupedSkills.local.length + groupedSkills.plugin.length;
   const hasEmptySearchResult = Boolean(query.trim()) && filteredSkillCount === 0;
   const directInstalledSkillCount = scopedProviderSkills.filter(

@@ -66,6 +66,7 @@ export function WebRemoteControlMobileShell({
   chatContent,
   chatOverlay,
   initialNavigationIntent,
+  composerPrefillRequestId,
   isSidePaneOpen = false,
   onCloseSidePane,
   renderTaskHome,
@@ -76,12 +77,13 @@ export function WebRemoteControlMobileShell({
 }: {
   children?: ReactNode;
   isMobileViewport?: boolean;
-  switcher: WebRemoteControlWorkspaceSwitcherApi;
+  switcher?: WebRemoteControlWorkspaceSwitcherApi;
   activeWorkspacePath: string;
   activeWorkspaceIdentity?: string;
   activeTaskId: string | null;
   taskViewEnabled?: boolean;
   initialNavigationIntent?: WebRemoteControlMobileNavigationIntent;
+  composerPrefillRequestId?: number;
   isSidePaneOpen?: boolean;
   onCloseSidePane?: () => void;
   renderTaskHome: (options: {
@@ -96,7 +98,9 @@ export function WebRemoteControlMobileShell({
 }) {
   const { intl } = useZCodeIntl();
   const [currentPage, setCurrentPage] = useState<WebRemoteControlMobilePage>(() =>
-    resolveInitialWebRemoteControlMobilePage(initialNavigationIntent),
+    composerPrefillRequestId
+      ? "chat"
+      : resolveInitialWebRemoteControlMobilePage(initialNavigationIntent),
   );
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const terminalTransportState = useWebRemoteControlTerminalTransportState(
@@ -107,6 +111,18 @@ export function WebRemoteControlMobileShell({
   const navigateToChat = useCallback(() => {
     setCurrentPage("chat");
   }, []);
+
+  useEffect(() => {
+    // 普通 Web 设置层只准备了草稿；手机 Home 没有 Composer，必须显式进入 Chat 才能消费预填。
+    // 不观察 currentPage，避免返回 Home 后把已经处理的意图重新执行。
+    if (isMobileViewport && composerPrefillRequestId) navigateToChat();
+  }, [
+    isMobileViewport,
+    composerPrefillRequestId,
+    activeWorkspacePath,
+    activeWorkspaceIdentity,
+    navigateToChat,
+  ]);
 
   const navigateHome = useCallback(() => {
     // 聊天可能是历史首项，浏览器无法后退。箭头直接回列表，并同步历史供刷新恢复。
@@ -159,7 +175,7 @@ export function WebRemoteControlMobileShell({
         switcher={switcher}
       />
       {isMobileViewport ? (
-        <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-background">
+        <div className="mobile-workspace relative flex h-full min-h-0 min-w-0 flex-col bg-background">
           {currentPage === "home" ? (
             <section className="flex h-full min-h-0 min-w-0 flex-col" data-mobile-page="home">
               {renderTaskHome({ navigateToChat, setSwitching: setSwitchingWorkspace })}

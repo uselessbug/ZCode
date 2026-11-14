@@ -93,7 +93,8 @@ export function PluginStorePage({
   const platform = usePlatform();
   const { intl, locale } = useZCodeIntl();
   const { order: storeOrder, refresh: refreshStoreOrder } = usePluginStoreOrder();
-  const { pluginManagementService, skillsService } = useServices();
+  const services = useServices();
+  const { pluginManagementService, skillsService } = services;
   const usePluginManagementStore = useScopedPluginManagementStore(pluginManagementService);
   const pluginUi = useMarketPluginUi({
     paneId,
@@ -874,6 +875,7 @@ export function PluginStorePage({
         onAddMarketplace={handleAddMarketplace}
         activeOperations={activeOperations}
         error={addMarketplaceError}
+        services={services}
       />
     </div>
   );

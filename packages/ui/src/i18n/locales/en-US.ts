@@ -305,6 +305,11 @@ const enUS: Record<string, string> = {
   "project.offline": "Offline",
   "project.legacySingleRoot": "Single folder",
   "project.legacyUpgradeRequired": "Upgrade the server to create and edit projects",
+  "project.remoteSingleRootRequired": "A remote project supports exactly one source folder.",
+  "project.remoteProjectRequired": "This workspace requires selecting or creating a project first.",
+  "project.remoteRootImmutable": "A saved project's source folder cannot be changed.",
+  "project.standaloneAutoRootHint":
+    "With no folder selected, a dedicated project folder is created under the server workspace's projects directory.",
   "project.unresolved": "Select a project",
   "project.removeEntry": "Remove from this device",
   "project.addFolder": "Add folder to project",
@@ -3832,6 +3837,8 @@ const enUS: Record<string, string> = {
   "settings.personalization.title": "Personalization",
   "settings.personalization.description":
     "Add custom instructions to personalize Agent responses. Instructions apply to future conversations of the local Agent; remote devices need separate configuration.",
+  "settings.personalization.serverDescription":
+    "Add custom instructions to personalize Agent responses. Instructions apply to future conversations of the Agent on this server and are shared across your phone and computer.",
   "settings.personalization.placeholder": "Add custom instructions...",
   "settings.personalization.editorLabel": "Custom instructions editor",
   "settings.personalization.saved": "Saved; effective for new conversations",
@@ -3888,6 +3895,19 @@ const enUS: Record<string, string> = {
   "settings.memory.viewer.fileChanged":
     "This memory file was updated while being read. Reopen it or refresh the file list.",
   "settings.memory.viewer.noSelection": "Select a memory file to preview it.",
+  "settings.memory.viewer.openFile": "View",
+  "settings.memory.viewer.edit": "Edit",
+  "settings.memory.viewer.save": "Save",
+  "settings.memory.viewer.saving": "Saving…",
+  "settings.memory.viewer.copyPath": "Copy path",
+  "settings.memory.viewer.pathCopied": "Path copied",
+  "settings.memory.viewer.saveConflict":
+    "This memory file changed elsewhere and was not overwritten. Your edits are kept — refresh and try again.",
+  "settings.memory.viewer.saveFailed": "Failed to save: {error}",
+  "settings.memory.viewer.reload": "Reload",
+  "settings.memory.viewer.discardConfirmTitle": "Discard unsaved changes?",
+  "settings.memory.viewer.discardConfirmDescription": "Your unsaved changes will be lost.",
+  "settings.memory.viewer.discardConfirm": "Discard changes",
   "settings.httpProxy": "HTTP Proxy",
   "settings.httpProxyDescription":
     'Route model, MCP, command-tool, extension, and app renderer egress traffic through this proxy; system environment variables are not read. Leave blank and that traffic connects directly, while the embedded browser follows your system proxy settings. Restart the app to take effect; for extensions you can also run "Reload extensions" from the command center.',
@@ -4149,6 +4169,8 @@ const enUS: Record<string, string> = {
     "Certificate setting saved. Restart the app to take effect.",
   "settings.browser.data.section": "Browser data",
   "settings.browser.desktopOnly": "Browser data can only be managed in the ZCode desktop app.",
+  "settings.browser.webUnsupported":
+    "This web page cannot import Chrome sign-in data from your computer or clear the ZCode desktop app's built-in browser data; those are only available in the ZCode desktop app. The server-side agent's Chromium MCP headless browser is not affected.",
   "settings.browser.import.title": "Import Chrome sign-in state",
   "settings.browser.import.description":
     "Bring your Chrome sign-in state into the built-in browser once, so the AI can open sites you are already signed in to and work more smoothly.",
@@ -4424,6 +4446,8 @@ const enUS: Record<string, string> = {
     "{device} is offline. Its configuration cannot be read or changed until it reconnects.",
   "settings.scope.deviceConnecting": "Connecting to {device}…",
   "settings.scope.localDevice": "This computer",
+  // In standalone Web / mobile remote control the user/local scope is backed by the current server Host.
+  "settings.scope.server": "Current server",
   "settings.scope.label": "Scope",
   "settings.scope.user": "User",
   "settings.scope.workspace": "Workspace",

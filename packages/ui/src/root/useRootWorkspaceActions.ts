@@ -467,6 +467,7 @@ export function useRootWorkspaceActions({
     addTab,
     createTask: startNewTaskFromActiveWorkspace,
     setWorkspaceActionError,
+    composerClientNamespace,
   });
 
   const handleLogout = useCallback(async () => {

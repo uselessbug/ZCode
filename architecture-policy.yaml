@@ -1939,6 +1939,10 @@ exceptions:
       - packages/ui/src/hooks/useStartPlanRecommendation.ts
       - packages/ui/src/settings/DynamicWorkflowModeSetting.tsx
     reason: 已准入的存量文件只把 TID 导入从 @zcode/shared 根入口改为 @zcode/shared/test-ids 子路径（根入口不再导出 test-ids，以收窄受影响单测范围）；行为与模块边界不变，接管 ui 目录不在本次范围内。
+  - id: standalone-web-existing-file-location-entry
+    rule: unmanaged-new-file
+    paths: [packages/ui/src/settings/WorkspaceFileSearchSection.tsx]
+    reason: 存量设置页入口复用 useOpenHostDirectory 浏览服务器目录（docs/standalone-web-settings.md），不增加服务或状态；本次不接管整个 settings 目录。
   - id: settings-personalization-section-new-file
     rule: unmanaged-new-file
     paths: [packages/ui/src/settings/PersonalizationSection.tsx]
