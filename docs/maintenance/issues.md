@@ -2,12 +2,12 @@
 
 本文是独立 Web 与移动端适配问题的唯一维护入口，按用户可见症状记录当前状态。
 
-## 已定位待修复与验证（1 项）
+## 本地浏览器回归已通过 -> 待部署实机验证（1 项）
 
 1. **设置页删除自定义模型后底部“正在删除模型…”提示持续转圈不消失**
    - **症状**：在「设置 -> 模型供应商」删除模型后，详情栏底部删除进度横幅持续停留在转圈（`pending`）状态，未替换为“已删除”或失败提示。
-   - **已定位代码机制**：`InlineEditableProviderCard.tsx` 的 `runSaveOperation` 让 Provider 表单草稿与所有模型操作共用单一 `draftRevisionRef`。已从实际 `runSaveOperation` 复现：当连续删除两个不同模型（两次删除均成功）或在模型删除在途期间发生 Provider 草稿变更时，后一次操作递增 `draftRevisionRef` 会使前一次操作完成时因 `shouldApplyProviderSaveCompletion` 判定版本不等而直接返回，导致先发起的 `model-save:<providerId>:<modelId>` 一直留在 `pending` 状态。已确认上游 3.18.2 未修改该处代码；同时不声称用户现场触发根因已全部穷尽确认。
-   - **状态**：已定位待修复/验证（已更新规格约束：反馈按 `provider/model` 通知 key 及该 key 下的操作实例拥有，`draftRevision` 仅保护草稿自身，不同 key 互不抑制、同 key 旧完成不覆盖新状态，不新增后端写入队列或超时机制；待代码修复与成功/失败并发及草稿变更回归完成后更新）。
+   - **已定位代码机制**：`InlineEditableProviderCard.tsx` 的 `runSaveOperation` 原先让 Provider 表单草稿与所有模型操作共用单一 `draftRevisionRef`。已从实际 `runSaveOperation` 复现：当连续删除两个不同模型（两次删除均成功）或在模型删除在途期间发生 Provider 草稿变更时，后一次操作递增 `draftRevisionRef` 会使前一次操作完成时因 `shouldApplyProviderSaveCompletion` 判定版本不等而直接返回，导致先发起的 `model-save:<providerId>:<modelId>` 一直留在 `pending` 状态（上游 3.18.2 未修改该处代码；同时不声称用户现场触发根因已全部穷尽确认）。
+   - **状态**：代码已修复（提交 `454b2832`），本地真实 UI 浏览器回归 15 项全部通过（15 pass / 0 fail；修复前 14 项基线用例中 11 fail / 3 pass，经 token 变异校验同 key 与跨卡片 3 项用例可检出失败并已还原），待部署实机验证。
 
 ## 实机验证未通过 -> 已撤回适配，待新版部署验证（1 项）
 
