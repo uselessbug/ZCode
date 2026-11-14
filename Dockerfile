@@ -7,10 +7,12 @@ COPY . .
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV NODE_OPTIONS=--max-old-space-size=8192
-RUN pnpm install --frozen-lockfile
+# hoisted 安装在多个 esbuild 构建后的目录同步中出现临时目录丢失；
+# 串行执行依赖构建及同步，避免并发改写嵌套目录，仍保留 prepare 与原生构建脚本。
+RUN pnpm install --frozen-lockfile --child-concurrency=1
 RUN pnpm typecheck && pnpm lint
 # 依赖就绪即可运行、不需要构建产物的门禁：发行包收集器契约与四个独立 Web/server 验收脚本。
-RUN node --test scripts/zcode-distribution.test.mjs
+RUN node --test scripts/zcode-distribution.test.mjs scripts/test/dockerfile-install-contract.test.mjs
 RUN pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-memory-files.mjs \
     && pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-multi-root-projects.mjs \
     && node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-mcp-routing.mjs \
