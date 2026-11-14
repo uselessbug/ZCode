@@ -3,6 +3,7 @@ import { logger } from "@/logger.js";
 
 export type SettingsSectionId =
   | "general"
+  | "agentBehavior"
   | "appearance"
   | "migration"
   | "browser"
@@ -17,6 +18,7 @@ export type SettingsSectionId =
   | "plugins"
   | "projects"
   | "archives"
+  | "shares"
   | "usage"
   | "subagents"
   | "commands"
@@ -69,6 +71,7 @@ export interface SettingsModelProviderTarget {
 function isSettingsSectionId(value: string): value is SettingsSectionId {
   return (
     value === "general" ||
+    value === "agentBehavior" ||
     value === "appearance" ||
     value === "migration" ||
     value === "browser" ||
@@ -83,6 +86,7 @@ function isSettingsSectionId(value: string): value is SettingsSectionId {
     value === "plugins" ||
     value === "projects" ||
     value === "archives" ||
+    value === "shares" ||
     value === "usage" ||
     value === "subagents" ||
     value === "commands" ||
@@ -326,17 +330,6 @@ function clearPendingSettingsSectionIntent(): void {
     window.sessionStorage.removeItem(SETTINGS_PLUGIN_SCOPE_KEY_INTENT_KEY);
   } catch {
     // 忽略浏览器存储异常，不影响主流程。
-  }
-}
-
-/** 手机设置页需要区分普通打开与直达分区；只读取原导航意图，不复制或消费它。 */
-export function hasPendingSettingsSection(): boolean {
-  if (typeof window === "undefined") return false;
-  try {
-    const raw = window.sessionStorage.getItem(SETTINGS_SECTION_INTENT_KEY);
-    return raw === "skills" || (raw !== null && isSettingsSectionId(raw));
-  } catch {
-    return false;
   }
 }
 

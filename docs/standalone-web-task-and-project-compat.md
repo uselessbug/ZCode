@@ -73,6 +73,17 @@ sequenceDiagram
 - 批次 `deleteArchivedTasks` 采用同一顺序：未归档计入 `skippedTaskIds`；CLI 抛错计入 `failedTaskIds` 且不写 tombstone；全部成功后只广播一次。
 - 归档管理把单条结果映射为 `deleted → succeeded + 移除行`、`skipped → skipped + 移除行`、`异常 → failed + 不移除行`。
 
+### 补充边界：独立 Web 归档永久删除的 CLI Carrier 路由
+
+- 独立 Web（`serviceAuthorityMode === "standalone-server"`）下的归档任务携带本 Server 的 canonical `workspaceIdentity`（`remote:server:<serverId>:<workspacePath>`）。当该工作区当前没有活跃的 CLI 子进程（例如服务端重启后首次清理历史归档任务）时，`previewSessionDeletion` 与 `executeSessionDeletion` 仍保留对工作区目录的精确归属校验，不能全局放宽 `isLocalActiveWorkspaceClient`。
+- 路由规则：
+  1. 先按 `getReadOnlyClient(params.workspace, "existing-only")` 复用已活跃的工作区 CLI（热 runtime 原样复用，不另外拉起目标项目 CLI）。
+  2. 仅当抛出 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 时，由装配层显式注入的 `isDeletionWorkspaceOwnedByCurrentHost(workspace)` 裁决是否允许回落当前 Host 的 `getPluginManagementClient()`：
+     - 若存在 `workspace.remoteSessionId`、`workspaceIdentity` 为空或 `workspacePath` 为空，一律禁止回落；
+     - 仅在 `serviceAuthorityMode === "standalone-server"` 下调用 `sourceServerWorkspaceService.resolveWorkspace({ workspacePath })`，要求 `resolved.canonicalWorkspaceKey === workspace.workspaceIdentity.trim()` 精确相等（沿用 `SourceServerWorkspaceIdentityChannelServer` 映射后的 canonical 身份）才允许回落到当前 Host 的控制面 CLI；
+     - 异域身份（如 `remote:ssh:*`、`remote:wsl:*`、其他 `remote:server:*` 或同 server 错 `workspacePath`）以及非 runtime-unavailable 异常均严禁回落，原样透传错误。
+  3. 无论走热 runtime 还是控制面 carrier，`session/delete/preview` 与 `session/delete/execute` 请求体都完整保留原始 `workspace`（`workspacePath` + `workspaceIdentity`）、`revision` 与 `operationId`，由 CLI `permanent-deletion` 继续执行身份一致性、`revision` 冲突与幂等保护。
+
 ### 补充项：非项目工作模式与项目 root
 
 ```mermaid

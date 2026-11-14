@@ -52,6 +52,8 @@ const runtimePackageNames = [
   "@hono/node-ws",
   "ssh2",
   "node-pty",
+  // HTTP server 与 Agent CLI 均外置 @napi-rs/keyring，发行包需携带主体及平台原生二进制。
+  "@napi-rs/keyring",
   "undici",
   "axios",
   "form-data",

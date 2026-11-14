@@ -2,6 +2,13 @@
 
 本文是独立 Web 与移动端适配问题的唯一维护入口，按用户可见症状记录当前状态。
 
+## 本地浏览器回归已通过 -> 待部署实机验证（1 项）
+
+1. **设置页删除自定义模型后底部“正在删除模型…”提示持续转圈不消失**
+   - **症状**：在「设置 -> 模型供应商」删除模型后，详情栏底部删除进度横幅持续停留在转圈（`pending`）状态，未替换为“已删除”或失败提示。
+   - **已定位代码机制**：`InlineEditableProviderCard.tsx` 的 `runSaveOperation` 原先让 Provider 表单草稿与所有模型操作共用单一 `draftRevisionRef`。已从实际 `runSaveOperation` 复现：当连续删除两个不同模型（两次删除均成功）或在模型删除在途期间发生 Provider 草稿变更时，后一次操作递增 `draftRevisionRef` 会使前一次操作完成时因 `shouldApplyProviderSaveCompletion` 判定版本不等而直接返回，导致先发起的 `model-save:<providerId>:<modelId>` 一直留在 `pending` 状态（上游 3.18.2 未修改该处代码；同时不声称用户现场触发根因已全部穷尽确认）。
+   - **状态**：代码已修复（提交 `454b2832`），本地真实 UI 浏览器回归 15 项全部通过（15 pass / 0 fail；修复前 14 项基线用例中 11 fail / 3 pass，经 token 变异校验同 key 与跨卡片 3 项用例可检出失败并已还原），待部署实机验证。
+
 ## 实机验证未通过 -> 已撤回适配，待新版部署验证（1 项）
 
 1. **技能详情“打开路径”打开服务器目录（3.1，Web 暂不支持）**
@@ -38,7 +45,7 @@
 - **独立 Web 设置页“当前服务器”MCP 已安装列表为空**
   - **症状**：独立云端 Web 进入「设置 -> MCP」选择“当前服务器”时，顶栏显示插件 MCP 计数（如 `MCP 7`），但“已安装”分组显示 `0`（用户级 `browser`、`rea` 等均不展示）。
   - **已确认根因**：服务端原生 `mcp-sync.loadMcpFromUserDirectory` 正常返回用户级 MCP，问题在于 `useMcpStore` 的 `resolveTargetDirectoryService` 将无 `workspaceIdentity` 且无 `authorityKey` 直接当作桌面本机探测并返回 `null`，回退到无桌面代理的 Web `platform` 读取硬编码 `{ servers: [] }` 并误标 ready。
-  - **状态**：已修复（2026-11-13 用户部署实机验证通过；本地非 GUI 运行时回归 `node packages/web/test/e2e/manual-review/pending/standalone-mcp-routing.mjs` 13 项通过）。
+  - **状态**：已修复（2026-11-13 用户部署实机验证通过；本地非 GUI 运行时回归 `node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-mcp-routing.mjs` 13 项通过）。
 - **插件市场从服务器目录添加插件来源**
   - **症状**：在「插件市场 -> 添加来源」点击「选择目录」时调用电脑本地文件夹选择器，独立 Web 下无法浏览并选择服务器上的插件源目录。
   - **状态**：已修复（2026-11-12 实机验证通过：可在「添加来源」弹窗中浏览服务器目录并添加插件来源）。

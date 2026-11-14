@@ -136,19 +136,26 @@ Provider/Model/成员写入按发生顺序执行；rename 等待旧 ID 操作并
 
 ## 保存反馈
 
-Renderer 内部继续使用 Draft revision 区分本地编辑、在途保存和过期响应，但不向用户展示 `dirty` 文案，也不在
-Provider 内容区保留另一套保存状态。一次保存操作只投影为窗口底部的一条通知，并按同一稳定 key 原位替换：
+Renderer 内部继续使用 Draft revision 区分 Provider 表单本地编辑、在途草稿保存和过期草稿响应，但不向用户展示 `dirty` 文案，也不在
+Provider 内容区保留另一套保存状态。一次保存或删除操作只投影为详情栏底部的一条通知，并按目标通知 key（Provider 级 `provider-save:<providerId>`、模型级 `model-save:<providerId>:<modelId>`）及该 key 下的操作实例原位替换：
 
 ```text
-saving（不自动消失）
+saving / deleting（不自动消失）
   |
-  +-- success -> 同 key 替换，短暂停留后淡出
+  +-- success -> 同 key 且属当前操作实例时原位替换，短暂停留后淡出
   |
-  `-- failure -> 同 key 替换，延长停留并提供重试/关闭
+  `-- failure -> 同 key 且属当前操作实例时原位替换，延长停留并提供重试/关闭
 ```
 
+反馈所有权与并发隔离规则：
+
+- **按通知 key 与操作实例拥有反馈**：每条反馈的 `pending -> success / failure` 转换归属其目标通知 key（`providerId` 或 `providerId + modelId`）及该 key 当前最新的操作实例；不新增后端写入队列，也不新增前端或后端超时机制。
+- **Draft revision 仅保护草稿**：Provider 表单的 `draftRevision` 只用于保护 Provider 表单草稿及 `provider-save:<providerId>` 通知（如输入变更使旧草稿保存响应过期、切换 Provider 丢弃旧实例完成回调），不得用于抑制独立的模型级操作通知。
+- **不同 key 互不抑制，同 key 旧完成不覆盖新操作**：并发删除或保存不同模型（不同 `model-save:<providerId>:<modelId>`），或在模型操作在途期间修改 Provider 表单草稿，各通知 key 互不阻塞、互不丢弃对方的完成状态；同一通知 key 发起新操作实例（含失败后重新触发）时，该 key 较早发起的旧操作完成不得覆盖新操作实例的 `pending` 或终态。
+- **回归场景要求**：必须覆盖同一 Provider 下不同模型并发删除/保存（全部成功、部分失败、全部失败）、同一模型连续操作/重试的旧完成隔离，以及模型操作在途期间发生 Provider 草稿变更（`markDraftDirty` 或自动保存）不导致模型通知滞留在 `pending`。
+
 模型弹窗的保存按钮仍在请求期间显示 Spinner 并禁止重复提交；这是操作控件状态，不是第二套保存反馈。只有 Host
-确认相应 revision 后才能用 success 替换 saving。较早请求的迟到响应不得覆盖当前操作，失败信息不能仅用颜色表达。
+确认相应操作完成后才能用 success 替换 saving / deleting。较早请求的迟到响应不得覆盖同 key 的当前操作，失败信息不能仅用颜色表达。
 
 ## Provider 身份与名称
 
@@ -419,7 +426,7 @@ Entitlement / Usage / Reset / Model Request
 动态账号事实由目标 Environment 的账号服务在调用时解析。Team usage 列表可以把已订阅产品响应与静态
 `team-coding-plan` mode 组合成查询 scope，但不得把该 scope 写回 Personal Config、Account Overlay 或 Registry。
 
-测试使用与 Agent 相同的流式 Adapter 路径，固定发送两条消息：system `You are ZCode connectivity probe.`，user `hi`，并消费完整流。文本、角色、顺序是白名单相关契约，不添加历史、工具、额外 system 或国际化文本（Todo 91）；不影响其他辅助请求。连接测试独立使用 1 Token 输出预算，Reasoning 显式使用有序档位的首项，不复用辅助内容生成的 5,000 Token 预算（Todo144）。正常 finish（含 length）即成功，不要求正文；流异常或缺少 finish 仍失败。测试路径不依赖已经退役的 Option Default，也不假设 Model 已绑定隐式默认 Options。超时、鉴权、预算参数拒绝、模型不存在、限流、服务端错误和响应解析错误由正式 Model/Adapter 错误边界归一化，再投影为设置页结果，不自动增加预算或更换模型。
+测试使用与 Agent 相同的流式 Adapter 路径，固定发送两条消息：system `You are ZCode connectivity probe.`，user `hi`，并消费完整流。文本、角色、顺序是白名单相关契约，不添加历史、工具、额外 system 或国际化文本（Todo 91）；不影响其他辅助请求。连接测试独立使用 512 Token 输出预算，并受模型输出上限约束：实际预算为 `min(512, maxOutputTokens.max)`，避免在本地绑定阶段拒绝合法的小容量模型。Reasoning 显式使用有序档位的首项，不复用辅助内容生成的 5,000 Token 预算（Todo159，取代 Todo144 的 1 Token 策略）。正常 finish（含 length）即成功，不要求正文；流异常或缺少 finish 仍失败。测试路径不依赖已经退役的 Option Default，也不假设 Model 已绑定隐式默认 Options。超时、鉴权、预算参数拒绝、模型不存在、限流、服务端错误和响应解析错误由正式 Model/Adapter 错误边界归一化，再投影为设置页结果，不自动增加预算或更换模型。
 
 测试成功表示保存后的正式 Model 能够完成一次真实请求，而不只是某个独立 HTTP Probe 收到了成功状态码。Start Plan、Coding Plan 和普通 API Provider 使用同一入口；它们的差异结束在 Provider、Request Auth 和 Adapter 内部。
 

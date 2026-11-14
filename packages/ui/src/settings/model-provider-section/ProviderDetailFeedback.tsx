@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { CheckCircle2Icon, CircleAlertIcon, Loader2Icon, XIcon } from "lucide-react";
+import { CheckCircle2Icon, CircleAlertIcon, LoaderCircle, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button.js";
 import { cn } from "@/components/lib/utils.js";
 
@@ -16,6 +16,11 @@ export type ProviderDetailFeedbackState = "pending" | "success" | "failure";
 
 export interface ProviderDetailFeedbackInput {
   key: string;
+  /**
+   * beginOperation(key) 返回的操作实例号。带实例号的反馈只有在它仍是该 key 的最新实例时才会落地；
+   * 不带实例号的反馈（如连接测试）始终直接替换。
+   */
+  operationId?: number;
   message: string;
   state: ProviderDetailFeedbackState;
   /** 连接测试成功使用语义绿；保存/删除沿用中性反馈，不按文案或 key 推断操作。 */
@@ -28,11 +33,14 @@ export interface ProviderDetailFeedbackInput {
 }
 
 interface ProviderDetailFeedbackContextValue {
+  /** 为通知 key 登记新的操作实例并返回实例号；同 key 较早实例此后的反馈会被丢弃。 */
+  beginOperation: (key: string) => number;
   showFeedback: (input: ProviderDetailFeedbackInput) => void;
   dismissFeedback: (key: string) => void;
 }
 
 const ProviderDetailFeedbackContext = createContext<ProviderDetailFeedbackContextValue>({
+  beginOperation: () => 0,
   showFeedback: () => undefined,
   dismissFeedback: () => undefined,
 });
@@ -49,6 +57,19 @@ function resolveDefaultDuration(state: ProviderDetailFeedbackState): number {
 export function ProviderDetailFeedbackBoundary({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ProviderDetailFeedbackInput[]>([]);
   const timersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  // 修复原因：旧实现让组件内单个 draftRevision 同时充当所有操作的“最新”判据，
+  // 不同模型的并发删除/保存、或模型操作在途时编辑草稿，都会让较早操作的完成被误判为过期，
+  // 对应 pending 通知永远不会被替换。反馈所有权改为“通知 key -> 该 key 最新操作实例”，
+  // 由这里唯一持有，Provider 切换/重挂载后的卡片实例共享同一份，不会出现多个 owner。
+  const latestOperationRef = useRef(new Map<string, number>());
+  const operationSequenceRef = useRef(0);
+
+  const beginOperation = useCallback((key: string) => {
+    const operationId = operationSequenceRef.current + 1;
+    operationSequenceRef.current = operationId;
+    latestOperationRef.current.set(key, operationId);
+    return operationId;
+  }, []);
 
   const dismissFeedback = useCallback((key: string) => {
     const timer = timersRef.current.get(key);
@@ -59,6 +80,13 @@ export function ProviderDetailFeedbackBoundary({ children }: { children: ReactNo
 
   const showFeedback = useCallback(
     (input: ProviderDetailFeedbackInput) => {
+      if (
+        input.operationId !== undefined &&
+        latestOperationRef.current.get(input.key) !== input.operationId
+      ) {
+        // 同 key 已有更新的操作实例：旧实例的 pending/success/failure 都不得覆盖它。
+        return;
+      }
       const previousTimer = timersRef.current.get(input.key);
       if (previousTimer) clearTimeout(previousTimer);
       timersRef.current.delete(input.key);
@@ -90,8 +118,8 @@ export function ProviderDetailFeedbackBoundary({ children }: { children: ReactNo
   }, []);
 
   const contextValue = useMemo(
-    () => ({ showFeedback, dismissFeedback }),
-    [dismissFeedback, showFeedback],
+    () => ({ beginOperation, showFeedback, dismissFeedback }),
+    [beginOperation, dismissFeedback, showFeedback],
   );
 
   return (
@@ -121,7 +149,7 @@ export function ProviderDetailFeedbackBoundary({ children }: { children: ReactNo
               )}
             >
               {item.state === "pending" ? (
-                <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden="true" />
+                <LoaderCircle className="size-4 shrink-0 animate-spin" aria-hidden="true" />
               ) : item.state === "success" ? (
                 <CheckCircle2Icon className="size-4 shrink-0 text-success" aria-hidden="true" />
               ) : (

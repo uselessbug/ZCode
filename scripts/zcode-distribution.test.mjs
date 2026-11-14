@@ -18,6 +18,7 @@ import { setTimeout } from "node:timers/promises";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import {
+  copyRuntimeNodeModules,
   officialPluginStagingTargets,
   patchNodePtyPrebuilds,
   stageBundledSkillAssets,
@@ -357,4 +358,22 @@ test("official plugin runtime gate matches the producer state", async (t) => {
       );
     }
   }
+});
+
+// server 与 agent 均将 @napi-rs/keyring 设为 external；发行包 node_modules 必须携带包装器及可用平台原生包。
+test("runtime node_modules includes externalized @napi-rs/keyring for server and agent", async (t) => {
+  const packageRoot = await stageRoot(t);
+  await mkdir(join(packageRoot, "agent"), { recursive: true });
+  await copyRuntimeNodeModules(packageRoot);
+  const keyringManifest = JSON.parse(
+    await readFile(join(packageRoot, "node_modules/@napi-rs/keyring/package.json"), "utf8"),
+  );
+  assert.equal(keyringManifest.name, "@napi-rs/keyring");
+  const suffix =
+    process.platform === "linux" ? "-gnu" : process.platform === "win32" ? "-msvc" : "";
+  const hostNativePackage = `@napi-rs/keyring-${process.platform}-${process.arch}${suffix}`;
+  const nativeManifest = JSON.parse(
+    await readFile(join(packageRoot, "node_modules", hostNativePackage, "package.json"), "utf8"),
+  );
+  assert.equal(nativeManifest.name, hostNativePackage);
 });

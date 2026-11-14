@@ -70,6 +70,10 @@ jobs:
             -e GIT_CONFIG_VALUE_0='*' \
             --entrypoint node zcode:ci-deps \
             scripts/architecture/architecture-check.mjs check --changed
+      # ci-browser 是 ci-deps 的同级 stage，复用同一份已安装依赖的层缓存，
+      # 只额外装系统 Chromium 并跑定向浏览器回归；不进入 build 与发布镜像。
+      - name: Run targeted browser regression
+        run: docker build --target ci-browser -t zcode:ci-browser .
       - name: Build ARM64 image from this checkout
         run: |
           version="$(node -p "require('./package.json').version")"
@@ -104,9 +108,11 @@ jobs:
             /src-ro/scripts/verify-standalone-bundled-assets.mjs /app/zcode
       - name: Check standalone startup and authentication
         run: |
+          # 无系统 Secret Service 时 entry-http 启动强校验凭据存储；CI 仅给一次性 smoke 容器传合成测试密钥。
           docker run -d --name zcode-smoke \
             -e ZCODE_SERVER_AUTH_TOKEN=ci-smoke-token \
-            -e ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS=1 zcode:build
+            -e ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS=1 \
+            -e ZCODE_CREDENTIAL_SECRET=ci-smoke-synthetic-credential-secret-not-for-prod zcode:build
           trap 'docker rm -f zcode-smoke >/dev/null 2>&1' EXIT
           docker exec -i zcode-smoke node --input-type=module <<'JS'
           import assert from 'node:assert/strict';

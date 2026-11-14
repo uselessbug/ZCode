@@ -29,5 +29,9 @@ export interface ProjectStorageContract {
     hostId?: string,
     options?: ProjectRepositoryOptions,
   ): ProjectRepositoryContract;
-  admitTaskIdentity(db: DatabaseSync, task: ProjectTaskRef, hostId?: string): void;
+  admitTaskIdentity(
+    db: DatabaseSync,
+    task: ProjectTaskRef & { forkedFromTaskId?: string },
+    hostId?: string,
+  ): void;
 }
