@@ -153,6 +153,16 @@ modules:
   - id: server
     roots: [packages/server/src]
     managed: false
+  - id: server-browser-control
+    roots: [packages/server/src/browser-control]
+    managed: true
+    requires: [services, shared, zcode-cli]
+    publicEntrypoints:
+      - packages/server/src/browser-control/index.ts
+      - packages/server/src/browser-control/contract.ts
+    layers:
+      adapters: .
+    owner: browser
   - id: zcode-server-cli
     roots: [packages/zcode-server-cli/src]
     managed: false

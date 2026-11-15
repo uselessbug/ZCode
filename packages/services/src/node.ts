@@ -111,6 +111,9 @@ export {
   type TopicResourcePeers,
 } from "./zcode-agent/topicResourcePeers.js";
 export { createTopicResourceRelayChannel } from "./zcode-agent/topicResourceRelayChannel.js";
+import type { BrowserAmbientContextExecutor } from "./zcode-agent/zcodeAgentBrowserAmbientContext.js";
+
+export type BrowserControlExecutor = BrowserAmbientContextExecutor;
 
 export { createFileService } from "./file/fileService.js";
 export {
@@ -688,9 +691,6 @@ import {
   type ServiceAuthorityMode,
   resolveRuntimeZCodeEndpointOrigin,
   resolveSafeTelemetryHostname,
-  type BrowserBackendDescriptor,
-  type BrowserClientMode,
-  type BrowserCommand,
   isZCodeCuaMcpCommand,
   isZCodeCuaMcpPackageArg,
   isZCodeCuaInternalFeatureEnabled,
@@ -1375,34 +1375,8 @@ export function createLocalServices(options: {
    * docs/plugins/extension-host.md §17.2）。它不注册进 ServiceCollection，也不在任何 RPC 频道上。
    */
   onAppControlServiceCreated?: (handle: AppControlServiceHandle) => void;
-  /** browser-use 执行桥（host→main WebContentsView+CDP）；desktop host 注入，缺省则 browser 不可用。 */
-  browserControlExecutor?: {
-    list(input: {
-      requestId: string;
-      sessionId: string;
-      turnId?: string;
-      workspaceKey: string;
-      workspacePath: string;
-      workspaceIdentity?: string;
-      remoteSessionId?: string;
-      clientMode: BrowserClientMode;
-      sessionContext: "live" | "cached";
-    }): Promise<BrowserBackendDescriptor[]>;
-    execute(input: {
-      requestId: string;
-      browserId?: string;
-      browserGeneration?: number;
-      sessionId: string;
-      turnId?: string;
-      workspaceKey: string;
-      workspacePath: string;
-      workspaceIdentity?: string;
-      remoteSessionId?: string;
-      clientMode: BrowserClientMode;
-      sessionContext: "live" | "cached";
-      command: BrowserCommand;
-    }): Promise<{ ok: boolean; [k: string]: unknown }>;
-  };
+  /** browser-use 执行桥；desktop host 或独立 HTTP server 注入，缺省则 browser 不可用。 */
+  browserControlExecutor?: BrowserControlExecutor;
   /** Windows desktop-local Host 的 CUA turn 状态投影；其它 authority 会在装配层拒绝。 */
   cuaOperationStateReporter?: CuaOperationStateReporter;
 }): ServiceCollection {
@@ -3660,6 +3634,7 @@ export async function createServerHostServices(options: {
   zcodeBuiltinProviderConfigFilePath: string;
   providerProvisioningTargetEnabled?: boolean;
   credentialCipherProvider?: CredentialCipher;
+  browserControlExecutor?: BrowserControlExecutor;
 }) {
   // 无桌面环境不能等到首次登录或 Provisioning 才发现系统库缺失。
   const credentialCipherProvider =
@@ -3713,6 +3688,7 @@ export async function createServerHostServices(options: {
     standaloneWorkspaceRoot: process.env.ZCODE_DEFAULT_WORKSPACE_DIR?.trim() || "/workspace",
     // 同一个 standalone 兼容开关显式开启多 root；未开启的远端 owner 仍单 root、root 不可变。
     allowStandaloneMultiRoot: standaloneWebCompat,
+    browserControlExecutor: options.browserControlExecutor,
   });
   return { services, workspaceIdentityMapper, migrationFailedPathCount };
 }

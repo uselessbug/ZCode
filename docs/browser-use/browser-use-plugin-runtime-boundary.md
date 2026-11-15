@@ -100,3 +100,11 @@ frontend bundle、browser-client/docs/skills assets。协议桥和 desktop CDP �
   不能绕过成 `agent-browser` 或另一套模型工具。
 - ZCode app-server 不消费 CLI managed headless 参数；Desktop/Web Remote 继续使用 shared-host 注入的
   BrowserControlPort，不能为手机或协议 session 另起 browser runtime。
+- **独立 HTTP Web 服务端边界（`packages/server/src/entry-http.ts`）**：
+  - 独立 HTTP Web 仅通过 `@zcode/server` 的受管模块 `server-browser-control` 复用 `@zcode/adapters/browser`
+    的 `createManagedCdpBrowserRuntime`，为 `agent.browsers.*` 提供受管 headless Chromium（`type: "cdp"`）；
+    不引入 Electron，不修改 `Dockerfile` 中 `app-server --stdio` 启动参数，也不把 `@zcode/adapters` 具体实现泄露到 `packages/services`。
+  - 启用门禁：仅独立 HTTP 入口在 standalone Web 兼容模式（`ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"`）
+    或显式启用（`ZCODE_STANDALONE_BROWSER_USE=1`）时装配 `browserControlExecutor`（`ZCODE_STANDALONE_BROWSER_USE=0` 可显式关闭）；
+    source server / SSH / stdio 链路不默认挂载，避免每次 prompt 的 `collectBrowserAmbientContext` list 探测意外启动 Chromium。
+  - 详见[独立 HTTP Web Browser Use 规格](../standalone-web-browser-use.md)。

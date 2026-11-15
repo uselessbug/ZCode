@@ -33,6 +33,8 @@ ENV CHROME_EXECUTABLE_PATH=/usr/bin/chromium
 # 定向 Provider 详情反馈竞态回归（src 修复随源码进入本 stage）。
 # 测试自身用 chromium.launch() 且未开 chromiumSandbox，Playwright 默认即 --no-sandbox，容器 root 可直接跑。
 RUN node --test packages/ui/test/browser/manual-review/pending/provider-feedback-race.test.mjs
+# Browser Use 需经过真实服务协议与 Chromium，不能只检查二进制版本或插件是否存在。
+RUN node scripts/verify-standalone-browser-use.mjs
 
 FROM ci-deps AS build
 RUN pnpm --filter @zcode/server... build
