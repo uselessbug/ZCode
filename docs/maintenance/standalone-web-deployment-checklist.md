@@ -4,7 +4,7 @@
 
 ## 1. 上游 3.18.2 升级基线、部署要求与验证清单
 
-- **固定基线与当前状态**：3.18.2 合并与提交链详见 [standalone-web-baseline.md](./standalone-web-baseline.md)。当前已部署基线 `4e959bab` 已通过 GitHub Actions（运行 `43622140891` `success`）构建校验并发布 `latest` 与 `sha-4e959bab` 镜像，且已完成容器部署、Agent 基础运行探针与 2026-11-15 用户实机验收。工作区后续本地新增的 `browser-use` 受管 CDP 适配与 3 项冗余代码清理待 CI 构建与部署（见下方说明）。
+- **固定基线与当前状态**：3.18.2 合并与提交链详见 [standalone-web-baseline.md](./standalone-web-baseline.md)。当前线上运行实例为 `4e959bab`（`healthy`），已完成容器部署、Agent 基础运行探针与 2026-11-15 用户实机验收。后续增量 `29c3c4dc`（含 `ab4ab3ac` Browser Use 受管 CDP 适配与 `ce24c4cf` 3 项冗余清理）已通过 GitHub Actions 构建校验并发布 `sha-29c3c4dc` 镜像，待部署切换（见下方“CI 构建已通过、待部署验证”）。
 - **3.18.2 凭据密钥部署要求与步骤说明（保持上游强校验，参见 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)）**：
   - **启动约束与默认路径自动发现（`:99-104`）**：独立 Web HTTP 服务在开放前会初始化凭据后端。无系统 keyring 的部署环境支持：
     - **默认路径自动发现**：当未设置 `ZCODE_CREDENTIAL_SECRET` 与 `ZCODE_CREDENTIAL_SECRET_FILE` 时，服务端按 UTF-8 自动读取 `<zcodeHomeDir>/v2/credential-secret`（容器默认 `/home/agent/.zcode/v2/credential-secret`，32–4096 字节随机文本密钥，权限 `0600`，属主为容器运行 UID `1001`）。若持久化目录中已存在合规的默认密钥文件，直接沿用上游自动发现即可，无须补设 `ZCODE_CREDENTIAL_SECRET_FILE`。
@@ -27,9 +27,10 @@
   - [x] **归档任务删除端到端与实机验证（3.18.2 用户可见变化）**：2026-11-15 用户实机执行归档任务永久删除确认正常；运行日志同步确认 `zcode-task.previewArchivedTaskDeletion`（`2026-11-15T14:00:51.756Z`，`OK 1051ms`）与 `zcode-task.permanentlyDeleteArchivedTask`（`2026-11-15T14:00:56.749Z`，`OK 1143ms`）均成功完成且无对应失败（未声称做独立磁盘逐文件审计）。
   - [x] **设置页删除/保存模型反馈实机验证**：2026-11-15 用户实机确认模型保存与删除提示正常。
   - [x] **移动端、重连与工作区交互实机确认**：2026-11-15 用户实机确认实体手机重连未见明显问题，手机工作区与 `compact-web` 新版设置页、手机子代理设置、权限确认弹窗、新建技能/插件试用预填跳转聊天页、任务分组、新建项目目录选择（默认 `/workspace`）以及任务工作区归属均正常。
-- **本地已实现、待 CI 构建与部署验证（尚未进入线上运行实例）**：
-  - [ ] **独立 HTTP Web 官方 `browser-use`（`agent.browsers.*`）受管无头 Chromium 接入**：`entry-http.ts` 注入 `server-browser-control` 受管 CDP 适配器，本地真实 Chromium 与脚本化 app-server 回归 15 项通过、发行布局加载器校验通过（规格见 [`docs/standalone-web-browser-use.md`](../standalone-web-browser-use.md)）；待 GitHub Actions 构建校验、镜像发布与容器部署验证。
-  - [ ] **3 项冗余代码清理（提交 `ce24c4cf`）**：移除 `rootStartupGate` 未使用 `providerStartupSyncPending` 参数、`ConversationTimeline` 废弃 `compactForRemoteControl` 属性、`scripts/zcode-distribution/assets.mjs` 未使用 `version` 字段；已本地提交，待 GitHub Actions CI 校验与部署。
+- **CI 构建已通过、待部署验证（镜像已发布，当前线上仍运行 `4e959bab`）**：
+  - **统一 CI 与发布产物证据**：提交链 `ce24c4cf`（3 项冗余参数/字段清理）→ `ab4ab3ac`（独立 HTTP Web `browser-use` 受管 CDP 接线）→ `29c3c4dc`，GitHub Actions 运行 [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) `success`（`typecheck`、`lint`、架构检查、`ci-browser` Browser Use 真实 Chromium 回归、ARM64 发行镜像构建、native 工具、随包资源与 HTTP 鉴权探针全部通过），已发布镜像 `latest` 与 `sha-29c3c4dc`（digest `sha256:afef497a850fb3424f125be498badc2206e818eb301349b6c5d0508b2e007b00`）。
+  - [ ] **独立 HTTP Web 官方 `browser-use`（`agent.browsers.*`）线上部署与验证**（代码 `ab4ab3ac`，规格见 [`docs/standalone-web-browser-use.md`](../standalone-web-browser-use.md)）：CI 与镜像构建校验已通过，待部署至运行容器并完成线上实测。
+  - [ ] **3 项冗余代码清理随镜像部署生效**（代码 `ce24c4cf`：移除 `rootStartupGate` 未使用 `providerStartupSyncPending` 参数、`ConversationTimeline` 废弃 `compactForRemoteControl` 属性、`scripts/zcode-distribution/assets.mjs` 未使用 `version` 字段）：CI 已通过，随 `sha-29c3c4dc` 或后续镜像部署生效。
 
 ---
 

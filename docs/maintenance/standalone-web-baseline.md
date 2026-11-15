@@ -11,7 +11,7 @@
   - 容器内置 Docker CLI / Compose 插件提交：`4e959bab`
 - 升级前 `main` 基线：`f40a4597`（`docs(maintenance): record standalone MCP deployment acceptance`）
 - 当前状态：`4e959bab` 已合并至 `main` 并由 GitHub Actions 完成构建、校验与镜像发布（`sha-4e959bab`）；已完成宿主容器更新、Agent 基础运行验收（容器 `healthy`、`restarts: 0`，HTTP 页面 `200`、鉴权 `serverinfo` `200` / 未授权 `401`、WebSocket 握手通过，运行日志无启动/凭据/`Unknown channel`/未捕获异常/OOM 关键错误）及 2026-11-15 用户实机验收（模型保存/删除提示、归档任务永久删除、实体手机重连、手机工作区与 `compact-web` 设置页、任务分组、子代理设置与权限弹窗、新建技能/插件试用预填跳转、新建项目目录选择与任务工作区归属均确认正常；归档永久删除同步经运行日志 `previewArchivedTaskDeletion` 与 `permanentlyDeleteArchivedTask` `OK` 印证）。
-- 后续工作区本地改动（待 CI 与部署）：3 项冗余参数/字段清理已提交 `ce24c4cf`，独立 HTTP Web 官方 `browser-use`（`agent.browsers.*`）受管 CDP 适配已在本地实现，均待推送后由 GitHub Actions 构建校验并部署验证；另经代码审查发现 `http.ts` 中 `restoreProject` 遗漏 `positionalHostMethods` 别名重写（未修复，详见 [issues.md](./issues.md)）。
+- 后续增量（CI 已通过、待部署）：3 项冗余参数/字段清理（`ce24c4cf`）与独立 HTTP Web 官方 `browser-use` 受管 CDP 适配（`ab4ab3ac`）已在 `29c3c4dc` 通过 GitHub Actions [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) 全量校验并发布镜像 `sha-29c3c4dc`（当前线上仍运行 `4e959bab`，CI 与镜像证据见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）；另经代码审查发现 `http.ts` 中 `restoreProject` 遗漏 `positionalHostMethods` 别名重写（未修复，详见 [issues.md](./issues.md)）。
 
 ### 1.1 升级保护能力范围
 

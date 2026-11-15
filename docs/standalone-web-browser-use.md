@@ -84,7 +84,6 @@ flowchart LR
 
 ## 5. 验证状态
 
-- 本地真实 Chromium 与脚本化 app-server 回归 15 项通过，涵盖服务协议反向请求、页面读写与截图、隔离、取消、关闭和同一历史会话重新接入。
-- 发行布局加载器已通过；验证使用临时服务模块与现有发行包中的 Playwright，不代表完整 HTTP 发布镜像已经构建验证。
-- 架构检查与浏览器桥定向类型检查通过。完整类型检查在 session-control 阶段因本地缺少 vitest 和 Node 类型依赖中止，完整构建交现有 Actions。
-- 本地回归通过，待 GitHub Actions CI 构建校验与容器部署验证；当前线上运行服务尚未包含本次适配。
+- 本地真实 Chromium、脚本化 app-server 回归 15 项与发行布局加载器校验通过，涵盖服务协议反向请求、页面读写与截图、隔离、取消、关闭和同一历史会话重新接入。
+- 代码提交 `ab4ab3ac` 随 `29c3c4dc` 已通过 GitHub Actions [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) 全量门禁、容器内 `ci-browser` Browser Use 回归与 ARM64 发行镜像构建校验，并发布镜像 `sha-29c3c4dc`（完整 CI 与镜像 digest 证据见[独立 Web 部署与实机验证清单](maintenance/standalone-web-deployment-checklist.md)）。
+- 待容器部署验证；当前线上运行服务仍为 `4e959bab`，尚未包含本次适配。
