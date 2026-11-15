@@ -44,7 +44,6 @@ export const officialPluginStagingTargets = () =>
         : (plugin.requiredRuntimePaths ?? ["dist/mcp/server.js"]),
     requiredSeedPaths: plugin.requiredSeedPaths ?? [],
     requiresRuntime: plugin.requiresRuntime !== false,
-    version: plugin.version,
   }));
 
 const runtimePackageNames = [

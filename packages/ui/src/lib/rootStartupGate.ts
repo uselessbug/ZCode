@@ -26,7 +26,6 @@ interface ProviderAvailabilityLoginEntryGuardState {
 
 interface ProviderStartupResolutionState {
   isWebRemoteControlRoot: boolean;
-  providerStartupSyncPending: boolean;
   providerAvailabilityStartupCheckCompleted: boolean;
 }
 

@@ -270,8 +270,6 @@ function getUnitHeightCacheKey(unit: ConversationTurnRenderUnit | undefined): st
 
 export interface ConversationTimelineProps {
   rows: readonly ConversationRow[];
-  /** 保留调用方契约；时间线自身对所有端无条件 min-w-0，不再依赖该标志收缩。 */
-  compactForRemoteControl?: boolean;
   /** CLI 权威 queue 中等待 model-step 注入的 guide；只改变 renderer 落位。 */
   pendingGuides?: readonly QueueItem[];
   /** runtime memory 状态，只交给当前 live turn，不进入历史虚拟列表。 */
@@ -1969,7 +1967,7 @@ function ConversationTimelineImpl({
       ref={timelineRootRef}
       className={cn(
         "relative flex min-h-0 flex-1 flex-col",
-        // 独立 Web 的窄屏不走 compactForRemoteControl，时间线仍必须允许收缩，否则长内容撑出横向滚动。
+        // 窄屏时间线必须允许收缩，避免长内容撑出横向滚动。
         "min-w-0",
         // 原先消息层的 mask 靠 scroll 回调追赶合成滚动，快速滚动会闪黑并漏字。
         // 把底部留白移到视口外，由原生 overflow 裁剪；输入框仍在同一视口内 sticky。

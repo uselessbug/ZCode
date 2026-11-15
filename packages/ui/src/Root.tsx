@@ -648,7 +648,6 @@ function RootInner({
     });
   const isResolvingProviderStartupState = shouldResolveProviderStartupState({
     isWebRemoteControlRoot,
-    providerStartupSyncPending,
     providerAvailabilityStartupCheckCompleted,
   });
   const isStartupProviderLoginEntryOpen = welcomeScreenOpenReason === "startup-provider-required";

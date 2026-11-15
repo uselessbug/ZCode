@@ -6831,7 +6831,6 @@ export function SessionPane({
               >
                 <ForkDestinationContext.Provider value={forkDestinationValue}>
                   <ConversationTimeline
-                    compactForRemoteControl={compactForRemoteControl}
                     scrollToBottomActionRef={timelineScrollToBottomRef}
                     scrollToQueryActionRef={timelineScrollToQueryRef}
                     selectionPanelLayoutContainerRef={conversationLayoutContainerRef}
