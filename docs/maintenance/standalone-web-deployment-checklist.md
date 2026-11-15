@@ -2,27 +2,32 @@
 
 - 关联入口：[独立 Web 与移动端适配问题清单](./issues.md) · [独立 Web 实施基线](./standalone-web-baseline.md)
 
-## 1. 上游 3.18.2 升级（`sync/upstream-3.18.2`）基线、部署要求与验证清单
+## 1. 上游 3.18.2 升级基线、部署要求与验证清单
 
-- **固定基线与当前状态**：工作分支 `sync/upstream-3.18.2`，上游合并提交 `347fd4ff`（合并上游 `fec97590` v3.18.2 与升级前 `main` 基线 `f40a4597`，共同祖先 `a9fe401e`），模型反馈竞态修复提交 `454b2832`；本地非 GUI 回归与 15/15 真实浏览器回归已通过（PR 基线架构检查新增违规为 0），尚未推送远端、尚未执行 GitHub Actions 构建、尚未实机部署。
-- **3.18.2 凭据密钥部署要求与步骤说明（保持上游强校验，当前尚未配置，参见 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)）**：
-  - **启动约束（`:99-104`）**：独立 Web HTTP 服务在开放前会初始化凭据后端（隔离探针仅验证真实 cipher wrapper 初始化：无 keyring 且未配置密钥时凭据初始化失败，配置合成密钥时凭据初始化通过，非完整 HTTP 服务启动实测；CI 校验使用合成测试密钥）。无系统 keyring 的部署环境须显式提供 `ZCODE_CREDENTIAL_SECRET_FILE` 或 `ZCODE_CREDENTIAL_SECRET`（二者不可同时设置，32–4096 字节，按原字节读取、不 trim）。
-  - **支持的密钥文件部署示例（`ZCODE_CREDENTIAL_SECRET_FILE`）**：
-    1. **升级前一致性备份**：在拉取并启动 3.18.2 镜像前，先对整个持久化数据目录（包含 SQLite 数据库、`credentials.json` 所在凭据目录等全部状态）做一致性备份。
-    2. **排他准备并挂载密钥文件（确保容器运行 UID 可读且绝不覆盖已有密钥）**：在宿主机持久化路径确认密钥文件不存在后，以排他创建方式写入 32–4096 字节随机密钥（`umask 077`，属主设为容器运行用户 UID `1001`，权限设为 `0600`，避免使容器 UID `1001` 无法读取的 `root:root 0400`；已有密钥文件必须直接复用，绝不覆盖），再以只读方式挂载到容器内并设置 `ZCODE_CREDENTIAL_SECRET_FILE=<容器内挂载路径>`（或显式注入 `ZCODE_CREDENTIAL_SECRET`）。
+- **固定基线与当前状态**：3.18.2 合并与提交链详见 [standalone-web-baseline.md](./standalone-web-baseline.md)。当前部署基线 `4e959bab` 已通过 GitHub Actions（运行 `43622140891` `success`）构建校验并发布 `latest` 与 `sha-4e959bab` 镜像；已完成容器部署与 Agent 基础运行验收，下方未勾选交互项待用户实机验证。
+- **3.18.2 凭据密钥部署要求与步骤说明（保持上游强校验，参见 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)）**：
+  - **启动约束与默认路径自动发现（`:99-104`）**：独立 Web HTTP 服务在开放前会初始化凭据后端。无系统 keyring 的部署环境支持：
+    - **默认路径自动发现**：当未设置 `ZCODE_CREDENTIAL_SECRET` 与 `ZCODE_CREDENTIAL_SECRET_FILE` 时，服务端按 UTF-8 自动读取 `<zcodeHomeDir>/v2/credential-secret`（容器默认 `/home/agent/.zcode/v2/credential-secret`，32–4096 字节随机文本密钥，权限 `0600`，属主为容器运行 UID `1001`）。若持久化目录中已存在合规的默认密钥文件，直接沿用上游自动发现即可，无须补设 `ZCODE_CREDENTIAL_SECRET_FILE`。
+    - **显式环境变量注入**：若使用自定义路径或环境变量，可显式提供 `ZCODE_CREDENTIAL_SECRET_FILE` 或 `ZCODE_CREDENTIAL_SECRET`（二者不可同时设置，32–4096 字节 UTF-8 随机文本密钥，按原样读取、不 trim）。
+  - **密钥准备与回退限制**：
+    1. **升级前一致性备份**：在拉取并启动 3.18.2 镜像前，先对整个持久化数据目录（包含 SQLite 数据库、凭据目录与 `v2/credential-secret` 等全部状态）做一致性备份。
+    2. **排他准备密钥文件（确保容器运行 UID 可读且绝不覆盖已有密钥）**：若默认路径 `/home/agent/.zcode/v2/credential-secret`（或自定义挂载路径）尚不存在密钥文件，以排他创建方式写入 32–4096 字节 UTF-8 随机文本密钥（`umask 077`，属主设为容器运行用户 UID `1001`，权限设为 `0600`；已有密钥文件必须直接复用，绝不覆盖）。
     3. **密钥留存与回退限制（`:46-63`）**：妥善保留并备份该密钥文件；3.18.2 写入或迁移生成 `zcodeCredentialFormat: 2`（v2 密文）后，仅支持 v1 的 3.17.2 旧版镜像（`f40a4597` / `364e6c55`）无法读取 v2 密文（且旧版程序不会自动安全阻止回滚）。因此**不能仅靠切回旧镜像标签或仅恢复 `credentials.json` 回退**；如需回退旧镜像，须核对 SQLite 数据库迁移差异并整体恢复升级前的一致性数据备份。
-- **本轮 3.18.2 本地已通过校验**：
+- **本轮 3.18.2 本地与 CI 已通过校验**：
   - `node --test scripts/zcode-distribution.test.mjs`：11 项通过。
   - `pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-multi-root-projects.mjs`：7 项通过。
   - `pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-memory-files.mjs`：5 项通过。
   - `node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-mcp-routing.mjs`：13 项通过（容器构建校验工作流已同步接入该项）。
-  - `node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-archived-deletion-carrier.mjs`：3 组通过（验证真实 Host + stub CLI 路由：cold owner 路由至管理进程、hot 路由至原 CLI、foreign/path/`remoteSessionId` 等 5 类非法目标 × preview/execute 共 10 次请求全部拒绝且无 fallback；注：本项仅验证 Host 路由，未实测 CLI 物理擦除、revision 或 incomplete 分支）。
+  - `pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-archived-deletion-carrier.mjs`：3 组通过（验证真实 Host + stub CLI 路由：cold owner 路由至管理进程、hot 路由至原 CLI、foreign/path/`remoteSessionId` 等 5 类非法目标 × preview/execute 共 10 次请求全部拒绝且无 fallback；注：本项仅验证 Host 路由，未实测 CLI 物理擦除、revision 或 incomplete 分支）。
   - 设置页模型删除/保存反馈竞态真实 UI 浏览器回归（修复提交 `454b2832`）：15 项全部通过（15 pass / 0 fail；修复前 14 项基线用例中 11 fail / 3 pass，经 token 变异验证同 key 与跨卡片 3 项用例失败检出后已还原）。
   - 架构检查（相对 `fec97590` 新增违规为 0）与定向 `lint`（0 errors，含上游既有 warnings）通过。
-- **待完成验证项（尚未推送 / 尚未执行 CI / 尚未实机部署）**：
-  - [ ] **归档任务删除端到端与实机验证（3.18.2 用户可见变化）**：采用上游 3.18.2 官方「归档预检 + 二次确认永久删除」，本地仅完成 Host carrier 路由 3 组校验；CLI 物理擦除及网页端归档预检、二次确认永久删除、刷新/重连不复活待部署后实机验证。
-  - [ ] **设置页删除/保存模型反馈实机验证**：本地 15 项浏览器回归已通过，待镜像部署后实机确认。
-  - [ ] **远端 CI 构建校验与独立 Web 实机回归**：待推送升级分支并创建 PR 先执行构建与自动化校验，合并至 `main` 发布镜像后再执行实机部署验收。
+  - GitHub Actions 远端构建与发布：PR #2 运行 `43569582003`、`main` 运行 `43570424184` 与 `43622140891` 全部 `success`（已发布 `latest` 与 `sha-4e959bab`）。
+- **已完成容器部署与 Agent 基础运行验收（2026-11-15）**：
+  - [x] **3.18.2（`4e959bab`）容器启动、鉴权与 WebSocket 基础探针**：容器状态 `healthy`（`restarts: 0`），默认 `v2/credential-secret`（64B、`0600`、UID `1001`）自动发现生效；HTTP 首页返回 `200`，鉴权 `serverinfo` 返回 `200`、未授权请求返回 `401`，WebSocket 握手通过；检查运行日志 5446 行无启动失败、凭据错误、`Unknown channel`、未捕获异常或 OOM 等关键错误。
+- **待用户实机验证项**：
+  - [ ] **归档任务删除端到端与实机验证（3.18.2 用户可见变化）**：采用上游 3.18.2 官方「归档预检 + 二次确认永久删除」，本地仅完成 Host carrier 路由 3 组校验；CLI 物理擦除及网页端归档预检、二次确认永久删除、刷新/重连不复活待用户实机验证。
+  - [ ] **设置页删除/保存模型反馈实机验证**：本地 15 项浏览器回归与服务部署基础探针已通过，待用户在真实模型配置下实机确认。
+  - [ ] **技能详情“打开路径”局部回退表现确认**：已撤回适配（独立 Web 暂不支持技能打开路径），待新版实机顺带确认。
 
 ---
 

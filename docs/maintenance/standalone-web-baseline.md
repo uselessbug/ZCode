@@ -2,12 +2,15 @@
 
 ## 1. 上游 3.18.2 升级基线
 
-- 记录日期：2026-11-14
-- 工作分支：`sync/upstream-3.18.2`
-- 上游合并提交：`347fd4ff`（合并上游 `fec97590` v3.18.2 与独立 Web 基线 `f40a4597`，共同祖先 `a9fe401e`）
-- 模型删除/保存反馈竞态修复提交：`454b2832`
+- 记录日期：2026-11-15
+- 升级分支与合并链路：`sync/upstream-3.18.2`（PR #2，GitHub Actions 运行 `43569582003` `success`）合并至 `main` 生成 `ae58c92f`（GitHub Actions 运行 `43570424184` `success`），后续在 `main` 提交 `4e959bab`（完整 SHA：`4e959baba16eeb1f8403b9785aa3bae7866dd32f`，容器镜像新增 Docker CLI 与 Compose 插件，GitHub Actions 运行 `43622140891` `success` 并发布 `latest` 与 `sha-4e959bab`）
+- 关键包含提交：
+  - 上游合并提交：`347fd4ff`（合并上游 `fec97590` v3.18.2 与独立 Web 基线 `f40a4597`，共同祖先 `a9fe401e`）
+  - 模型删除/保存反馈竞态修复提交：`454b2832`
+  - CI 依赖安装竞态修复提交：`bf8c2105`
+  - 容器内置 Docker CLI / Compose 插件提交：`4e959bab`
 - 升级前 `main` 基线：`f40a4597`（`docs(maintenance): record standalone MCP deployment acceptance`）
-- 当前状态：本地合并与本地定向回归校验已完成，尚未推送远端、尚未运行 CI 构建、尚未执行实机部署。
+- 当前状态：已合并至 `main` 并由 GitHub Actions 完成构建、校验与镜像发布（`sha-4e959bab`）；已完成宿主容器更新与 Agent 基础运行验收（容器 `healthy`、`restarts: 0`，HTTP 页面 `200`、鉴权 `serverinfo` `200` / 未授权 `401`、WebSocket 握手通过，运行日志无启动/凭据/`Unknown channel`/未捕获异常/OOM 关键错误）。新版自定义模型删除、归档任务永久删除与实体手机重连待用户实机验证。
 
 ### 1.1 升级保护能力范围
 
@@ -22,7 +25,10 @@
 
 依据 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)（保持上游行为，不自动生成生产密钥或恢复弱密钥兜底）：
 
-- **显式凭据密钥强校验（`:99-104`）**：独立 Server / Docker Web 在开放 HTTP 服务前会初始化凭据后端；无系统 keyring 时必须显式提供 `ZCODE_CREDENTIAL_SECRET` 或 `ZCODE_CREDENTIAL_SECRET_FILE`（32–4096 字节只读 secret，按原字节读取、不 trim，二者不可同时设置）。本地隔离探针已验证凭据 cipher wrapper 初始化：无 secret 且无 keyring 时凭据初始化失败，注入合成 secret 时凭据初始化通过（非完整 HTTP 服务实测）。
+- **凭据密钥发现与强校验（`:99-104`）**：独立 Server / Docker Web 在开放 HTTP 服务前会初始化凭据后端；无系统 keyring 时支持以下任一方式提供 32–4096 字节只读随机文本密钥（按 UTF-8 文本原样读取、不 trim）：
+  1. 未设置环境变量时，自动发现默认持久化路径 `<zcodeHomeDir>/v2/credential-secret`（容器默认 `/home/agent/.zcode/v2/credential-secret`，已有合规密钥文件时直接复用，无须额外设置 `ZCODE_CREDENTIAL_SECRET_FILE`）；
+  2. 显式设置 `ZCODE_CREDENTIAL_SECRET` 或 `ZCODE_CREDENTIAL_SECRET_FILE`（二者不可同时设置）。
+  本地隔离探针已验证凭据 cipher wrapper 初始化，实际 3.18.2 容器部署已通过默认持久化 `v2/credential-secret` 自动发现完成启动与基础探针验收。
 - **v2 密文与跨版本回退限制（`:46-63`）**：3.18.2 启用 `zcodeCredentialFormat: 2`（v2 密文）。一旦写入或迁移生成 v2 密文，仅支持 v1 的旧版镜像（如 3.17.2 阶段的 `f40a4597` / `364e6c55`）无法读取 v2 密文（且旧版程序不具备 v2 版本门禁，不会自动安全阻止回滚）。因此不能仅靠切回旧镜像标签回退；升级前须对整个持久化数据目录（含 SQLite 数据库与凭据目录）及凭据密钥做一致性备份，回退前须核对 SQLite 迁移兼容性并整体恢复升级前数据备份，不能假设仅恢复 `credentials.json` 即可回退。
 
 ---
