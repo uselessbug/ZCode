@@ -4,7 +4,7 @@
 
 ## 1. 上游 3.18.2 升级基线、部署要求与验证清单
 
-- **固定基线与当前状态**：3.18.2 合并与提交链详见 [standalone-web-baseline.md](./standalone-web-baseline.md)。当前部署基线 `4e959bab` 已通过 GitHub Actions（运行 `43622140891` `success`）构建校验并发布 `latest` 与 `sha-4e959bab` 镜像；已完成容器部署与 Agent 基础运行验收，下方未勾选交互项待用户实机验证。
+- **固定基线与当前状态**：3.18.2 合并与提交链详见 [standalone-web-baseline.md](./standalone-web-baseline.md)。当前已部署基线 `4e959bab` 已通过 GitHub Actions（运行 `43622140891` `success`）构建校验并发布 `latest` 与 `sha-4e959bab` 镜像，且已完成容器部署、Agent 基础运行探针与 2026-11-15 用户实机验收。工作区后续本地新增的 `browser-use` 受管 CDP 适配与 3 项冗余代码清理待 CI 构建与部署（见下方说明）。
 - **3.18.2 凭据密钥部署要求与步骤说明（保持上游强校验，参见 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)）**：
   - **启动约束与默认路径自动发现（`:99-104`）**：独立 Web HTTP 服务在开放前会初始化凭据后端。无系统 keyring 的部署环境支持：
     - **默认路径自动发现**：当未设置 `ZCODE_CREDENTIAL_SECRET` 与 `ZCODE_CREDENTIAL_SECRET_FILE` 时，服务端按 UTF-8 自动读取 `<zcodeHomeDir>/v2/credential-secret`（容器默认 `/home/agent/.zcode/v2/credential-secret`，32–4096 字节随机文本密钥，权限 `0600`，属主为容器运行 UID `1001`）。若持久化目录中已存在合规的默认密钥文件，直接沿用上游自动发现即可，无须补设 `ZCODE_CREDENTIAL_SECRET_FILE`。
@@ -13,21 +13,23 @@
     1. **升级前一致性备份**：在拉取并启动 3.18.2 镜像前，先对整个持久化数据目录（包含 SQLite 数据库、凭据目录与 `v2/credential-secret` 等全部状态）做一致性备份。
     2. **排他准备密钥文件（确保容器运行 UID 可读且绝不覆盖已有密钥）**：若默认路径 `/home/agent/.zcode/v2/credential-secret`（或自定义挂载路径）尚不存在密钥文件，以排他创建方式写入 32–4096 字节 UTF-8 随机文本密钥（`umask 077`，属主设为容器运行用户 UID `1001`，权限设为 `0600`；已有密钥文件必须直接复用，绝不覆盖）。
     3. **密钥留存与回退限制（`:46-63`）**：妥善保留并备份该密钥文件；3.18.2 写入或迁移生成 `zcodeCredentialFormat: 2`（v2 密文）后，仅支持 v1 的 3.17.2 旧版镜像（`f40a4597` / `364e6c55`）无法读取 v2 密文（且旧版程序不会自动安全阻止回滚）。因此**不能仅靠切回旧镜像标签或仅恢复 `credentials.json` 回退**；如需回退旧镜像，须核对 SQLite 数据库迁移差异并整体恢复升级前的一致性数据备份。
-- **本轮 3.18.2 本地与 CI 已通过校验**：
+- **本轮 3.18.2（`4e959bab`）本地与 CI 已通过校验**：
   - `node --test scripts/zcode-distribution.test.mjs`：11 项通过。
   - `pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-multi-root-projects.mjs`：7 项通过。
   - `pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-memory-files.mjs`：5 项通过。
   - `node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-mcp-routing.mjs`：13 项通过（容器构建校验工作流已同步接入该项）。
-  - `pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-archived-deletion-carrier.mjs`：3 组通过（验证真实 Host + stub CLI 路由：cold owner 路由至管理进程、hot 路由至原 CLI、foreign/path/`remoteSessionId` 等 5 类非法目标 × preview/execute 共 10 次请求全部拒绝且无 fallback；注：本项仅验证 Host 路由，未实测 CLI 物理擦除、revision 或 incomplete 分支）。
+  - `pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-archived-deletion-carrier.mjs`：3 组通过（验证真实 Host + stub CLI 路由：cold owner 路由至管理进程、hot 路由至原 CLI、foreign/path/`remoteSessionId` 等 5 类非法目标 × preview/execute 共 10 次请求全部拒绝且无 fallback）。
   - 设置页模型删除/保存反馈竞态真实 UI 浏览器回归（修复提交 `454b2832`）：15 项全部通过（15 pass / 0 fail；修复前 14 项基线用例中 11 fail / 3 pass，经 token 变异验证同 key 与跨卡片 3 项用例失败检出后已还原）。
   - 架构检查（相对 `fec97590` 新增违规为 0）与定向 `lint`（0 errors，含上游既有 warnings）通过。
-  - GitHub Actions 远端构建与发布：PR #2 运行 `43569582003`、`main` 运行 `43570424184` 与 `43622140891` 全部 `success`（已发布 `latest` 与 `sha-4e959bab`）。
-- **已完成容器部署与 Agent 基础运行验收（2026-11-15）**：
+  - GitHub Actions 远端构建与发布：PR #2 运行 `43569582003`、`main` 运行 `43570424184` 与 `4e959bab` 运行 `43622140891` 全部 `success`（已发布 `latest` 与 `sha-4e959bab`）。
+- **已完成容器部署与实机验收（2026-11-15）**：
   - [x] **3.18.2（`4e959bab`）容器启动、鉴权与 WebSocket 基础探针**：容器状态 `healthy`（`restarts: 0`），默认 `v2/credential-secret`（64B、`0600`、UID `1001`）自动发现生效；HTTP 首页返回 `200`，鉴权 `serverinfo` 返回 `200`、未授权请求返回 `401`，WebSocket 握手通过；检查运行日志 5446 行无启动失败、凭据错误、`Unknown channel`、未捕获异常或 OOM 等关键错误。
-- **待用户实机验证项**：
-  - [ ] **归档任务删除端到端与实机验证（3.18.2 用户可见变化）**：采用上游 3.18.2 官方「归档预检 + 二次确认永久删除」，本地仅完成 Host carrier 路由 3 组校验；CLI 物理擦除及网页端归档预检、二次确认永久删除、刷新/重连不复活待用户实机验证。
-  - [ ] **设置页删除/保存模型反馈实机验证**：本地 15 项浏览器回归与服务部署基础探针已通过，待用户在真实模型配置下实机确认。
-  - [ ] **技能详情“打开路径”局部回退表现确认**：已撤回适配（独立 Web 暂不支持技能打开路径），待新版实机顺带确认。
+  - [x] **归档任务删除端到端与实机验证（3.18.2 用户可见变化）**：2026-11-15 用户实机执行归档任务永久删除确认正常；运行日志同步确认 `zcode-task.previewArchivedTaskDeletion`（`2026-11-15T14:00:51.756Z`，`OK 1051ms`）与 `zcode-task.permanentlyDeleteArchivedTask`（`2026-11-15T14:00:56.749Z`，`OK 1143ms`）均成功完成且无对应失败（未声称做独立磁盘逐文件审计）。
+  - [x] **设置页删除/保存模型反馈实机验证**：2026-11-15 用户实机确认模型保存与删除提示正常。
+  - [x] **移动端、重连与工作区交互实机确认**：2026-11-15 用户实机确认实体手机重连未见明显问题，手机工作区与 `compact-web` 新版设置页、手机子代理设置、权限确认弹窗、新建技能/插件试用预填跳转聊天页、任务分组、新建项目目录选择（默认 `/workspace`）以及任务工作区归属均正常。
+- **本地已实现、待 CI 构建与部署验证（尚未进入线上运行实例）**：
+  - [ ] **独立 HTTP Web 官方 `browser-use`（`agent.browsers.*`）受管无头 Chromium 接入**：`entry-http.ts` 注入 `server-browser-control` 受管 CDP 适配器，本地真实 Chromium 与脚本化 app-server 回归 15 项通过、发行布局加载器校验通过（规格见 [`docs/standalone-web-browser-use.md`](../standalone-web-browser-use.md)）；待 GitHub Actions 构建校验、镜像发布与容器部署验证。
+  - [ ] **3 项冗余代码清理（提交 `ce24c4cf`）**：移除 `rootStartupGate` 未使用 `providerStartupSyncPending` 参数、`ConversationTimeline` 废弃 `compactForRemoteControl` 属性、`scripts/zcode-distribution/assets.mjs` 未使用 `version` 字段；已本地提交，待 GitHub Actions CI 校验与部署。
 
 ---
 
@@ -57,14 +59,14 @@
 - **实机验证结果（2026-11-12）**：已通过。官方原有记忆设置仅提供列表与调用外部编辑器（无删除接口）；本仓本轮新增页内 Markdown 预览、编辑与保存，进入「设置 -> 记忆」点击记忆文件即可在网页弹窗内预览、编辑并保存。
 - **关于列表菜单操作**：用户确认后端无 delete 接口则不做删除功能（需删除时让对话 Agent 删除，尽量少改后端），已取消新增 delete API 需求；列表项直接“编辑”菜单暂不做（若未来需要再另行评估）。
 
-### (3) 技能详情“打开路径”（3.1 实机验证未通过 -> 已撤回适配，待新版部署验证）与 `.zcodeignore`「打开文件位置」（单列保留）
+### (3) 技能详情“打开路径”（已撤回适配，Web 暂不支持）与 `.zcodeignore`「打开文件位置」（已实现保留）
 
-- **3.1 技能详情“打开路径”（已撤回适配，待新版部署验证；Web 暂不支持）**：
+- **3.1 技能详情“打开路径”（已撤回适配；独立 Web 暂不支持，不计为已修复）**：
   - **实机表现**：点击技能路径后能打开右侧「文件管理」栏，但无法定位到技能目录。
   - **已确认根因**：文件树仍以当前项目为根，技能目录在项目外，因而定位被跳过。
-  - **回退结果**：已撤回适配，待新版部署验证（`SkillsSection` 局部回退）：仅将技能路径打开退回原本地文件管理器调用与失败提示，并撤回无项目时的目录浏览弹窗；独立 Web 下技能打开路径暂不支持（仍显示原失败提示），不记为功能已修好。技能页“当前服务器”范围文案及其他本轮改动保留。
-- **工作区文件搜索 `.zcodeignore`「打开文件位置」（单列保留，未随同回退）**：
-  - `WorkspaceFileSearchSection` 中「打开文件位置」定位的就是当前项目根目录本身，不存在跨出项目根目录的问题，保留打开右侧「文件管理」栏。
+  - **回退结论**：`SkillsSection` 已撤回适配，仅将技能路径打开退回原本地文件管理器调用与失败提示，并撤回无项目时的目录浏览弹窗；独立 Web 下技能打开路径暂不支持（不记为功能已修复，不再单独追踪待验证）。技能页“当前服务器”范围文案及其他改动保留。
+- **工作区文件搜索 `.zcodeignore`「打开文件位置」（已实现，未单列验收）**：
+  - `WorkspaceFileSearchSection` 中「打开文件位置」定位的就是当前项目根目录本身，不存在跨出项目根目录的问题，保留打开右侧「文件管理」栏（用户未单列验收，不作为阻断或待反馈项）。
 
 ### (4) 从服务器目录添加插件来源（2026-11-12 实机验证通过）
 
@@ -86,10 +88,10 @@
   - 在“当前服务器”与具体项目间切换，用户级 MCP（如 `browser`、`rea`）与项目级 MCP 在“已安装”分组正常展示并刷新连接状态。
   - 新增、编辑、删除、启停 MCP 持久化到当前服务器，刷新页面或重连后保持；首次加载不闪现假空列表；Desktop 本机、手机 `/remote` 与跨 Host 远端行为不退化。
 
-## 4. 保留待确认、待复核与暂缓项
+## 4. 未修复项、暂缓项与内部小项
 
-- **待集中复核**：新建任务、归档与取消归档在独立 Web 下的工作区归属（`cwd`、Git 归属、`workspacePath`、`workspaceIdentity`）一致性，结合实机多 root 与任务移动使用情况继续观察复核。
-- **待实机确认**：
-  - 输入法剪贴板粘贴超长文本（>15360 字符）时输入框转为附件的表现。
-  - 实体手机断线重连后的编辑器焦点恢复与软键盘交互表现。
-- **暂缓（低优先级）**：依赖宿主专属容器的插件自定义交互页（UI Plugin）独立 Web 承载。
+- **未修复（代码审查发现，尚未经用户现场复现）**：`packages/server/src/http.ts` 的 `createStandaloneProjectAlias` 中 `positionalHostMethods` 遗漏 `restoreProject`，独立 Web 下撤销移除项目或恢复已移除项目时 `"local"` 未重写为 `ownerHostId`。
+- **暂缓 / 暂不做**：
+  - 设置页“记忆”列表项菜单直接“编辑”入口（暂不做，页内点击查看与编辑已可用）。
+  - 依赖宿主专属容器的插件自定义交互页（UI Plugin）独立 Web 承载（暂缓，低优先级）。
+- **内部工程小项（非用户故障）**：`MemorySettingsViewer.tsx` 列表刷新与冲突弹窗重载按钮共用 `TID_SETTINGS_MEMORY_REFRESH`。

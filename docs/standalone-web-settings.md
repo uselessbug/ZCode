@@ -2,7 +2,7 @@
 
 # 独立 Web / 手机远控 设置页：服务能力边界与手机布局
 
-固定上游 3c5b227649371507ddc4eb46ac5133afe6db1cab（3.16.2）基础上，本 spec 覆盖设置页两件事：**服务能力边界**（记忆浏览不再按桌面平台假门禁）与**手机单栏布局**。连接生命周期另见 [连接恢复](standalone-web-recovery.md)，任务/项目兼容见 [任务和项目](standalone-web-task-and-project-compat.md)。
+本 spec 覆盖设置页两件事：**服务能力边界**（记忆浏览、个性化、MCP 等不再按桌面平台假门禁）与**手机窄屏 Web 布局**（随 3.18.2 统一采用官方 `compact-web` 方案，详见 [设置页窄屏 Web 布局](settings-narrow-layout.md)）。连接生命周期另见 [连接恢复](standalone-web-recovery.md)，任务/项目兼容见 [任务和项目](standalone-web-task-and-project-compat.md)。
 
 不引入能力注册框架，也不新增第二份能力配置。
 
@@ -13,7 +13,6 @@
 | 项目记忆 catalog（按 workspace 的 Markdown） | 所属 Host 数据根 `<dataRoot>/cli/memories/projects` 的 `IMemoryService`            | `SettingsPage` 的 `localHostServices.memoryService` |
 | `localHostServices` 的归属                   | 各入口注入的 base Host（桌面本机 Host / 云端 server Host / 手机远控被控桌面 Host） | `useBaseWorkspaceServices()`                        |
 | 记忆开关与存储格式                           | 各 base Host 的 `settingService`（`memoryEnabled`）                                | `useSettings({ services: localHostServices })`      |
-| 设置页手机导航态                             | `SettingsPage` 局部状态（一个布尔）                                                | `mobileSettingsDetailOpen`                          |
 
 ### 记忆浏览：按服务边界判定，不按平台
 
@@ -83,12 +82,12 @@ sequenceDiagram
 
 ## 技能“打开路径”与工作区 `.zcodeignore`“打开文件位置”状态说明
 
-- **技能详情“打开路径”（已撤回适配，待新版部署验证；Web 暂不支持）**：
+- **技能详情“打开路径”（已撤回适配；独立 Web 暂不支持）**：
   - 2026-11-12 实机验证发现，在有活动工作区时点击技能详情路径虽能打开右侧「文件管理」栏，但无法定位到技能目录。
   - **已确认根因**：`SkillsSection` 调用 `useOpenHostDirectory` 时传入当前项目的 `workspacePath` 与外部技能目录 `revealPath`；`WorkspaceFileTree`（286-289 行）在 `revealPath` 不属于当前 `workspacePath` 根目录时直接 `return`，且 `temporaryExternalDirectory` 不会改变文件树根目录。
-  - **当前合同**：`SkillsSection` 的技能路径网页适配及无工作区时的 `DirectoryBrowser` 弹窗已撤回适配，待新版部署验证，恢复为原有的 `platform.openInFileManager` + 失败 Toast 提示；独立 Web 下技能打开路径暂不支持（仍弹原有失败提示），技能页“当前服务器” Scope 文案等其余改动保留。
-- **工作区文件搜索 `.zcodeignore`“打开文件位置”（单列保留）**：
-  - `WorkspaceFileSearchSection` 中点击「打开文件位置」传入的目标路径本身就是当前工作区根目录 `workspacePath`，不存在跨出项目根目录的问题，因此继续保留 `useOpenHostDirectory` 打开右侧「文件管理」面板，未随技能路径一同回退。
+  - **当前合同**：`SkillsSection` 的技能路径网页适配及无工作区时的 `DirectoryBrowser` 弹窗已撤回，恢复为原有的 `platform.openInFileManager` + 失败 Toast 提示；独立 Web 下技能打开路径暂不支持（不计为已修复，亦不再单独追踪待验证），技能页“当前服务器” Scope 文案等其余改动保留。
+- **工作区文件搜索 `.zcodeignore`“打开文件位置”（已实现保留）**：
+  - `WorkspaceFileSearchSection` 中点击「打开文件位置」传入的目标路径本身就是当前工作区根目录 `workspacePath`，不存在跨出项目根目录的问题，因此继续保留 `useOpenHostDirectory` 打开右侧「文件管理」面板，未随技能路径一同回退（未单列实机验收，不作为阻断项）。
 
 ## 插件来源：服务端目录选择
 
@@ -169,17 +168,15 @@ sequenceDiagram
 3. 首次加载与重连换绑：首屏不因 passive effect 早于注入而读到假空；重连更换服务实例或快速切换目标时，在途旧读取被 `mcpBindingRevision` 丢弃。
 4. Desktop、`/remote` 与跨 Host 远端：Desktop 本机读写与 legacy 迁移、手机 `/remote` 代理、跨 Host 远端读写及缺服务 fail-closed 行为不变。
 
-## 手机设置页单栏布局
+## 手机窄屏 Web 设置页布局（官方 `compact-web`）
 
-- 生效条件：`!isDesktop && useIsMobileCompactViewport()`（`max-width: 767px`）。宽屏桌面与窄窗口桌面保持原双栏。
-- 根容器标记 `data-mobile-settings`；单栏下列表与详情互斥显示，不再保留桌面 68px 图标栏。
-- 列表态：复用现有导航按钮，列表项显示图标 + 完整文字（不折叠成图标栏），触控高度 ≥44px；保留返回工作区入口。
-- 详情态：保留设置标题与可触控返回按钮（回到列表）；其余设置内容与桌面一致。
-- 不复制设置业务状态，仅新增一个导航布尔；使用现有 `useIsMobileCompactViewport` 与设计 token，不修改 html 字体缩放。
+- 生效条件：统一使用 `packages/ui/src/styles.css` 定义的 `@custom-variant compact-web`（视口宽度 `< 40rem` / `640px`，且根节点不含 `platform-mac-desktop` / `platform-windows-desktop` / `platform-linux-desktop`）。桌面端任意宽度与宽屏 Web（`>= 640px`）保持原双栏布局。
+- 导航与内容结构：`SettingsPage` 在 `compact-web` 下改为上下两行（`compact-web:grid-cols-1 compact-web:grid-rows-[auto_minmax(0,1fr)]`），隐藏桌面 48px 窗口拖拽留白；顶部为横向滚动导航条（左侧返回工作区按钮 + “图标 + 文字”分区按钮，分组间竖线分隔，切换分区时自动将激活项滚入可视区），下方直接占满宽度渲染当前分区内容，不维护列表/详情两层切换状态或额外 DOM data marker。
+- 行内自适应：`SettingsRow` 默认布局在 `compact-web` 下改为可换行 flex，说明文字列优先占满剩余宽度，开关与短按钮同行右侧排列，下拉框与长按钮自动换行右对齐且不超出卡片宽度。详细规范见 [设置页窄屏 Web 布局](settings-narrow-layout.md)。
 
 ## 验收场景
 
-1. 桌面端：设置页仍为左侧导航 + 内容双栏，导航项在窄窗口保持图标栏；记忆浏览与浏览器数据行为不变。
+1. 桌面端：设置页仍为左侧导航 + 内容双栏，导航项在窄窗口保持 68px 图标栏；记忆浏览与浏览器数据行为不变。
 2. 云端 Web / 手机远控（已连桥）：记忆设置可浏览**服务端/被控端**项目记忆，不读手机本机文件；`memoryEnabled` 开关与存储格式不变。
-3. 手机（≤767px，非桌面）：设置页进入列表页（图标 + 完整文字，触控 ≥44px）；点击某分区进入单栏详情；详情返回按钮回到列表。
-4. Web 设置页“浏览器数据”提示为 `settings.browser.webUnsupported`，说明 Chromium MCP 不受限；桌面端提示不变，Chrome 数据导入/清理按钮在 Web 仍禁用。
+3. 手机窄屏 Web（`< 640px`，非桌面）：设置页顶部显示返回按钮与横向可滚动分区导航条，下方占满宽度展示当前分区内容，说明文字正常换行、控件不挤压变形；点击返回按钮回到工作区。
+4. Web 设置页“浏览器数据”提示为 `settings.browser.webUnsupported`，说明 Chromium MCP 不受限（独立 HTTP Web 下 Agent 侧 `browser-use` 受管 CDP 边界另见 [独立 HTTP Web Browser Use 规格](standalone-web-browser-use.md)）；桌面端提示不变，Chrome 数据导入/清理按钮在 Web 仍禁用。
