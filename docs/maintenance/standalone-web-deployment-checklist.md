@@ -4,7 +4,7 @@
 
 ## 1. 上游 3.18.2 升级基线、部署要求与验证清单
 
-- **固定基线与当前状态**：线上当前实际运行版本为 `a18fe44a`（`sha-a18fe44a`），前一批 4 项修改（移除项目数据估算与清理、普通二进制上传与 >64K 文本落盘、独立 HTTP 服务端定时任务执行链、非桌面 Web 停用营销轮询）已通过 GitHub Actions [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success` 发布并于 `2026-11-16T11:59:45.181Z` 完成容器自更新与运行探针校验；2026-11-16 用户已在页面实测 `.docx` 附件上传与解析成功，在此基础上完成的桌面行为对齐更新已提交，待 CI 构建与部署验收。早前 `b9f0e517` 主题兼容修复已由用户确认自动跟随恢复（切换时页面重载与重连横幅另行追踪），`f643ee64` 部署的 `restoreProject` 项目恢复已于 2026-11-16 经用户页面实操与容器运行日志验证通过。具体证据见下方及 [standalone-web-baseline.md](./standalone-web-baseline.md)。
+- **固定基线与当前状态**：线上当前实际运行版本为 `5d682dfd`（`sha-5d682dfd`，digest `sha256:ce7a0475f08bff71703f0ce1be81bb7f22e315ba1130a51f58651eade2838075`）。桌面行为对齐 8 项更新（附件具名落盘与桌面预读统一、项目数据双记忆命名空间清理、开启代码批注卡片、定时任务冻结目录快照放行、Browser Use 空闲池保留与归档/删除清理、0 目录项目生命周期对齐、本地 Git 受管 Worktree 打通、侧栏任务菜单「显示文件树」与隐藏无效配置入口）已通过 GitHub Actions [`43917276559`](https://github.com/uselessbug/ZCode/actions/runs/43917276559) `success` 发布，并于 `2026-11-16T17:49:21.595Z` 完成容器自更新与运行探针校验（含 `/api/server-info` `capabilities.managedWorktrees: true`；实际页面交互待浏览器刷新后日常使用验收）。早前 `a18fe44a`（GitHub Actions [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success`）部署后，2026-11-16 用户已在页面实测 `.docx` 附件上传与解析成功；`b9f0e517` 主题兼容修复已由用户确认自动跟随恢复（切换时页面重载与重连横幅另行追踪），`f643ee64` 部署的 `restoreProject` 项目恢复已于 2026-11-16 经用户页面实操与容器运行日志验证通过。具体证据见下方及 [standalone-web-baseline.md](./standalone-web-baseline.md)。
 - **3.18.2 凭据密钥部署要求与步骤说明（保持上游强校验，参见 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)）**：
   - **启动约束与默认路径自动发现（`:99-104`）**：独立 Web HTTP 服务在开放前会初始化凭据后端。无系统 keyring 的部署环境支持：
     - **默认路径自动发现**：当未设置 `ZCODE_CREDENTIAL_SECRET` 与 `ZCODE_CREDENTIAL_SECRET_FILE` 时，服务端按 UTF-8 自动读取 `<zcodeHomeDir>/v2/credential-secret`（容器默认 `/home/agent/.zcode/v2/credential-secret`，32–4096 字节随机文本密钥，权限 `0600`，属主为容器运行 UID `1001`）。若持久化目录中已存在合规的默认密钥文件，直接沿用上游自动发现即可，无须补设 `ZCODE_CREDENTIAL_SECRET_FILE`。
@@ -47,6 +47,10 @@
 - **已完成 `a18fe44a` CI 发布、容器部署与运行探针（2026-11-16）**：
   - **CI 与镜像发布证据**：提交 `a18fe44a`（完整 SHA：`a18fe44a5d0f3eadd7af630c854350952340e90c`，包含 `f4e9adb9` 停用非桌面营销轮询、`2d420913` 普通二进制与大文本附件修复、`844e62d6` 独立 Web 项目数据估算与清理、`e552c565` + `a18fe44a` 独立 HTTP 定时任务 `automation-runtime` 执行链及 `da4511a5` 项目恢复验收记录），GitHub Actions 运行 [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success`，发布镜像 `latest` 与 `sha-a18fe44a`（digest `sha256:b05def7328ed9ee88da4d21fd9fe60a55e1009298737fb433f5e9d8f44f98da9`）。
   - [x] **容器自更新与运行探针（`2026-11-16T11:59:45.181Z`）**：独立后台 `docker:cli` helper 容器（`--rm`）于 `2026-11-16T11:59:46Z` 完成并退出码 `0`；`ai-agent-zcode-1` 状态 `running`、`healthy`、`restarts: 0`，运行镜像 `org.opencontainers.image.revision` 核实为 `a18fe44a5d0f3eadd7af630c854350952340e90c`；HTTP 首页 `200`、鉴权 `/api/server-info` `200`、未授权 `/api/server-info` `401`、WebSocket 握手 `pass`、`credential-secret` 与 `provider_config.json` SHA-256 指纹不变、首页双值 `color-scheme` meta 为 `true`、`/opt/browser-mcp` 目录不存在。
+
+- **已完成 `5d682dfd` CI 发布、容器部署与运行探针（2026-11-17）**：
+  - **CI 与镜像发布证据**：提交 `5d682dfd`（完整 SHA：`5d682dfd473c915dad98a3c16688f822237764f8`，包含 `52c43e5a` 附件具名落盘与桌面预读统一、`520e37e9` 侧栏任务文件树动作与代码批注卡片、`9d3ef7b2` 0 目录项目/双记忆清理/定时任务冻结目录/Browser Use 生命周期与本地 Git 受管 Worktree 对齐及 `5d682dfd` 维护文档更新），GitHub Actions 运行 [`43917276559`](https://github.com/uselessbug/ZCode/actions/runs/43917276559) `success`（`typecheck`、`lint`、架构检查、`ci-browser` 含 Browser Use 18/18 回归与 ARM64 发行镜像契约校验全部通过），发布镜像 `latest` 与 `sha-5d682dfd`（digest `sha256:ce7a0475f08bff71703f0ce1be81bb7f22e315ba1130a51f58651eade2838075`）。
+  - [x] **容器自更新与运行探针（`2026-11-16T17:49:21.595Z`）**：独立后台 `docker:cli` helper 容器（`--rm`）退出码 `0` 完成自更新与一致性备份；`ai-agent-zcode-1` 状态 `running`、`healthy`、`restarts: 0`，运行镜像 `org.opencontainers.image.revision` 核实为 `5d682dfd473c915dad98a3c16688f822237764f8`；HTTP 首页 `200`、鉴权 `/api/server-info` `200`（且 `capabilities.managedWorktrees: true`）、未授权 `/api/server-info` `401`、WebSocket 握手 `pass`、`credential-secret` 与 `provider_config.json` SHA-256 指纹不变、首页双值 `color-scheme` meta 为 `true`、`/opt/browser-mcp` 目录不存在。
 
 ---
 
@@ -105,20 +109,20 @@
   - 在“当前服务器”与具体项目间切换，用户级 MCP（如 `rea`；历史验收时含已移除的 `browser`）与项目级 MCP 在“已安装”分组正常展示并刷新连接状态。
   - 新增、编辑、删除、启停 MCP 持久化到当前服务器，刷新页面或重连后保持；首次加载不闪现假空列表；Desktop 本机、手机 `/remote` 与跨 Host 远端行为不退化。
 
-## 4. 已提交待 CI 构建与部署验收、已部署线上项、暂缓项与内部小项
+## 4. 已部署线上项、待定位项、暂缓项与内部小项
 
-- **已提交，待 CI 构建与部署验收（桌面行为对齐）**：
+- **已部署（`5d682dfd`），待实际页面交互验收（桌面行为对齐 8 项；GitHub Actions [`43917276559`](https://github.com/uselessbug/ZCode/actions/runs/43917276559) `success`，镜像 `sha-5d682dfd`，`2026-11-16T17:49:21.595Z` 容器与接口探针通过，含 `capabilities.managedWorktrees: true`；实际页面交互待浏览器刷新后日常使用验收）**：
   - [ ] **附件原文件名落盘与桌面 `readTextFileForModel` 预读统一**：上传普通文件与长粘贴在会话附件目录内改为 `<artifactId>/<安全化原文件名>` 子目录原子落盘（保留中文、空格等原文件名，使模型路径与 `::zcode-file-citation` 芯片显示真实原名，兼容新旧读取/统计与顶层条目保留匹配）；普通上传文本删除自建 64 KiB 硬切分，统一复用桌面 `resolveLocalFileAttachment` / `readTextFileForModel`（256 KiB + 25k token 预读、`.json` 等统一带 `source` 附件提醒，保留双 `zcode-artifact://` URI）。本地 `standalone-cli-attachment-materialization.mjs` 与 CLI 单测通过。
   - [ ] **项目数据双记忆命名空间覆盖**：`project-data` 同时估算与清理独立 Web 本地路径哈希记忆目录（`<slug>-<hash>/memory`）与 canonical 身份哈希记忆目录（`project-<hash>/memory`），避免本地路径会话记忆漏估漏删。本地 `standalone-project-alias.mjs` 回归通过。
   - [ ] **独立 Web 开启代码批注卡片**：`packages/web/src/main.tsx` `<Root>` 补传 `assistantCodeCommentCardsEnabled`。
   - [ ] **定时任务已冻结目录快照放行**：进程内可信标记放行已持久化的定时任务目录快照，项目编辑或清空 `roots` 后仍按原快照创建会话。本地 `standalone-automation-runtime.mjs` 回归通过。
   - [ ] **Browser Use 普通释放保留上下文与归档/删除生命周期清理**：普通 `closeSession` 仅释放租约并将 `BrowserContext`/页面/Cookie 保存在有界空闲池供后续恢复；归档、自动归档、删除、永久删除及项目数据清理（含已删 `owned` 子会话）统一经 per-`sessionKey` 串行队列触发 `closeTaskSessions` 彻底销毁上下文（真实 Chromium `verify-standalone-browser-use.mjs` 18/18 通过）。
   - [ ] **0 目录新建与清空目录对齐桌面生命周期**：支持保存与编辑清空为 `0` 个目录、恢复干净默认项目名，首次 `prepareSession` 懒创建 `/workspace/.zcode/workspace/<projectId>`；无项目草稿目录保持 `/workspace/.zcode/conversations/draft-<id>`，新建/编辑项目目录浏览默认起点保持 `/workspace`。本地 `standalone-multi-root-projects.mjs` 回归通过。
-  - [ ] **当前服务器本地 Git 受管 Worktree 全链路打通**：服务端、`/api/server-info`（`capabilities.managedWorktrees`）与前端入口协同放行，受管 Worktree 落盘在 `/workspace/.zcode/worktrees`，补齐真实 `worktreeRemovalGate` `readTaskCwd`、Browser Use 归属归一及归档 Worktree 任务永久删除路径对齐（`standalone-managed-worktree.mjs` 真实 Git 验收通过）。
+  - [ ] **当前服务器本地 Git 受管 Worktree 全链路打通**：服务端、`/api/server-info`（`capabilities.managedWorktrees`）与前端入口协同放行，受管 Worktree 落盘在 `/workspace/.zcode/worktrees`，补齐真实 `worktreeRemovalGate` `readTaskCwd`、Browser Use 归属归一及归档 Worktree 任务永久删除路径对齐（本地 `standalone-managed-worktree.mjs` 真实 Git 验收通过，线上探针已确认 `/api/server-info` 返回 `capabilities.managedWorktrees: true`）。
   - [ ] **任务菜单「显示文件树」与隐藏无效配置入口**：侧栏任务菜单调用官方 `openTaskFiles` 打开右侧文件栏，隐藏无效的「前往 Provider 配置」（`standalone-desktop-parity-ui.mjs` 26 项通过）。
-- **已部署（`a18fe44a`），线上运行中（4 项；GitHub Actions [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success`，镜像 `sha-a18fe44a`，`2026-11-16T11:59:45.181Z` 容器与接口探针通过，2026-11-16 用户已实测 `.docx` 附件上传与解析成功）**：
+- **早前已部署（`a18fe44a`），线上运行中（4 项；GitHub Actions [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success`，镜像 `sha-a18fe44a`，`2026-11-16T11:59:45.181Z` 容器与接口探针通过，2026-11-16 用户已实测 `.docx` 附件上传与解析成功）**：
   - [ ] **移除项目时无法估算与清理当前服务器项目数据**：补齐 `packages/server/src/http.ts` 对 `measureProjectData`、`deleteProjectData` 的位置参数 Host 别名转换；仅在 `standalone-server` 且开启独立 Web 兼容配置时放行当前服务器 `ownerHostId`（跨 Host 与普通远端仍报 `project.data-local-only`）；同时覆盖本地路径哈希记忆目录与 canonical 身份哈希记忆目录，并复用严格会话删除载体（优先命中热运行工作区 CLI 保护 `busy` 会话，仅在 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 且归属本服务器时回落管理面进程）。本地 `standalone-project-alias.mjs` 回归通过。
-  - [x] **普通二进制文件分块上传与大文本落盘（用户已实测 `.docx` 上传解析成功，进一轮具名落盘与桌面预读对齐见上方待 CI 部署项）**：前端对无 `localPath` 的普通文件统一按真实字节走 V4 `begin/chunk/commit` 分块上传（上限 20 MiB，支持 0 字节文件，超限抛 `OversizedInlineFileAttachmentError` 提供 5 语言提示并补齐图片超限本地化，移除前端 64K 字符截断）；`a18fe44a` 部署后用户实测 `.docx` 上传与解析成功。本地 `standalone-attachment-upload.mjs`（16 项）与 `standalone-cli-attachment-materialization.mjs` 回归通过。
+  - [x] **普通二进制文件分块上传与大文本落盘（用户已实测 `.docx` 上传解析成功，进一轮具名落盘与桌面预读对齐已随 `5d682dfd` 部署上线）**：前端对无 `localPath` 的普通文件统一按真实字节走 V4 `begin/chunk/commit` 分块上传（上限 20 MiB，支持 0 字节文件，超限抛 `OversizedInlineFileAttachmentError` 提供 5 语言提示并补齐图片超限本地化，移除前端 64K 字符截断）；`a18fe44a` 部署后用户实测 `.docx` 上传与解析成功。本地 `standalone-attachment-upload.mjs`（16 项）与 `standalone-cli-attachment-materialization.mjs` 回归通过。
   - [ ] **独立 HTTP 服务端定时任务缺少到期调度与立即运行执行链**：新增受管模块 `packages/services/src/automation-runtime`，提取并由 Desktop 与独立 HTTP 共享 20s 到期轮询、5min misfire 跳过、按 `runId` 幂等结算、单飞 manual claim 与 60s 心跳续租、统一变更 `wake` 及先排空在途派发再关库的优雅关闭；修复 `standalone-server` 下新建及会话内 `CronCreate` 的服务器 `hostId` 与 canonical `workspaceIdentity` 固化，启动对齐采用无批量迁移副作用的只读 canonical 查询（保护同路径异域定义不被改写）；仅在 `entry-http.ts` 显式启用执行链。本地 `standalone-automation-runtime.mjs` 回归通过。
   - [ ] **非桌面 Web 停用 Z.ai 营销／活动轮询（冗余清理）**：`MarketingTouchProvider` 在非桌面入口（`!desktop`）直接返回空上下文，不创建营销 runtime/poller、不挂载 `MutationObserver`、不发起 `marketing-touch.query` 请求，消除自托管 Web 下的无用轮询与重复 `ZodError` 日志。本地 `standalone-attachment-upload.mjs` 挂载对照通过。
 - **待定位（1 项）**：
