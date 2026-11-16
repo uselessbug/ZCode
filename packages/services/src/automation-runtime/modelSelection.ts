@@ -1,12 +1,12 @@
 import type { ModelSelection } from "@zcode/shared";
-import type { IModelSelectionService } from "@zcode/services";
+import type { AutomationModelSelectionPort } from "./contract.js";
 
 /** 在 Automation Select 转为一次 Submission 的边界固定模型身份。 */
 export async function resolveAutomationSubmissionModelSelection(params: {
   selection?: ModelSelection;
   fixedSelection?: ModelSelection;
   readSelection?: () => Promise<ModelSelection | undefined>;
-  modelSelectionService: Pick<IModelSelectionService, "getView">;
+  modelSelectionService: AutomationModelSelectionPort;
 }): Promise<ModelSelection> {
   // 已固定 run 是执行事实；重试不能重新对应账号，更不能被当前读取失败改变。
   if (params.fixedSelection) return params.fixedSelection;

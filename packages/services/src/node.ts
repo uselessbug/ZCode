@@ -413,12 +413,46 @@ export {
   isOneShotAutomation,
   isValidCronExpr,
 } from "./session/automationCron.js";
+export {
+  AUTOMATION_MANUAL_CLAIM_HEARTBEAT_MS,
+  AUTOMATION_MISFIRE_GRACE_MS,
+  AUTOMATION_POLL_INTERVAL_MS,
+  AutomationPermanentDispatchError,
+  createAutomationExecutor,
+  createAutomationRuntime,
+  createAutomationScheduler,
+  type AutomationBotDeliveryPort,
+  type AutomationCronPort,
+  type AutomationDispatchRequest,
+  type AutomationDispatchSettlement,
+  type AutomationExecutorHandle,
+  type AutomationExecutorRepoPort,
+  type AutomationLoggerPort,
+  type AutomationModelSelectionPort,
+  type AutomationRepoPort,
+  type AutomationRunExecutorTargetServices,
+  type AutomationRuntimeHandle,
+  type AutomationSchedulerDispatchPort,
+  type AutomationSchedulerHandle,
+  type AutomationSchedulerRepoPort,
+  type AutomationTaskServicePort,
+  type AutomationTimersPort,
+  type CreateAutomationExecutorOptions,
+  type CreateAutomationRuntimeOptions,
+  type CreateAutomationSchedulerOptions,
+} from "./automation-runtime/index.js";
 
 import {
+  buildRemoteHostWorkspaceIdentity,
   buildServerRemoteWorkspaceIdentity,
   DEFAULT_APP_TOOL_SEARCH_MODE,
   remoteHostIdFromWorkspaceIdentity,
 } from "@zcode/shared";
+import {
+  createAutomationRuntime,
+  type AutomationRuntimeHandle,
+} from "./automation-runtime/index.js";
+import { computeAutomationNextRunAt, isOneShotAutomation } from "./session/automationCron.js";
 import { SourceServerWorkspaceAliasRepo } from "./session/sourceServerWorkspaceAliasRepo.js";
 import { SourceServerWorkspaceIdentityMapper } from "./source-server-workspace/sourceServerWorkspaceIdentityChannelServer.js";
 import { ServiceCollection } from "./collection.js";
@@ -774,6 +808,9 @@ const providerProvisioningTriggerDisposers = new WeakMap<
 >();
 // 自动归档定时扫描器不是 IPC 服务，随 services 释放时停掉定时器与设置监听。
 const taskAutoArchiveDisposers = new WeakMap<ServiceCollection, () => void>();
+// 独立 HTTP 定时任务运行时：随 services 释放先停新 admission 与轮询，再等待在途 ACK 后关库。
+const automationRuntimes = new WeakMap<ServiceCollection, AutomationRuntimeHandle>();
+const automationRuntimeDisposers = new WeakMap<ServiceCollection, AutomationRuntimeHandle>();
 // TaskIndexRepo / OffPeakTaskRepo 等各自持有 tasks-index.sqlite 的连接句柄；
 // dispose 链必须统一关闭：Windows 上句柄悬着会让宿主回收后临时目录 rm 撞 EBUSY
 // （stdioDesktopPresentationSurface 单测稳定复现），Linux 的 unlink-while-open 语义掩盖了泄漏。
@@ -1321,6 +1358,14 @@ export function createLocalServices(options: {
     automation: ZCodeAutomation;
     run: ZCodeAutomationRun;
   }) => Promise<void>;
+  onAutomationChanged?: (automationId?: string) => void;
+  /** 仅独立 HTTP Host 显式开启进程内定时任务调度与直派；默认 false 避免远端误起第二调度器。 */
+  automationExecutionEnabled?: boolean;
+  /** standalone 只读查询到 canonical 身份后同步登记进传输层映射表，不触发批量别名迁移。 */
+  onStandaloneWorkspaceIdentityResolved?: (mapping: {
+    stableIdentity: string;
+    canonicalIdentity: string;
+  }) => void;
   /** 闲时任务翻 schedulable 后请求宿主立即唤醒 scheduler（desktop host 注入 parentPort 转发）。 */
   onOffPeakSchedulerWakeRequested?: () => void;
   // 注入点：默认 resolver 已能覆盖 dev/桌面/SSH 远端三类形态；
@@ -2346,6 +2391,24 @@ export function createLocalServices(options: {
     standaloneWorkspaceRoot: options?.standaloneWorkspaceRoot,
     // 独立云端 Web 多 root：与工作区策略同源显式开启，普通远端保持单 root。
     allowStandaloneMultiRoot: options?.allowStandaloneMultiRoot,
+    // 独立云端 Web 项目数据估算与清理：仅 standalone-server 且显式开启独立云端工作区时开放，
+    // 并按每个目录独立解析 canonical workspaceIdentity。
+    ...(options?.serviceAuthorityMode === "standalone-server" &&
+    options?.allowStandaloneCloudWorkspaces
+      ? {
+          allowStandaloneProjectData: true,
+          ...(options?.sourceServerWorkspaceService
+            ? {
+                resolveDirectoryWorkspaceIdentity: async (workspacePath: string) =>
+                  (
+                    await options.sourceServerWorkspaceService!.resolveWorkspace({
+                      workspacePath,
+                    })
+                  ).canonicalWorkspaceKey,
+              }
+            : {}),
+        }
+      : {}),
     // zcodeAgentService 在下方创建；端口只在命令执行时取用它。
     data: {
       repository: () => taskIndexRepo.getProjectDataRepository(),
@@ -2548,7 +2611,25 @@ export function createLocalServices(options: {
       serviceAuthorityMode: options?.serviceAuthorityMode,
       desktopContextPromptEnabled,
     }),
-    onAutomationManualRunRequested: options?.onAutomationManualRunRequested,
+    onAutomationManualRunRequested:
+      options?.automationExecutionEnabled === true
+        ? (params) => {
+            if (!automationRuntimeRef.current) {
+              return Promise.reject(new Error("Automation runtime is not initialized."));
+            }
+            return automationRuntimeRef.current.dispatchManualRun(params);
+          }
+        : options?.onAutomationManualRunRequested,
+    canDispatchAutomationManualRun:
+      options?.automationExecutionEnabled === true
+        ? () => Boolean(automationRuntimeRef.current?.canAcceptManualRun())
+        : undefined,
+    onAutomationChanged:
+      options?.automationExecutionEnabled === true
+        ? () => automationRuntimeRef.current?.wake()
+        : options?.onAutomationChanged,
+    resolveAutomationExecutionContext,
+    defaultAutomationHostId: options?.projectStorageHostId ?? "local",
     // createLocalServices 虽然暴露了 reporter 注入点，旧装配却没有继续传给
     // ZCodeAgentProcessManager，导致 host 永远不向 main 上报 Agent spawn/exit，进程监控器
     // 因而看不到实际运行的 Agent，也无法验证只读到可写升级是否复用同一进程。
@@ -3458,6 +3539,57 @@ export function createLocalServices(options: {
     },
   );
 
+  if (options?.automationExecutionEnabled === true) {
+    const automationRuntimeLogger = createServiceLogger("automation-runtime");
+    const automationRuntimeRepo = new AutomationRepo();
+    sqliteReposToClose.push(automationRuntimeRepo);
+    const runtime = createAutomationRuntime({
+      repo: automationRuntimeRepo,
+      cron: {
+        computeNextRunAt: computeAutomationNextRunAt,
+        isOneShotAutomation,
+      },
+      resolveTargetServices: () => ({
+        taskService: zcodeTaskService,
+        modelSelectionService: providerRuntime.modelSelection,
+        botsService: services.getOptional(IBotsService),
+      }),
+      logger: {
+        info: (message, details) => automationRuntimeLogger.info(undefined, message, details),
+        warn: (message, error) => automationRuntimeLogger.warn(undefined, message, { error }),
+        error: (message, error) => automationRuntimeLogger.error(undefined, message, { error }),
+      },
+      ...(options.serviceAuthorityMode === "standalone-server" &&
+      options.projectStorageHostId &&
+      options.projectStorageHostId !== "local"
+        ? {
+            standaloneAuthority: {
+              projectStorageHostId: options.projectStorageHostId,
+              // 使用无批量迁移副作用的只读 alias 查询 + 本服务器确定性 identity，
+              // 避免同目录并存本地历史定义与异域 SSH 定义时误触发全路径批量迁移。
+              resolveWorkspace: async (workspacePath) => {
+                const stableIdentity = buildRemoteHostWorkspaceIdentity(
+                  options.projectStorageHostId!,
+                  workspacePath,
+                );
+                const canonicalWorkspaceKey =
+                  (await automationRuntimeRepo.readWorkspaceAliasCanonicalKey(workspacePath)) ??
+                  stableIdentity;
+                options.onStandaloneWorkspaceIdentityResolved?.({
+                  stableIdentity,
+                  canonicalIdentity: canonicalWorkspaceKey,
+                });
+                return { canonicalWorkspaceKey };
+              },
+            },
+          }
+        : {}),
+    });
+    automationRuntimeRef.current = runtime;
+    automationRuntimes.set(services, runtime);
+    automationRuntimeDisposers.set(services, runtime);
+  }
+
   // 见 sharedSqliteRepos 声明处注释：登记全部 tasks-index sqlite 句柄，dispose 链统一关闭
   sqliteReposToClose.push(taskIndexRepo);
   sharedSqliteRepos.set(services, sqliteReposToClose);
@@ -3544,6 +3676,9 @@ function readTelemetryOAuthUserId(rawUserInfo: string | null): string {
 }
 
 export function disposeServiceResources(services: ServiceCollection): void {
+  automationRuntimeDisposers.get(services)?.disposeSync();
+  automationRuntimeDisposers.delete(services);
+  automationRuntimes.delete(services);
   const content = services.getOptional(ICloudContentService);
   if (content && hasDisposeAllAndWait(content)) void content.disposeAllAndWait().catch(() => {});
   (
@@ -3587,6 +3722,14 @@ export function disposeServiceResources(services: ServiceCollection): void {
 }
 
 export async function disposeServiceResourcesAndWait(services: ServiceCollection): Promise<void> {
+  // 先停止定时任务新调度/手动派发 admission 与轮询 timer 并等待在途 ACK 结算，
+  // 再关闭 Agent 进程树与共享 SQLite Repo，避免关库后异步写库报错。
+  const automationRuntime = automationRuntimeDisposers.get(services);
+  automationRuntimeDisposers.delete(services);
+  automationRuntimes.delete(services);
+  if (automationRuntime) {
+    await automationRuntime.dispose().catch(() => {});
+  }
   (
     services.getOptional(IGenUiService) as (IGenUiService & { dispose?(): void }) | undefined
   )?.dispose?.();
@@ -3676,6 +3819,8 @@ export async function createServerHostServices(options: {
   providerProvisioningTargetEnabled?: boolean;
   credentialCipherProvider?: CredentialCipher;
   browserControlExecutor?: BrowserControlExecutor;
+  /** 默认 false；仅独立 HTTP 入口开启，避免 Desktop-attached remote 误起第二调度器。 */
+  automationExecutionEnabled?: boolean;
 }) {
   // 无桌面环境不能等到首次登录或 Provisioning 才发现系统库缺失。
   const credentialCipherProvider =
@@ -3730,7 +3875,19 @@ export async function createServerHostServices(options: {
     // 同一个 standalone 兼容开关显式开启多 root；未开启的远端 owner 仍单 root、root 不可变。
     allowStandaloneMultiRoot: standaloneWebCompat,
     browserControlExecutor: options.browserControlExecutor,
+    automationExecutionEnabled: options.automationExecutionEnabled === true,
+    onStandaloneWorkspaceIdentityResolved: (mapping) => {
+      workspaceIdentityMapper.register(mapping);
+    },
   });
+  if (options.automationExecutionEnabled === true) {
+    try {
+      await automationRuntimes.get(services)?.start();
+    } catch (error) {
+      await disposeServiceResourcesAndWait(services).catch(() => {});
+      throw error;
+    }
+  }
   return { services, workspaceIdentityMapper, migrationFailedPathCount };
 }
 

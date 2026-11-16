@@ -63,6 +63,7 @@ async function main(): Promise<void> {
       zcodeBuiltinProviderConfigFilePath,
       providerProvisioningTargetEnabled: Boolean(authToken),
       browserControlExecutor: browserControl?.executor,
+      automationExecutionEnabled: true,
     });
     services = created.services;
     server = createHttpServer(services, port, {

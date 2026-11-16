@@ -68,13 +68,33 @@ export class InvalidAutomationRelativeDelayError extends Error {
  * 仓库只做存储；这里承载「create 时算 next_run_at」「改 cron_expr 重算」「改 recurring/max_runs 重算生命周期」
  * 「restart 重算」等 cron 相关业务，供 UI 管理面 / RPC 调用。
  */
+export interface AutomationServiceOptions {
+  /** 定义变更后通知进程内调度器补跑/收敛。 */
+  onWake?: (automationId?: string) => void;
+  /** standalone 下为无 projectId 定义与会话内 CronCreate 补齐可信 hostId 与 canonical workspaceIdentity。 */
+  resolveExecutionContext?: (target: {
+    workspacePath: string;
+    workspaceIdentity?: string;
+  }) => Promise<{ hostId: string; workspaceIdentity?: string }>;
+  defaultHostId?: string;
+}
+
 export class AutomationService {
   constructor(
     private readonly repo: AutomationRepo = new AutomationRepo(),
     private readonly prepareProjectExecution?: (
       projectId: string,
     ) => Promise<ProjectExecutionSnapshot>,
+    private readonly options?: AutomationServiceOptions,
   ) {}
+
+  private notifyWake(automationId?: string): void {
+    try {
+      this.options?.onWake?.(automationId);
+    } catch {
+      // wake 回调失败不得影响管理写操作本身的持久化结果。
+    }
+  }
 
   async create(params: ZCodeAutomationCreateParams): Promise<ZCodeAutomation> {
     const createdAt = Date.now();
@@ -164,14 +184,36 @@ export class AutomationService {
       if (createParams.targetTaskId) throw new Error("project.bound-task");
       if (!this.prepareProjectExecution) throw new Error("project.creation-unavailable");
       execution = await this.prepareProjectExecution(createParams.projectId);
+    } else if (this.options?.resolveExecutionContext) {
+      const resolved = await this.options.resolveExecutionContext({
+        workspacePath: createParams.workspacePath,
+        workspaceIdentity: createParams.workspaceIdentity,
+      });
+      execution = {
+        projectId: createParams.projectId ?? null,
+        hostId: resolved.hostId,
+        workspacePath: createParams.workspacePath,
+        workspaceIdentity: resolved.workspaceIdentity,
+        additionalDirectories: createParams.additionalDirectories ?? [],
+      };
+    } else if (!createParams.hostId && this.options?.defaultHostId) {
+      execution = {
+        projectId: createParams.projectId ?? null,
+        hostId: this.options.defaultHostId,
+        workspacePath: createParams.workspacePath,
+        workspaceIdentity: createParams.workspaceIdentity,
+        additionalDirectories: createParams.additionalDirectories ?? [],
+      };
     }
-    return this.repo.create(
+    const created = await this.repo.create(
       { ...createParams, ...execution },
       {
         nextRunAt: endedBeforeFirstRun ? null : nextRunAt,
         ...(endedBeforeFirstRun ? { lifecycleStatus: "completed" as const } : {}),
       },
     );
+    this.notifyWake(created.automationId);
+    return created;
   }
 
   async list(scope?: {
@@ -343,7 +385,7 @@ export class AutomationService {
       // 用户只要手动执行过就可能在编辑 maxRuns 时把任务提前改成 completed。
       const scheduledRunCount = await this.repo.getScheduledRunCount(automationId, workspaceKey);
       if (scheduledRunCount === null) return null;
-      // 与 markDispatched 口径一致：有限次任务未显式设 max_runs 时按一次性任务(上限 1)处理。
+      // 与 markScheduleRunDispatched 口径一致：有限次任务未显式设 max_runs 时按一次性任务(上限 1)处理。
       const reachedMax = !nextRecurring && scheduledRunCount >= (nextMaxRuns ?? 1);
       if (reachedMax) {
         options.lifecycleStatus = "completed";
@@ -365,11 +407,15 @@ export class AutomationService {
       }
     }
 
-    return this.repo.update(automationId, updateParams, options, workspaceKey);
+    const updated = await this.repo.update(automationId, updateParams, options, workspaceKey);
+    if (updated) this.notifyWake(updated.automationId);
+    return updated;
   }
 
   async delete(automationId: string, scope?: AutomationWorkspaceScope): Promise<boolean> {
-    return this.repo.delete(automationId, resolveScopeKey(scope));
+    const deleted = await this.repo.delete(automationId, resolveScopeKey(scope));
+    if (deleted) this.notifyWake(automationId);
+    return deleted;
   }
 
   /** 暂停 / 恢复。 */
@@ -378,12 +424,15 @@ export class AutomationService {
     enabled: boolean,
     scope?: AutomationWorkspaceScope,
   ): Promise<void> {
-    return this.repo.setEnabled(automationId, enabled, resolveScopeKey(scope));
+    await this.repo.setEnabled(automationId, enabled, resolveScopeKey(scope));
+    this.notifyWake(automationId);
   }
 
   /** 执行轮自暂停（CronPauseSelf）：只暂停当前 workspace 内 active 的任务，返回是否生效。 */
   async pause(automationId: string, scope?: AutomationWorkspaceScope): Promise<boolean> {
-    return this.repo.pause(automationId, resolveScopeKey(scope));
+    const paused = await this.repo.pause(automationId, resolveScopeKey(scope));
+    if (paused) this.notifyWake(automationId);
+    return paused;
   }
 
   /** 失败任务手动重跑：回 active、清计数，按 cron 重算下次时间。 */
@@ -395,7 +444,8 @@ export class AutomationService {
     // 只有 failed 代表可恢复异常，允许用户手动重排下一次运行。
     if (existing.lifecycleStatus !== "failed") return;
     const nextRunAt = computeAutomationNextRunAt(existing);
-    return this.repo.restart(automationId, { nextRunAt }, workspaceKey);
+    await this.repo.restart(automationId, { nextRunAt }, workspaceKey);
+    this.notifyWake(automationId);
   }
 
   /** 立即运行：创建供当前 host 直接派发的 manual run，不修改原 cron 计划。 */

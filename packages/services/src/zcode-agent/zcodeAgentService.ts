@@ -1184,6 +1184,16 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
     automation: ZCodeAutomation;
     run: ZCodeAutomationRun;
   }) => Promise<void>;
+  /** 校验当前 manual dispatcher 是否仍可接纳新请求（未关闭）。 */
+  canDispatchAutomationManualRun?: () => boolean;
+  /** 定时任务定义变更后唤醒进程内调度器。 */
+  onAutomationChanged?: (automationId?: string) => void;
+  /** standalone 下为无 projectId 创建及会话内 CronCreate 补齐可信 hostId 与 canonical workspaceIdentity。 */
+  resolveAutomationExecutionContext?: (target: {
+    workspacePath: string;
+    workspaceIdentity?: string;
+  }) => Promise<{ hostId: string; workspaceIdentity?: string }>;
+  defaultAutomationHostId?: string;
   /**
    * Off-Peak 会话内创建。config 同时承担曝光门（enabled && Selection View 非空 →
    * session create/resume 下发 offPeakToolEnabled）与缺省解析（model=白名单末位 /
@@ -1428,7 +1438,15 @@ export function createZCodeAgentService(
       : undefined;
   // AutomationRepo 也持有 tasks-index.sqlite 连接，disposeAll 需一并收口（见下方 disposeAll 注释）
   const automationRepo = new AutomationRepo();
-  const automationService = new AutomationService(automationRepo, options?.prepareProjectExecution);
+  const automationService = new AutomationService(
+    automationRepo,
+    options?.prepareProjectExecution,
+    {
+      onWake: options?.onAutomationChanged,
+      resolveExecutionContext: options?.resolveAutomationExecutionContext,
+      defaultHostId: options?.defaultAutomationHostId,
+    },
+  );
   const automationTaskIndexRepo = new TaskIndexRepo();
   const pluginProcessManager = new ZCodeAgentProcessManager({
     commandResolver: options?.commandResolver,
@@ -6052,9 +6070,9 @@ export function createZCodeAgentService(
 
     async runAutomationNow(params: ZCodeAgentAutomationIdParams) {
       const dispatch = options?.onAutomationManualRunRequested;
-      if (!dispatch) {
+      if (!dispatch || options?.canDispatchAutomationManualRun?.() === false) {
         // runNow 会先写 manual run 并占用 single-flight claim；dispatcher
-        // 缺失是同步可判定的配置错误，必须在认领前失败，不能依赖 stale 崩溃回收。
+        // 缺失或已关闭是同步可判定的错误，必须在认领前失败，不能写库或依赖 stale 回收。
         throw new Error("Automation immediate dispatcher is unavailable.");
       }
       const claimed = await automationService.runNow(params.automationId, {
