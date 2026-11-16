@@ -1128,6 +1128,7 @@ describe("话题历史文本附件", () => {
       expect.objectContaining({
         content: Buffer.from(text),
         extension: "txt",
+        fileName: "topic-history.txt",
         retention: "session",
       }),
       expect.anything(),
@@ -1190,16 +1191,28 @@ describe("话题历史文本附件", () => {
   });
 });
 
-describe("普通上传文件 artifact 分流解析", () => {
-  it("安全小 UTF-8 文本（.vue / .json / 0 字节 .txt）内联并保留原 artifactUri", async () => {
+describe("普通上传文件具名落盘与桌面 readTextFileForModel 统一链路", () => {
+  it("安全 UTF-8 文本（.vue / .json / 0 字节 .txt / 100KiB .log / 无扩展名 README）具名落盘并走统一预读，保留双 URI", async () => {
     const vueText = "<template><div>Hello</div></template>\n";
     const jsonText = '{"ok":true,"count":2}';
+    const logText = `${"2026-11-16T00:00:00Z INFO unified read line\n".repeat(1550)}`; // ~66.6 KiB (>64 KiB, <=25k tokens)
+    const readmeText = "README without extension";
     const artifacts: Record<string, string> = {
       "zcode-artifact://vue": `data:application/octet-stream;base64,${Buffer.from(vueText).toString("base64")}`,
       "zcode-artifact://json": `data:application/json;base64,${Buffer.from(jsonText).toString("base64")}`,
       "zcode-artifact://empty": "data:text/plain;base64,",
+      "zcode-artifact://log": `data:text/plain;base64,${Buffer.from(logText).toString("base64")}`,
+      "zcode-artifact://readme": `data:text/plain;base64,${Buffer.from(readmeText).toString("base64")}`,
     };
-    const writeToolResultBinaryArtifact = vi.fn();
+    const writeToolResultBinaryArtifact = vi.fn(async (req) => ({
+      id: `raw-${req.toolCallId}`,
+      uri: `zcode-artifact://s1/raw-${req.toolCallId}`,
+      path: `/tmp/artifacts/s1/raw-${req.toolCallId}/${req.fileName || "attachment.txt"}`,
+      bytes: req.content.byteLength,
+      contentType: req.contentType,
+      createdAt: new Date(),
+    }));
+
     const resolved = await resolveTurnAttachments(
       [
         {
@@ -1207,7 +1220,7 @@ describe("普通上传文件 artifact 分流解析", () => {
           content: "zcode-artifact://vue",
           filename: "App.vue",
           mimeType: "application/octet-stream",
-          sizeBytes: 999_999, // 故意伪造超大 sizeBytes，验证不轻信展示字段
+          sizeBytes: 999_999,
         },
         {
           type: "file",
@@ -1221,10 +1234,22 @@ describe("普通上传文件 artifact 分流解析", () => {
           filename: "empty.txt",
           mimeType: "text/plain",
         },
+        {
+          type: "file",
+          content: "zcode-artifact://log",
+          filename: "runtime.log",
+          mimeType: "text/plain",
+        },
+        {
+          type: "file",
+          content: "zcode-artifact://readme",
+          filename: "README",
+          mimeType: "text/plain",
+        },
       ],
       {
         workingDirectory: "/tmp/project",
-        sessionId: createSessionId("uploaded-small-text"),
+        sessionId: createSessionId("s1"),
         traceContext: { traceId: "trace_uploaded_small_text" },
         artifactStore: {
           readToolResultArtifact: vi.fn(async ({ uri }) => ({ content: artifacts[uri]! })),
@@ -1233,12 +1258,13 @@ describe("普通上传文件 artifact 分流解析", () => {
       },
     );
 
-    expect(writeToolResultBinaryArtifact).not.toHaveBeenCalled();
+    expect(writeToolResultBinaryArtifact).toHaveBeenCalledTimes(5);
     expect(resolved[0]).toMatchObject({
       contentBlock: { type: "text", text: vueText },
       filename: "App.vue",
       mime: "text/plain",
-      url: "zcode-artifact://vue",
+      url: "zcode-artifact://s1/raw-file-attachment-0",
+      source: { type: "file", path: "/tmp/artifacts/s1/raw-file-attachment-0/App.vue" },
       metadata: {
         artifactUri: "zcode-artifact://vue",
         originalUrl: "zcode-artifact://vue",
@@ -1251,8 +1277,9 @@ describe("普通上传文件 artifact 分流解析", () => {
     expect(resolved[1]).toMatchObject({
       contentBlock: { type: "text", text: jsonText },
       filename: "config.json",
-      mime: "application/json",
-      url: "zcode-artifact://json",
+      mime: "text/plain",
+      url: "zcode-artifact://s1/raw-file-attachment-1",
+      source: { type: "file", path: "/tmp/artifacts/s1/raw-file-attachment-1/config.json" },
       metadata: {
         artifactUri: "zcode-artifact://json",
         originalUrl: "zcode-artifact://json",
@@ -1261,11 +1288,20 @@ describe("普通上传文件 artifact 分流解析", () => {
         storageKind: "inline",
       },
     });
+    // .json 走桌面统一链路后，与 Read 本地文件一致生成 prompt_attachment 系统提醒
+    const jsonEntries = buildRuntimeUserEntriesFromTurn("Check config.", [resolved[1]!]);
+    expect(jsonEntries).toHaveLength(2);
+    expect(jsonEntries[1]).toMatchObject({
+      kind: "attachment",
+      metadata: { source: "prompt_attachment" },
+      content: expect.stringContaining("Called the Read tool"),
+    });
+
     expect(resolved[2]).toMatchObject({
       contentBlock: { type: "text", text: "" },
       filename: "empty.txt",
       mime: "text/plain",
-      url: "zcode-artifact://empty",
+      url: "zcode-artifact://s1/raw-file-attachment-2",
       metadata: {
         artifactUri: "zcode-artifact://empty",
         originalUrl: "zcode-artifact://empty",
@@ -1275,21 +1311,104 @@ describe("普通上传文件 artifact 分流解析", () => {
         storageKind: "inline",
       },
     });
+    expect(resolved[3]).toMatchObject({
+      contentBlock: { type: "text", text: logText },
+      filename: "runtime.log",
+      mime: "text/plain",
+      url: "zcode-artifact://s1/raw-file-attachment-3",
+      source: { type: "file", path: "/tmp/artifacts/s1/raw-file-attachment-3/runtime.log" },
+      metadata: {
+        artifactUri: "zcode-artifact://log",
+        originalUrl: "zcode-artifact://log",
+        recoverability: "provider_ready",
+        sizeBytes: Buffer.byteLength(logText),
+        storageKind: "inline",
+      },
+    });
+    expect(resolved[4]).toMatchObject({
+      contentBlock: { type: "text", text: readmeText },
+      filename: "README",
+      mime: "text/plain",
+      url: "zcode-artifact://s1/raw-file-attachment-4",
+      source: { type: "file", path: "/tmp/artifacts/s1/raw-file-attachment-4/README" },
+      metadata: {
+        artifactUri: "zcode-artifact://readme",
+        originalUrl: "zcode-artifact://readme",
+        storageKind: "inline",
+      },
+    });
   });
 
-  it("二进制、>64KiB 大文本与含 NUL/非法 UTF-8 的伪文本落盘原始字节并保留双 URI", async () => {
+  it(">300KiB 超大文本通过 readTextFileForModel 生成部分视图 preview 并保留双 URI", async () => {
+    const hugeLines = Array.from(
+      { length: 2400 },
+      (_, idx) => `line-${idx + 1}: ${"x".repeat(130)}`,
+    ).join("\n"); // > 300 KiB & > 25,000 tokens
+    expect(Buffer.byteLength(hugeLines, "utf8")).toBeGreaterThan(300 * 1024);
+
+    const writeToolResultBinaryArtifact = vi.fn(async (req) => ({
+      id: "raw-huge",
+      uri: "zcode-artifact://s1/raw-huge",
+      path: `/tmp/artifacts/s1/raw-huge/${req.fileName}`,
+      bytes: req.content.byteLength,
+      contentType: req.contentType,
+      createdAt: new Date(),
+    }));
+    const [resolved] = await resolveTurnAttachments(
+      [
+        {
+          type: "file",
+          content: "zcode-artifact://huge",
+          filename: "huge.log",
+          mimeType: "text/plain",
+        },
+      ],
+      {
+        workingDirectory: "/tmp/project",
+        sessionId: createSessionId("s1"),
+        traceContext: { traceId: "trace_huge_text" },
+        artifactStore: {
+          readToolResultArtifact: vi.fn(async () => ({
+            content: `data:text/plain;base64,${Buffer.from(hugeLines, "utf8").toString("base64")}`,
+          })),
+          writeToolResultBinaryArtifact,
+        } as never,
+      },
+    );
+
+    expect(resolved).toMatchObject({
+      filename: "huge.log",
+      mime: "text/plain",
+      url: "zcode-artifact://s1/raw-huge",
+      source: { type: "file", path: "/tmp/artifacts/s1/raw-huge/huge.log" },
+      metadata: {
+        artifactUri: "zcode-artifact://huge",
+        originalUrl: "zcode-artifact://huge",
+        recoverability: "preview_only",
+        storageKind: "inline",
+        sizeBytes: Buffer.byteLength(hugeLines, "utf8"),
+        preview: {
+          truncated: true,
+          truncatedByTokenCap: true,
+          partialViewNotice: expect.stringContaining("Truncated: PARTIAL view"),
+        },
+      },
+    });
+  });
+
+  it("二进制、伪文本扩展名与含 NUL/非法 UTF-8 的伪文本具名落盘并生成 binary_file local_ref", async () => {
     const zipBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0x10]);
-    const largeLogBytes = Buffer.from("line\n".repeat(14_000)); // > 64 KiB
+    const docxBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]);
     const fakeTxtBytes = Buffer.from([0x48, 0x69, 0x00, 0xff, 0xfe]); // NUL + invalid UTF-8
     const artifacts: Record<string, string> = {
       "zcode-artifact://zip": `data:text/plain;base64,${zipBytes.toString("base64")}`,
-      "zcode-artifact://big": `data:text/plain;base64,${largeLogBytes.toString("base64")}`,
+      "zcode-artifact://docx": `data:text/plain;base64,${docxBytes.toString("base64")}`,
       "zcode-artifact://fake": `data:text/plain;base64,${fakeTxtBytes.toString("base64")}`,
     };
     const writeToolResultBinaryArtifact = vi.fn(async (req) => ({
       id: `bin-${req.toolCallId}`,
       uri: `zcode-artifact://s1/bin-${req.toolCallId}`,
-      path: `/tmp/artifacts/s1/${req.toolCallId}${req.extension}`,
+      path: `/tmp/artifacts/s1/bin-${req.toolCallId}/${req.fileName}`,
       bytes: req.content.byteLength,
       contentType: req.contentType,
       createdAt: new Date(),
@@ -1305,8 +1424,8 @@ describe("普通上传文件 artifact 分流解析", () => {
         },
         {
           type: "file",
-          content: "zcode-artifact://big",
-          filename: "server.log",
+          content: "zcode-artifact://docx",
+          filename: "日本文学史 复习资料 (期末).docx",
           mimeType: "text/plain",
         },
         {
@@ -1336,21 +1455,20 @@ describe("普通上传文件 artifact 分流解析", () => {
         originalUrl: "zcode-artifact://zip",
         storageKind: "local_ref",
         sizeBytes: zipBytes.byteLength,
-        pathReferenceText: expect.stringContaining("/tmp/artifacts/s1/file-attachment-0.zip"),
+        pathReferenceText: expect.stringContaining(
+          "/tmp/artifacts/s1/bin-file-attachment-0/archive.zip",
+        ),
       },
     });
     expect(resolved[1]).toMatchObject({
-      filename: "server.log",
-      mime: "text/plain",
+      filename: "日本文学史 复习资料 (期末).docx",
       url: "zcode-artifact://s1/bin-file-attachment-1",
       metadata: {
-        artifactUri: "zcode-artifact://big",
-        originalUrl: "zcode-artifact://big",
+        artifactUri: "zcode-artifact://docx",
+        originalUrl: "zcode-artifact://docx",
         storageKind: "local_ref",
-        sizeBytes: largeLogBytes.byteLength,
-        pathReferenceText: expect.stringContaining(
-          "text file is larger than the inline text budget",
-        ),
+        sizeBytes: docxBytes.byteLength,
+        pathReferenceText: expect.stringContaining("日本文学史 复习资料 (期末).docx"),
       },
     });
     expect(resolved[2]).toMatchObject({

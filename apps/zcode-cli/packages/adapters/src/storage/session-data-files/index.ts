@@ -3,7 +3,28 @@ import { basename, dirname, join, relative, isAbsolute } from "node:path";
 
 import type { SessionDataDirectory, SessionDataFilesPort, SessionDataFile } from "./contract.js";
 
-export type { SessionDataDirectory, SessionDataFilesPort } from "./contract.js";
+export type { SessionDataDirectory, SessionDataFile, SessionDataFilesPort } from "./contract.js";
+
+/** 按 `<artifacts>/<sessionId>` 第一层顶层条目归属判定文件是否匹配目标 artifactId。 */
+export function matchesRetainedArtifactFile(
+  file: Pick<SessionDataFile, "name" | "relativePath" | "kind" | "artifactEntryName">,
+  artifactId: string,
+): boolean {
+  if (file.kind !== "artifact" || !artifactId) return false;
+  const entryName = file.artifactEntryName ?? file.name;
+  const segments = file.relativePath.replace(/\\/g, "/").split("/");
+  // 新子目录布局（artifacts/<sessionId>/<artifactId>/<leaf>）必须精确匹配顶层目录名，
+  // 绝不用叶子 fileName.includes(artifactId)，防止同名文件在不同 artifactId 间误留或误删。
+  if (segments[0] === "artifacts" && segments.length > 3) {
+    return entryName === artifactId;
+  }
+  return (
+    entryName === artifactId ||
+    entryName.startsWith(`${artifactId}.`) ||
+    entryName.includes(`-${artifactId}.`) ||
+    entryName.endsWith(`-${artifactId}`)
+  );
+}
 
 export interface NodeSessionDataFilesOptions {
   cliStorageRoot: string;
@@ -54,9 +75,11 @@ export function createNodeSessionDataFiles(
   };
   const listSessionFiles = async (sessionId: string): Promise<SessionDataFile[]> => {
     const result: SessionDataFile[] = [];
+    const artifactsSessionDir = join(root, "artifacts", sessionId);
     for (const path of sessionPaths(sessionId)) {
-      const kind = path === join(root, "artifacts", sessionId) ? "artifact" : "record";
-      const walk = async (current: string): Promise<void> => {
+      const isArtifactsDir = path === artifactsSessionDir;
+      const kind = isArtifactsDir ? "artifact" : "record";
+      const walk = async (current: string, artifactEntryName?: string): Promise<void> => {
         let stats;
         try {
           stats = await lstat(current);
@@ -70,11 +93,25 @@ export function createNodeSessionDataFiles(
             relativePath: relative(root, current),
             kind,
             bytes: 0,
+            ...(artifactEntryName !== undefined ? { artifactEntryName } : {}),
           });
           return;
         }
         if (stats.isDirectory()) {
-          for (const entry of await readdir(current)) await walk(join(current, entry));
+          for (const entry of await readdir(current)) {
+            // 忽略未发布的具名附件暂存目录（.zcode-staging-*），不计入正式会话产物清单。
+            if (
+              isArtifactsDir &&
+              current === artifactsSessionDir &&
+              entry.startsWith(".zcode-staging-")
+            ) {
+              continue;
+            }
+            // 仅记录 <artifacts>/<sessionId> 下的第一层顶层条目名供保留归属判定。
+            const nextEntryName =
+              isArtifactsDir && current === artifactsSessionDir ? entry : artifactEntryName;
+            await walk(join(current, entry), nextEntryName);
+          }
           return;
         }
         result.push({
@@ -82,6 +119,7 @@ export function createNodeSessionDataFiles(
           relativePath: relative(root, current),
           kind,
           bytes: stats.size,
+          ...(artifactEntryName !== undefined ? { artifactEntryName } : {}),
         });
       };
       // 存储类别目录若被换成链接，不能沿祖先链接清理用户文件。
@@ -104,14 +142,28 @@ export function createNodeSessionDataFiles(
       await removeAll(paths);
       return manifest.reduce((sum, file) => sum + file.bytes, 0);
     }
-    // 保留 URI 定位所需的附件文件，绝不因为引用而留下正文、执行日志或其他独占附件。
+    // 按第一层顶层 artifact 条目精确保留，未保留子目录连同同名叶子文件一并递归删除。
     const keep = (file: SessionDataFile) =>
-      file.kind === "artifact" && retained.some((id) => file.name.includes(id));
-    let bytes = 0;
-    for (const file of manifest) {
-      if (keep(file)) continue;
-      await rm(join(root, file.relativePath), { force: true });
-      bytes += file.bytes;
+      file.kind === "artifact" && retained.some((id) => matchesRetainedArtifactFile(file, id));
+    const bytes = manifest.filter((file) => !keep(file)).reduce((sum, file) => sum + file.bytes, 0);
+    const retainedEntries = new Set(
+      manifest.filter(keep).map((file) => file.artifactEntryName ?? file.name),
+    );
+    const artifactsDir = paths[0]!;
+    const artifactsStats = await lstat(artifactsDir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (artifactsStats?.isSymbolicLink()) {
+      await rm(artifactsDir, { recursive: true, force: true });
+    } else if (artifactsStats?.isDirectory()) {
+      for (const entry of await readdir(artifactsDir)) {
+        if (retainedEntries.has(entry)) continue;
+        const entryPath = join(artifactsDir, entry);
+        const entryStats = await lstat(entryPath).catch(() => null);
+        if (entryStats?.isDirectory() && retained.includes(entry)) continue;
+        await rm(entryPath, { recursive: true, force: true });
+      }
     }
     for (const path of paths.slice(1)) await rm(path, { recursive: true, force: true });
     return bytes;

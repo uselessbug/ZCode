@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { SessionId, SessionStorePort } from "@zcode/contracts";
-import type { SessionDataFilesPort } from "@zcode/adapters/storage";
+import { matchesRetainedArtifactFile, type SessionDataFilesPort } from "@zcode/adapters/storage";
 import {
   v4SessionDeletionParamsSchema,
   v4SessionDeletionExecuteParamsSchema,
@@ -43,13 +43,18 @@ async function inspect(host: SessionDeletionHost, params: V4SessionDeletionParam
   for (const sessionId of snapshot.sessionIds)
     for (const file of await host.files.listSessionFiles(sessionId))
       files.push({ ...file, sessionId });
+  // 按顶层 artifact 条目归属匹配保留文件，并用相对路径精确计算待删文件数，避免同名叶子文件误判。
+  const retainedRelativeKeys = new Set<string>();
   const retainedArtifacts = snapshot.references.flatMap((ref) => {
     const matched = files.filter(
       (file) =>
         file.sessionId === ref.sessionId &&
         file.kind === "artifact" &&
-        file.name.includes(ref.artifactId),
+        matchesRetainedArtifactFile(file, ref.artifactId),
     );
+    for (const file of matched) {
+      retainedRelativeKeys.add(`${file.sessionId}\0${file.relativePath}`);
+    }
     return matched.length
       ? matched.map((file) => ({ ...ref, fileName: file.name }))
       : [{ ...ref, fileName: ref.artifactId }];
@@ -77,13 +82,7 @@ async function inspect(host: SessionDeletionHost, params: V4SessionDeletionParam
     forks: snapshot.forks,
     retainedArtifacts,
     deletedFiles: files.filter(
-      (file) =>
-        !retainedArtifacts.some(
-          (ref) =>
-            ref.sessionId === file.sessionId &&
-            ref.fileName === file.name &&
-            file.kind === "artifact",
-        ),
+      (file) => !retainedRelativeKeys.has(`${file.sessionId}\0${file.relativePath}`),
     ).length,
     blockedReason,
     incomplete: snapshot.deleting,

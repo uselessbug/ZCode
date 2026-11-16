@@ -143,6 +143,8 @@ async function fixture() {
     async cold() {
       store.close();
       store = await createSqliteSessionStore({ dbPath });
+      // 修复原因：cold() 关库重开后同步刷新 runtime.sessionStore，避免后续用例继续访问已关闭连接。
+      runtime.sessionStore = store;
       const messages = await store.messages({ sessionID: sessionId });
       const cold = new MessageHistoryImpl();
       cold.init("system fixture");

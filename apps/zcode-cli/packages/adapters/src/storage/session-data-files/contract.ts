@@ -14,6 +14,8 @@ export interface SessionDataFile {
   relativePath: string;
   kind: "artifact" | "record";
   bytes: number;
+  /** `<artifacts>/<sessionId>` 下的第一层顶层条目名（子目录布局为 `<artifactId>`，平铺布局为顶层文件名）。 */
+  artifactEntryName?: string;
 }
 export interface SessionDataFilesPort {
   listSessionFiles?(sessionId: string): Promise<SessionDataFile[]>;

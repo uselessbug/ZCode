@@ -84,4 +84,30 @@ describe("node session data files", () => {
     ]);
     expect(await files.removeSession("sess_a", ["tool-result-shared"])).toBe(0);
   });
+
+  it("具名子目录布局下按顶层 artifactId 精确保留同名文件并递归清理未保留目录", async () => {
+    const { cli, files, write } = await setup();
+    await write(join(cli, "artifacts", "sess_named", "art-keep", "复习资料.docx"), 19);
+    await write(join(cli, "artifacts", "sess_named", "art-drop", "复习资料.docx"), 23);
+    await write(join(cli, "artifacts", "sess_named", "art-drop-2", "notes.txt"), 5);
+    await write(join(cli, "artifacts", "sess_named", ".zcode-staging-123", "tmp.txt"), 99);
+    await write(join(cli, "exec", "sess_named", "run.log"), 11);
+
+    const manifest = await files.listSessionFiles!("sess_named");
+    const artifactEntries = manifest
+      .filter((item) => item.kind === "artifact")
+      .map((item) => [item.artifactEntryName, item.name]);
+    expect(artifactEntries).toEqual([
+      ["art-drop-2", "notes.txt"],
+      ["art-drop", "复习资料.docx"],
+      ["art-keep", "复习资料.docx"],
+    ]);
+
+    expect(await files.removeSession("sess_named", ["art-keep"])).toBe(39);
+    expect(await readdir(join(cli, "artifacts", "sess_named"))).toEqual(["art-keep"]);
+    expect(await readdir(join(cli, "artifacts", "sess_named", "art-keep"))).toEqual([
+      "复习资料.docx",
+    ]);
+    expect(await files.removeSession("sess_named", ["art-keep"])).toBe(0);
+  });
 });
