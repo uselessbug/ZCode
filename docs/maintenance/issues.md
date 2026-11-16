@@ -10,9 +10,9 @@
 
 - **任务菜单「在文件管理器中打开／前往 Provider 配置」在独立 Web 下点击可能无反馈**：静态调用链确认 Web 平台返回不支持后仅记日志无提示，尚未经页面点击复现，本轮暂未处理。
 
-## 已实现，待 CI 构建与部署验收（4 项）
+## 已部署（`a18fe44a`），待实际页面交互验收（4 项）
 
-当前线上运行容器仍为 `b9f0e517`。以下 4 项已完成源码修改与本地隔离回归，待 GitHub Actions 全量构建发布镜像后更新部署并做实机验收：
+提交 `a18fe44a`（完整 SHA：`a18fe44a5d0f3eadd7af630c854350952340e90c`，包含 `f4e9adb9`、`2d420913`、`844e62d6`、`e552c565`、`da4511a5`）已通过 GitHub Actions [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success` 发布镜像 `sha-a18fe44a`（digest `sha256:b05def7328ed9ee88da4d21fd9fe60a55e1009298737fb433f5e9d8f44f98da9`），并于 `2026-11-16T11:59:45.181Z` 完成宿主自更新部署与容器运行探针校验（`ai-agent-zcode-1` 状态 `running` / `healthy` / `restarts: 0`，HTTP 首页 `200`、鉴权 `/api/server-info` `200`、未授权 `401`、WebSocket 握手 `pass`）。以下 4 项已部署上线，待浏览器刷新加载新前端静态资源后由用户日常使用做实际页面交互验收：
 
 1. **移除项目时无法估算与清理当前服务器项目数据**
    - **症状**：2026-11-16 用户在独立 Web 执行项目移除与恢复时，移除确认弹窗预估项目数据触发 `project.measureProjectData FAIL Error: project.data-local-only`。
@@ -45,7 +45,7 @@
 
 - **独立 Web 项目管理“撤销移除 / 恢复已移除项目”缺少 `restoreProject` Host 别名重写**
   - **症状**：在独立 Web「设置 -> 项目管理」移除项目后点击 Toast「撤销」，或在「已移除的项目」中点击恢复时，客户端以位置参数调用 `restoreProject(id, "local")`，服务端此前遗漏第 2 个位置参数 `hostId` 别名转换，会报 `project.host-offline`。
-  - **状态**：已修复（提交 `f643ee64` 部署后，2026-11-16 用户在独立 Web 先从「已移除的项目」恢复旧版本移除的项目，随后连续操作两次「移除 → 恢复 → 移除」；服务端容器运行日志确认 4 次 RPC 全部成功且无 `project.host-offline`：`2026-11-16 15:10:38 project.restoreProject OK (11.9ms)`、`15:10:42 project.deleteProject OK (6.9ms)`、`15:10:45 project.restoreProject OK (7.2ms)`、`15:10:48 project.deleteProject OK (6.5ms)`。同次操作日志暴露出移除弹窗预估数据时报 `project.measureProjectData FAIL Error: project.data-local-only`，已作为独立问题在本轮完成本地源码修复，见上方“本地已修改”第 1 项）。
+  - **状态**：已修复（提交 `f643ee64` 部署后，2026-11-16 用户在独立 Web 先从「已移除的项目」恢复旧版本移除的项目，随后连续操作两次「移除 → 恢复 → 移除」；服务端容器运行日志确认 4 次 RPC 全部成功且无 `project.host-offline`：`2026-11-16 15:10:38 project.restoreProject OK (11.9ms)`、`15:10:42 project.deleteProject OK (6.9ms)`、`15:10:45 project.restoreProject OK (7.2ms)`、`15:10:48 project.deleteProject OK (6.5ms)`。同次操作日志暴露出移除弹窗预估数据时报 `project.measureProjectData FAIL Error: project.data-local-only`，已作为独立问题在 `a18fe44a` 完成源码修复并部署上线，见上方“已部署（`a18fe44a`），待实际页面交互验收”第 1 项）。
 
 - **独立 Web / HTTP Server 下官方 `browser-use` 插件 `agent.browsers.list()` 返回 `[]`**
   - **症状**：官方 `browser-use` 插件已启用且运行模块可加载，但调用 `agent.browsers.list()` 返回 `[]`。

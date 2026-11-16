@@ -4,7 +4,7 @@
 
 ## 1. 上游 3.18.2 升级基线、部署要求与验证清单
 
-- **固定基线与当前状态**：线上当前实际运行版本仍为 `b9f0e517`，主题兼容修复已部署、运行探针通过且用户确认自动跟随恢复（切换时页面重载与重连横幅另行追踪）；`f643ee64` 部署的 `restoreProject` 项目恢复已于 2026-11-16 经用户页面实操与容器运行日志验证通过。本轮已完成 4 项源码修改与本地隔离回归（移除项目数据估算与清理、普通二进制上传与 >64K 文本落盘、独立 HTTP 服务端定时任务执行链、非桌面 Web 停用营销轮询），待 GitHub Actions 构建发布及线上部署验收。具体证据见下方及 [standalone-web-baseline.md](./standalone-web-baseline.md)。
+- **固定基线与当前状态**：线上当前实际运行版本为 `a18fe44a`（`sha-a18fe44a`），本轮 4 项修改（移除项目数据估算与清理、普通二进制上传与 >64K 文本落盘、独立 HTTP 服务端定时任务执行链、非桌面 Web 停用营销轮询）已通过 GitHub Actions [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success` 发布并于 `2026-11-16T11:59:45.181Z` 完成容器自更新与运行探针校验，待浏览器刷新加载新前端静态资源后由用户做实际页面交互验收；同日早前 `b9f0e517` 主题兼容修复已由用户确认自动跟随恢复（切换时页面重载与重连横幅另行追踪），`f643ee64` 部署的 `restoreProject` 项目恢复已于 2026-11-16 经用户页面实操与容器运行日志验证通过。具体证据见下方及 [standalone-web-baseline.md](./standalone-web-baseline.md)。
 - **3.18.2 凭据密钥部署要求与步骤说明（保持上游强校验，参见 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)）**：
   - **启动约束与默认路径自动发现（`:99-104`）**：独立 Web HTTP 服务在开放前会初始化凭据后端。无系统 keyring 的部署环境支持：
     - **默认路径自动发现**：当未设置 `ZCODE_CREDENTIAL_SECRET` 与 `ZCODE_CREDENTIAL_SECRET_FILE` 时，服务端按 UTF-8 自动读取 `<zcodeHomeDir>/v2/credential-secret`（容器默认 `/home/agent/.zcode/v2/credential-secret`，32–4096 字节随机文本密钥，权限 `0600`，属主为容器运行 UID `1001`）。若持久化目录中已存在合规的默认密钥文件，直接沿用上游自动发现即可，无须补设 `ZCODE_CREDENTIAL_SECRET_FILE`。
@@ -37,12 +37,16 @@
   - [x] **容器更新与持久化探针（`2026-11-16T02:10:54Z`）**：本地源码与运行容器已更新至 `f643ee6465143c583bd741047c08634231c4ba89`，`docker inspect` 状态 `healthy`（`restarts: 0`），独立部署 helper 容器 `exited 0`；探针确认 HTTP 首页 `200`、鉴权 `serverinfo` `200`、未授权请求 `401`、WebSocket 握手 `pass`，`credential-secret` 与 provider 配置指纹保持不变。
   - [x] **独立 Browser MCP 完整移除与新镜像线上 Browser Use 实测通过**：线上容器探针确认 `/opt/browser-mcp` 不存在、配置中 `browser` MCP 不存在、官方 `browser-use` 插件保持开启、发行包 `playwright-core` 可用；`Dockerfile` `/opt/browser-mcp` 安装步骤、专属 CI 探针与设置页中英文旧文案已随 `f643ee64` 发布与镜像部署清理生效（验收脚本已独立更新为复用发行包 `playwright-core`）。在新运行 `f643ee64` 容器中经 `browser-use` 技能 -> `agent.browsers` 列到新受管 CDP，实际打开 `https://example.com/` 并等待 `domcontentloaded` 后成功读取标题 `Example Domain`、多语正文与 `Learn more` IANA 链接。
   - [x] **记忆冲突重载专用标识（`settings-memory-reload`）部署与组件 fixture**：冲突重载改用 `TID_SETTINGS_MEMORY_RELOAD`（`settings-memory-reload`），列表刷新保留 `settings-memory-refresh`，已随 `f643ee64` 部署；真实前端组件 fixture（`MemorySettingsViewer` + `ConfirmDialogHost`）通过冲突流程、标识唯一、取消保留草稿与确认加载外部最新文件（旧标识变异如期检出）；整条 Electron WDIO 套件未运行。
-  - [x] **`restoreProject` 项目恢复（2026-11-16 实机交互与日志验收通过）**：`packages/server/src/http.ts` 补齐 `restoreProject` 位置参数转换并随 `f643ee64` 部署上线。2026-11-16 用户在独立 Web 先从「已移除的项目」恢复旧版本移除的项目，随后连续操作两次「移除 → 恢复 → 移除」；服务端容器运行日志确认 4 次 RPC 全部成功且无 `project.host-offline`：`2026-11-16 15:10:38 project.restoreProject OK (11.9ms)`、`15:10:42 project.deleteProject OK (6.9ms)`、`15:10:45 project.restoreProject OK (7.2ms)`、`15:10:48 project.deleteProject OK (6.5ms)`。同次操作日志暴露移除弹窗预估数据报 `project.measureProjectData FAIL Error: project.data-local-only`，已作为独立问题在本轮完成本地源码修改（见第 4 节）。
+  - [x] **`restoreProject` 项目恢复（2026-11-16 实机交互与日志验收通过）**：`packages/server/src/http.ts` 补齐 `restoreProject` 位置参数转换并随 `f643ee64` 部署上线。2026-11-16 用户在独立 Web 先从「已移除的项目」恢复旧版本移除的项目，随后连续操作两次「移除 → 恢复 → 移除」；服务端容器运行日志确认 4 次 RPC 全部成功且无 `project.host-offline`：`2026-11-16 15:10:38 project.restoreProject OK (11.9ms)`、`15:10:42 project.deleteProject OK (6.9ms)`、`15:10:45 project.restoreProject OK (7.2ms)`、`15:10:48 project.deleteProject OK (6.5ms)`。同次操作日志暴露移除弹窗预估数据报 `project.measureProjectData FAIL Error: project.data-local-only`，已作为独立问题在 `a18fe44a` 完成源码修改并部署上线（见第 4 节）。
 
 - **系统主题兼容修复 `b9f0e517`（2026-11-16）**：
   - GitHub Actions [`43795610757`](https://github.com/uselessbug/ZCode/actions/runs/43795610757) 全部成功并发布 `sha-b9f0e517`；完整类型、lint、架构、主题与 Browser Use 浏览器回归、发行包和服务启动检查通过。
   - 主题回归覆盖普通规则 10 组、Nightly 单值 meta 覆写模拟 9 组，共 19 组通过；修复前代码在模拟下复现暗→浅不变及刷新仍暗，修复后正常。2026-11-16 用户确认 Android Firefox Nightly 自动跟随已恢复；另补充确认切换时伴随页面重载、加载条与重连横幅，单独在 [issues.md](./issues.md) 追踪。
   - 已部署源码 `b9f0e517457179eef35cd8112923fbeda7659b5f`，容器 `healthy`、`restarts: 0`。`2026-11-16T03:17:57Z` 探针确认 HTTP `200`、鉴权 `200` / 未授权 `401`、WebSocket 通过，凭据和 Provider 配置指纹不变，页面 `color-scheme` meta 为 `light dark`；启动日志 300 行未匹配关键错误。
+
+- **已完成 `a18fe44a` CI 发布、容器部署与运行探针（2026-11-16）**：
+  - **CI 与镜像发布证据**：提交 `a18fe44a`（完整 SHA：`a18fe44a5d0f3eadd7af630c854350952340e90c`，包含 `f4e9adb9` 停用非桌面营销轮询、`2d420913` 普通二进制与大文本附件修复、`844e62d6` 独立 Web 项目数据估算与清理、`e552c565` + `a18fe44a` 独立 HTTP 定时任务 `automation-runtime` 执行链及 `da4511a5` 项目恢复验收记录），GitHub Actions 运行 [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success`，发布镜像 `latest` 与 `sha-a18fe44a`（digest `sha256:b05def7328ed9ee88da4d21fd9fe60a55e1009298737fb433f5e9d8f44f98da9`）。
+  - [x] **容器自更新与运行探针（`2026-11-16T11:59:45.181Z`）**：独立后台 `docker:cli` helper 容器（`--rm`）于 `2026-11-16T11:59:46Z` 完成并退出码 `0`；`ai-agent-zcode-1` 状态 `running`、`healthy`、`restarts: 0`，运行镜像 `org.opencontainers.image.revision` 核实为 `a18fe44a5d0f3eadd7af630c854350952340e90c`；HTTP 首页 `200`、鉴权 `/api/server-info` `200`、未授权 `/api/server-info` `401`、WebSocket 握手 `pass`、`credential-secret` 与 `provider_config.json` SHA-256 指纹不变、首页双值 `color-scheme` meta 为 `true`、`/opt/browser-mcp` 目录不存在。
 
 ---
 
@@ -101,9 +105,9 @@
   - 在“当前服务器”与具体项目间切换，用户级 MCP（如 `rea`；历史验收时含已移除的 `browser`）与项目级 MCP 在“已安装”分组正常展示并刷新连接状态。
   - 新增、编辑、删除、启停 MCP 持久化到当前服务器，刷新页面或重连后保持；首次加载不闪现假空列表；Desktop 本机、手机 `/remote` 与跨 Host 远端行为不退化。
 
-## 4. 待 CI 构建与部署验收改动、暂缓项与内部小项
+## 4. 已部署待实际页面交互验收改动、暂缓项与内部小项
 
-- **已实现，待 CI 构建与部署验收（4 项；线上当前运行版本仍为 `b9f0e517`）**：
+- **已部署（`a18fe44a`），待实际页面交互验收（4 项；GitHub Actions [`43860163049`](https://github.com/uselessbug/ZCode/actions/runs/43860163049) `success`，镜像 `sha-a18fe44a`，`2026-11-16T11:59:45.181Z` 容器与接口探针通过，待浏览器刷新加载新前端静态资源后由用户日常使用确认）**：
   - [ ] **移除项目时无法估算与清理当前服务器项目数据**：补齐 `packages/server/src/http.ts` 对 `measureProjectData`、`deleteProjectData` 的位置参数 Host 别名转换；仅在 `standalone-server` 且开启独立 Web 兼容配置时放行当前服务器 `ownerHostId`（跨 Host 与普通远端仍报 `project.data-local-only`）；贯穿任务与 0 会话项目 root 的 canonical `workspaceIdentity` 以准确命中 `project-<16位哈希>` 记忆目录，并复用严格会话删除载体（优先命中热运行工作区 CLI 保护 `busy` 会话，仅在 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 且归属本服务器时回落管理面进程）。本地 `standalone-project-alias.mjs` 回归通过。
   - [ ] **普通二进制文件无法上传及 >64K 文本附件静默截断**：前端对无 `localPath` 的普通文件统一按真实字节走 V4 `begin/chunk/commit` 分块上传（上限 20 MiB，支持 0 字节文件，超限抛 `OversizedInlineFileAttachmentError` 提供 5 语言提示并补齐图片超限本地化，移除前端 64K 字符截断）；CLI 侧对 `<= 64 KiB` 且通过正面文本类型与严格 UTF-8 校验的小文本安全内联，对二进制文件与 `> 64 KiB` 大文本经 `writeToolResultBinaryArtifact` 落盘为会话级原始字节文件并生成 `local_ref` 真实路径引用，同时保留双 artifact URI 保障预览与 fork 引用保护（一并补齐 `clipboard-text` / `topic-history` 落盘双 URI fork 引用保护与 `create-app` 普通 MIME data URL 解码）。本地 `standalone-attachment-upload.mjs`（16 项）与 `standalone-cli-attachment-materialization.mjs`（7 组场景）回归通过。
   - [ ] **独立 HTTP 服务端定时任务缺少到期调度与立即运行执行链**：新增受管模块 `packages/services/src/automation-runtime`，提取并由 Desktop 与独立 HTTP 共享 20s 到期轮询、5min misfire 跳过、按 `runId` 幂等结算、单飞 manual claim 与 60s 心跳续租、统一变更 `wake` 及先排空在途派发再关库的优雅关闭；修复 `standalone-server` 下新建及会话内 `CronCreate` 的服务器 `hostId` 与 canonical `workspaceIdentity` 固化，启动对齐采用无批量迁移副作用的只读 canonical 查询（保护同路径异域定义不被改写）；仅在 `entry-http.ts` 显式启用执行链。本地 `standalone-automation-runtime.mjs`（7 组场景）回归通过。
