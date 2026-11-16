@@ -4,7 +4,7 @@
 
 ## 1. 上游 3.18.2 升级基线、部署要求与验证清单
 
-- **固定基线与当前状态**：3.18.2 合并与提交链详见 [standalone-web-baseline.md](./standalone-web-baseline.md)。当前服务已更新为 `f643ee64`（完整 SHA：`f643ee6465143c583bd741047c08634231c4ba89`，GitHub Actions [`43789255724`](https://github.com/uselessbug/ZCode/actions/runs/43789255724) `success`，镜像 `latest` / `sha-f643ee64`），容器 `healthy`（`restarts: 0`），持久化与运行时探针通过；独立 Browser MCP 已从镜像与配置完整移除且移除后线上 Browser Use 网页访问读取复测通过，记忆冲突重载专用标识已部署且组件 fixture 通过，`restoreProject` 已部署待实际页面交互验收。细目见下方。
+- **固定基线与当前状态**：当前运行 `b9f0e517`，主题兼容修复已部署且运行探针通过，手机实机主题反馈待验收；前一阶段 `f643ee64` 的修复与验收范围保留。源码、CI 与具体证据见下方及 [standalone-web-baseline.md](./standalone-web-baseline.md)。
 - **3.18.2 凭据密钥部署要求与步骤说明（保持上游强校验，参见 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)）**：
   - **启动约束与默认路径自动发现（`:99-104`）**：独立 Web HTTP 服务在开放前会初始化凭据后端。无系统 keyring 的部署环境支持：
     - **默认路径自动发现**：当未设置 `ZCODE_CREDENTIAL_SECRET` 与 `ZCODE_CREDENTIAL_SECRET_FILE` 时，服务端按 UTF-8 自动读取 `<zcodeHomeDir>/v2/credential-secret`（容器默认 `/home/agent/.zcode/v2/credential-secret`，32–4096 字节随机文本密钥，权限 `0600`，属主为容器运行 UID `1001`）。若持久化目录中已存在合规的默认密钥文件，直接沿用上游自动发现即可，无须补设 `ZCODE_CREDENTIAL_SECRET_FILE`。
@@ -38,6 +38,11 @@
   - [x] **独立 Browser MCP 完整移除与新镜像线上 Browser Use 实测通过**：线上容器探针确认 `/opt/browser-mcp` 不存在、配置中 `browser` MCP 不存在、官方 `browser-use` 插件保持开启、发行包 `playwright-core` 可用；`Dockerfile` `/opt/browser-mcp` 安装步骤、专属 CI 探针与设置页中英文旧文案已随 `f643ee64` 发布与镜像部署清理生效（验收脚本已独立更新为复用发行包 `playwright-core`）。在新运行 `f643ee64` 容器中经 `browser-use` 技能 -> `agent.browsers` 列到新受管 CDP，实际打开 `https://example.com/` 并等待 `domcontentloaded` 后成功读取标题 `Example Domain`、多语正文与 `Learn more` IANA 链接。
   - [x] **记忆冲突重载专用标识（`settings-memory-reload`）部署与组件 fixture**：冲突重载改用 `TID_SETTINGS_MEMORY_RELOAD`（`settings-memory-reload`），列表刷新保留 `settings-memory-refresh`，已随 `f643ee64` 部署；真实前端组件 fixture（`MemorySettingsViewer` + `ConfirmDialogHost`）通过冲突流程、标识唯一、取消保留草稿与确认加载外部最新文件（旧标识变异如期检出）；整条 Electron WDIO 套件未运行。
   - [ ] **`restoreProject` 项目恢复（已部署，待实际页面交互验收）**：`packages/server/src/http.ts` 已补齐 `restoreProject` 位置参数转换（未扩大数据清理权限）并随 `f643ee64` 部署上线。后端源码包装 + 真实 SQLite 回归（`standalone-project-alias.mjs`）通过，覆盖恢复、幂等、任务与 roots 保留、重开数据库、foreign Host、`data-local-only` 及负向变异对照；整条 Electron WDIO 未运行，尚未经实际页面交互验收，不计为用户已验收。
+
+- **系统主题兼容修复 `b9f0e517`（2026-11-16）**：
+  - GitHub Actions [`43795610757`](https://github.com/uselessbug/ZCode/actions/runs/43795610757) 全部成功并发布 `sha-b9f0e517`；完整类型、lint、架构、主题与 Browser Use 浏览器回归、发行包和服务启动检查通过。
+  - 主题回归覆盖普通规则 10 组、Nightly 单值 meta 覆写模拟 9 组，共 19 组通过；修复前代码在模拟下复现暗→浅不变及刷新仍暗，修复后正常。实际 Android Firefox Nightly 手机验收尚未完成。
+  - 已部署源码 `b9f0e517457179eef35cd8112923fbeda7659b5f`，容器 `healthy`、`restarts: 0`。`2026-11-16T03:17:57Z` 探针确认 HTTP `200`、鉴权 `200` / 未授权 `401`、WebSocket 通过，凭据和 Provider 配置指纹不变，页面 `color-scheme` meta 为 `light dark`；启动日志 300 行未匹配关键错误。
 
 ---
 

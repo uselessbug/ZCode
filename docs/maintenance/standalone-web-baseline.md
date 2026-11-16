@@ -12,7 +12,7 @@
   - 3 项冗余参数/字段清理与独立 HTTP Web 官方 `browser-use` 受管 CDP 适配：`ce24c4cf`、`ab4ab3ac`（阶段发布基线 `29c3c4dc`）
   - 项目恢复 `restoreProject` 位置参数转换、记忆冲突重载专用标识与独立 Browser MCP 镜像/文案清理：`f643ee64`
 - 升级前 `main` 基线：`f40a4597`（`docs(maintenance): record standalone MCP deployment acceptance`）
-- 当前状态（更新于 2026-11-16）：线上容器运行 `f643ee64`（完整 SHA：`f643ee6465143c583bd741047c08634231c4ba89`，GitHub Actions 运行 [`43789255724`](https://github.com/uselessbug/ZCode/actions/runs/43789255724) `success`，发布 `latest` 与 `sha-f643ee64`），容器 `healthy`、`restarts: 0`，2026-11-16T02:10:54Z 基础 HTTP/鉴权/WebSocket 与持久化探针通过；独立 Browser MCP 已从镜像与配置完整移除且移除后线上 Browser Use 访问读取复测通过，记忆冲突重载专用标识已部署且组件 fixture 通过，`restoreProject` 已部署待实际页面交互验收（证据集中见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）。
+- 当前状态（更新于 2026-11-16）：线上容器运行 `b9f0e517`（完整 SHA：`b9f0e517457179eef35cd8112923fbeda7659b5f`，GitHub Actions [`43795610757`](https://github.com/uselessbug/ZCode/actions/runs/43795610757) `success`，镜像 `sha-b9f0e517`），主题兼容修复已部署。容器 `healthy`、`restarts: 0`，HTTP / 鉴权 / WebSocket 与配置完整性探针通过；普通与 Nightly 模拟主题回归 19 组通过，实际手机主题反馈待验收。前一阶段 `f643ee64` 的项目恢复、记忆标识与 Browser MCP 清理均保留；详细证据见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)。
 - 历史部署验收基线：2026-11-15 `29c3c4dc`（GitHub Actions 运行 [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) `success`）完成 `ce24c4cf` 冗余清理生效及官方 `browser-use` 网页访问读取实测与用户确认；更早 `4e959bab` 部署完成运行日志 5446 行无关键错误核验及用户多端实机验收（模型保存/删除提示、归档任务永久删除、实体手机重连、手机工作区与 `compact-web` 设置页、任务分组、子代理设置与权限弹窗、新建技能/插件试用预填跳转、新建项目目录选择与任务工作区归属均确认正常；详见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）。
 
 ### 1.1 升级保护能力范围

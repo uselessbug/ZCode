@@ -2,9 +2,9 @@
 
 本文是独立 Web 与移动端适配问题的唯一维护入口，按用户可见症状记录当前状态。
 
-## 已修改，待 CI / 部署 / 手机验收（1 项）
+## 已部署，待手机验收（1 项）
 
-- **Firefox Nightly“系统”主题暗色切回浅色失效**：用户在 Android Firefox Nightly `162.0a1` 反馈暗→浅不跟随、刷新仍暗，Firefox 自身界面已浅；PC Firefox Beta `161.0b3` 正常。Nightly 新规则让单值 `color-scheme` meta 覆写系统媒体查询，旧首屏 `dark` 和运行时单值写入形成反馈。现已将两个网页入口固定为 `light dark` 并停止运行时改写 meta，CSS 原生控件配色照常同步。真实 Chromium 的普通 / Nightly 模拟规则 19 组通过，旧版变异检出；手机实机待验收。见[主题规格](../web-remote-control/mobile-theme-control.md)。
+- **Firefox Nightly“系统”主题暗色切回浅色失效**：用户在 Android Firefox Nightly `162.0a1` 反馈暗→浅不跟随、刷新仍暗，Firefox 自身界面已浅；PC Firefox Beta `161.0b3` 正常。Nightly 新规则让单值 `color-scheme` meta 覆写系统媒体查询，旧首屏 `dark` 和运行时单值写入形成反馈。提交 `b9f0e517` 已将两个网页入口固定为 `light dark` 并停止运行时改写 meta，CSS 原生控件配色照常同步；CI 与部署完成，普通 / Nightly 模拟规则 19 组通过，旧版变异检出。手机实机待验收，见[部署验证记录](./standalone-web-deployment-checklist.md)与[主题规格](../web-remote-control/mobile-theme-control.md)。
 
 ## 已部署，待实际页面交互验收（1 项）
 
