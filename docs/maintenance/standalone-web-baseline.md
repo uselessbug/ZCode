@@ -9,10 +9,11 @@
   - 模型删除/保存反馈竞态修复提交：`454b2832`
   - CI 依赖安装竞态修复提交：`bf8c2105`
   - 容器内置 Docker CLI / Compose 插件提交：`4e959bab`
-  - 3 项冗余参数/字段清理与独立 HTTP Web 官方 `browser-use` 受管 CDP 适配：`ce24c4cf`、`ab4ab3ac`（发布基线 `29c3c4dc`）
+  - 3 项冗余参数/字段清理与独立 HTTP Web 官方 `browser-use` 受管 CDP 适配：`ce24c4cf`、`ab4ab3ac`（阶段发布基线 `29c3c4dc`）
+  - 项目恢复 `restoreProject` 位置参数转换、记忆冲突重载专用标识与独立 Browser MCP 镜像/文案清理：`f643ee64`
 - 升级前 `main` 基线：`f40a4597`（`docs(maintenance): record standalone MCP deployment acceptance`）
-- 当前状态：线上容器运行 `29c3c4dc`（完整 SHA：`29c3c4dc0ecfe54b640b40a332a97862619787af`，GitHub Actions 运行 [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) `success`，镜像 `sha-29c3c4dc`），容器 `healthy`、`restarts: 0`，基础 HTTP/鉴权/WebSocket 探针通过；`ce24c4cf` 3 项冗余清理已随镜像生效，官方 `browser-use` 2026-11-15 网页访问读取通过且用户确认（具体证据见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）。早前 `4e959bab` 部署阶段已完成运行日志 5446 行无关键错误核验及 2026-11-15 用户实机验收（模型保存/删除提示、归档任务永久删除、实体手机重连、手机工作区与 `compact-web` 设置页、任务分组、子代理设置与权限弹窗、新建技能/插件试用预填跳转、新建项目目录选择与任务工作区归属均确认正常；归档永久删除同步经运行日志 `previewArchivedTaskDeletion` 与 `permanentlyDeleteArchivedTask` `OK` 印证）。
-- 待发布改动（2026-11-16）：`restoreProject` HTTP 位置参数转换、记忆冲突重载专用标识与独立 Browser MCP 镜像 / 脚本 / 文案清理已完成。项目服务 / SQLite 回归与记忆真实组件浏览器 fixture 通过，完整 WDIO 尚未运行；当前服务仍为 `29c3c4dc`。检查细目见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)。
+- 当前状态（更新于 2026-11-16）：线上容器运行 `f643ee64`（完整 SHA：`f643ee6465143c583bd741047c08634231c4ba89`，GitHub Actions 运行 [`43789255724`](https://github.com/uselessbug/ZCode/actions/runs/43789255724) `success`，发布 `latest` 与 `sha-f643ee64`），容器 `healthy`、`restarts: 0`，2026-11-16T02:10:54Z 基础 HTTP/鉴权/WebSocket 与持久化探针通过；独立 Browser MCP 已从镜像与配置完整移除且移除后线上 Browser Use 访问读取复测通过，记忆冲突重载专用标识已部署且组件 fixture 通过，`restoreProject` 已部署待实际页面交互验收（证据集中见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）。
+- 历史部署验收基线：2026-11-15 `29c3c4dc`（GitHub Actions 运行 [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) `success`）完成 `ce24c4cf` 冗余清理生效及官方 `browser-use` 网页访问读取实测与用户确认；更早 `4e959bab` 部署完成运行日志 5446 行无关键错误核验及用户多端实机验收（模型保存/删除提示、归档任务永久删除、实体手机重连、手机工作区与 `compact-web` 设置页、任务分组、子代理设置与权限弹窗、新建技能/插件试用预填跳转、新建项目目录选择与任务工作区归属均确认正常；详见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）。
 
 ### 1.1 升级保护能力范围
 
