@@ -2412,11 +2412,52 @@ export function createLocalServices(options: {
     },
     afterChange: () => broadcastService.send({ channel: "state:task-groups", payload: {} }),
   });
-  const prepareProjectExecution = async (projectId: string) => ({
-    ...(await projectService.prepareSession({ projectId })),
-    hostId: options?.projectStorageHostId ?? "local",
-    workspaceIdentity: undefined,
-  });
+  const prepareProjectExecution = async (projectId: string) => {
+    const prepared = await projectService.prepareSession({ projectId });
+    if (options?.serviceAuthorityMode === "standalone-server") {
+      // standalone 下固化当前服务器 canonical workspaceIdentity 与可信 hostId，
+      // 避免新建定时任务落盘缺失 identity 或退回 local。
+      const resolved = await sourceServerWorkspaceService.resolveWorkspace({
+        workspacePath: prepared.workspacePath,
+      });
+      return {
+        ...prepared,
+        hostId: options?.projectStorageHostId ?? "local",
+        workspaceIdentity: resolved.canonicalWorkspaceKey,
+      };
+    }
+    return {
+      ...prepared,
+      hostId: options?.projectStorageHostId ?? "local",
+      workspaceIdentity: undefined,
+    };
+  };
+  const resolveAutomationExecutionContext =
+    options?.serviceAuthorityMode === "standalone-server"
+      ? async (target: { workspacePath: string; workspaceIdentity?: string }) => {
+          const resolved = await sourceServerWorkspaceService.resolveWorkspace({
+            workspacePath: target.workspacePath,
+          });
+          const hostId = options?.projectStorageHostId ?? "local";
+          const identity = target.workspaceIdentity?.trim();
+          if (identity) {
+            const stableIdentity =
+              hostId !== "local"
+                ? buildRemoteHostWorkspaceIdentity(hostId, target.workspacePath)
+                : undefined;
+            if (identity !== resolved.canonicalWorkspaceKey && identity !== stableIdentity) {
+              throw new Error("Automation workspace does not belong to this server");
+            }
+          }
+          return {
+            hostId,
+            workspaceIdentity: resolved.canonicalWorkspaceKey,
+          };
+        }
+      : undefined;
+  const automationRuntimeRef: { current: AutomationRuntimeHandle | undefined } = {
+    current: undefined,
+  };
   let appControlService: AppControlService | undefined;
   // 受管 worktree 的删除租约：worktree 服务取得，Agent 服务与终端服务据此拒绝新操作（§8.3）。
   // 租约只在本 Host 内生效，前提是一台机器只有一个本地 Host：应用持有单实例锁，主窗口只经

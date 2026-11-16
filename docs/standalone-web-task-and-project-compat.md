@@ -84,12 +84,12 @@ sequenceDiagram
      - 异域身份（如 `remote:ssh:*`、`remote:wsl:*`、其他 `remote:server:*` 或同 server 错 `workspacePath`）以及非 runtime-unavailable 异常均严禁回落，原样透传错误。
   3. 无论走热 runtime 还是控制面 carrier，`session/delete/preview` 与 `session/delete/execute` 请求体都完整保留原始 `workspace`（`workspacePath` + `workspaceIdentity`）、`revision` 与 `operationId`，由 CLI `permanent-deletion` 继续执行身份一致性、`revision` 冲突与幂等保护。
 
-### 补充边界：项目恢复的 Host 别名
+### 补充边界：项目恢复与当前服务器项目数据清理的 Host 别名
 
-- 仅在 `web-remote-replayable` 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS=1` 时，由 HTTP 包装把 `restoreProject(id, "local")` 的第二个参数重写为当前服务器 canonical owner；对象内的 `hostId` 与返回结果沿用既有转换。
-- Toast 撤销移除与已移除项目列表恢复共用该路径。重复恢复、roots、主要目录与任务归属由原项目服务处理；其他 Host 参数原样传递，普通桌面与未开启别名的连接不变。
-- 不把 `measureProjectData`、`deleteProjectData` 加入位置参数转换；服务器数据清理仍受 `project.data-local-only` 限制。
-- 回归直接执行源码别名包装，验证恢复参数转换、返回 Host、重复调用及其他 Host/数据清理方法不被额外重写；实际网页撤销、刷新后恢复状态与数据保留另行验收。
+- 仅在 `web-remote-replayable` 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS=1` 时，由 HTTP 包装把 `restoreProject(id, "local")`、`measureProjectData(ids, "local")` 与 `deleteProjectData(id, "local")` 的第二个位置参数重写为当前服务器 canonical owner；对象内的 `hostId` 与返回结果沿用既有转换。
+- Toast 撤销移除与已移除项目列表恢复共用 `restoreProject` 路径；项目管理弹窗的数据估算与「同时删除它们的 ZCode 数据」共用 `measureProjectData` / `deleteProjectData` 路径。其他 Host 参数（如异域 `hostId`）原样传递，普通桌面、普通远端 owner 与未开启 `allowStandaloneProjectData` 的服务端仍抛 `project.data-local-only`。
+- 服务端 `project-data` 对每个可删目录（含 0 会话项目 root）独立解析当前服务器 canonical `workspaceIdentity` 并传给 CLI `v4/storage/sessionData/*`，以命中 `project-<sha256(identity).slice(0,16)>` 记忆目录；`purgeSessionData` 优先命中热运行 CLI 以保护 `busy` 运行中会话，仅在 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 且归属当前 Host canonical 身份时回落管理面进程，异域身份与非 runtime-unavailable 异常原样抛出、不回落。
+- 回归直接执行源码别名包装与真实项目服务/SQLite，验证恢复参数转换、`measureProjectData`/`deleteProjectData` 成功路径、0 会话与 canonical 记忆路径解析、热运行 `busy` 会话保护、冷工作区安全回落及异域/未开启拒绝边界。
 
 ### 补充项：非项目工作模式与项目 root
 

@@ -14,3 +14,14 @@ export async function projectExample(service: IProjectService): Promise<string> 
 export async function openFolderExample(service: IProjectService, path: string): Promise<string> {
   return (await service.saveProject({ roots: [path], reuseExistingRoot: true })).id;
 }
+
+export async function projectDataPurgeExample(
+  service: IProjectService,
+  projectId: string,
+): Promise<number> {
+  const measured = await service.measureProjectData([projectId], "local");
+  if ((measured.projects[0]?.sessions ?? 0) === 0) return 0;
+  await service.deleteProject(projectId, "local");
+  const result = await service.deleteProjectData(projectId, "local");
+  return result.freedBytes;
+}

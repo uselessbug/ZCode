@@ -32,6 +32,7 @@ export type {
   SaveProjectInput,
   ProjectDirectories,
   ProjectDataPort,
+  ProjectDataDirectory,
   ProjectDataSession,
   ProjectDataMeasure,
   ProjectDataDeleteResult,
@@ -150,6 +151,10 @@ export function createProjectService(options: {
   standaloneWorkspaceRoot?: string;
   /** 独立云端 Web 多 root：允许已有项目拥有多个 root；普通远端 owner 仍单 root。 */
   allowStandaloneMultiRoot?: boolean;
+  /** 独立云端 Web 项目数据估算与清理开关：显式开启后允许对当前服务器 owner 执行。 */
+  allowStandaloneProjectData?: boolean;
+  /** standalone 下为每个可删目录独立解析 canonical workspaceIdentity。 */
+  resolveDirectoryWorkspaceIdentity?: (workspacePath: string) => Promise<string | undefined>;
 }): IProjectService {
   const route = async (hostId?: string) => {
     if (!hostId || hostId === (options.ownerHostId ?? "local")) return null;

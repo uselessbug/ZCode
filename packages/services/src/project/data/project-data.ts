@@ -5,6 +5,7 @@ import type { ProjectRepositoryContract } from "#src/project-storage/contract.js
 import type { ProjectDataRepositoryContract } from "#src/project-storage/index.js";
 import type { IProjectService } from "#src/project/contract.js";
 import type {
+  ProjectDataDirectory,
   ProjectDataMeasure,
   ProjectDataPort,
   ProjectDataSession,
@@ -56,16 +57,39 @@ function deletableDirectories(
 export function createProjectDataCommands(options: {
   repository(): Promise<ProjectRepositoryContract>;
   ownerHostId?: string;
+  /** 仅独立云端 Web 显式开启后才允许对当前服务器 owner 执行项目数据估算与清理。 */
+  allowStandaloneProjectData?: boolean;
+  /** standalone 下为每个可删目录独立解析 canonical workspaceIdentity（含 0 会话项目 root）。 */
+  resolveDirectoryWorkspaceIdentity?: (workspacePath: string) => Promise<string | undefined>;
   data?: { port: ProjectDataPort; repository(): Promise<ProjectDataRepositoryContract> };
   changed(): Promise<void>;
 }): Pick<IProjectService, "measureProjectData" | "deleteProjectData"> {
-  // 数据只在本机删除：远程项目的数据在其设备上，Source Server 自身也不开放这条路径。
+  // Desktop 仅在本机 owner 执行；独立 Web 显式开启开关后允许对本服务器 owner 执行，跨 Host/未开启仍拒绝。
   const requireLocal = (hostId?: string) => {
     const owner = options.ownerHostId ?? "local";
-    if (owner !== "local" || (hostId && hostId !== owner))
-      throw new Error("project.data-local-only");
+    const allowedOwner = owner === "local" || options.allowStandaloneProjectData === true;
+    if (!allowedOwner || (hostId && hostId !== owner)) throw new Error("project.data-local-only");
     if (!options.data) throw new Error("project.data-unavailable");
     return options.data;
+  };
+  const resolveDirectoriesWithIdentity = async (
+    paths: readonly string[],
+  ): Promise<ProjectDataDirectory[]> => {
+    const uniquePaths = [...new Set(paths)];
+    const resolver = options.resolveDirectoryWorkspaceIdentity;
+    if (!resolver) {
+      return uniquePaths.map((workspacePath) => ({ workspacePath }));
+    }
+    // 对每个目录独立解析 canonical 身份（不把 worktree 任务的归属身份误套用到另一个 cwd）。
+    return Promise.all(
+      uniquePaths.map(async (workspacePath) => {
+        const workspaceIdentity = (await resolver(workspacePath))?.trim();
+        return {
+          workspacePath,
+          ...(workspaceIdentity ? { workspaceIdentity } : {}),
+        };
+      }),
+    );
   };
   return {
     async measureProjectData(ids, hostId) {
@@ -74,17 +98,22 @@ export function createProjectDataCommands(options: {
       const repository = await options.repository();
       const rows = await data.repository();
       const directories = deletableDirectories(repository, rows, ids);
+      const directoryEntries = await resolveDirectoriesWithIdentity(
+        [...directories.values()].flat(),
+      );
       const sessions = new Map<string, ProjectDataSession[]>(
         ids.map((id) => [
           id,
-          rows
-            .readProjectTaskRefs(id)
-            .map((task) => ({ sessionId: task.taskId, workspacePath: task.workspacePath })),
+          rows.readProjectTaskRefs(id).map((task) => ({
+            sessionId: task.taskId,
+            workspacePath: task.workspacePath,
+            ...(task.workspaceIdentity ? { workspaceIdentity: task.workspaceIdentity } : {}),
+          })),
         ]),
       );
       const measured = await data.port.measure({
         sessions: [...sessions.values()].flat(),
-        directories: [...directories.values()].flat(),
+        directories: directoryEntries,
       });
       const sessionBytes = new Map(
         measured.sessions.map((entry) => [entry.sessionId, entry.bytes]),
@@ -118,7 +147,11 @@ export function createProjectDataCommands(options: {
       if (!project.deleted) throw new Error("project.data-requires-removed");
       const tasks = rows.readProjectTaskRefs(id);
       const sessions = await data.port.purgeSessions(
-        tasks.map((task) => ({ sessionId: task.taskId, workspacePath: task.workspacePath })),
+        tasks.map((task) => ({
+          sessionId: task.taskId,
+          workspacePath: task.workspacePath,
+          ...(task.workspaceIdentity ? { workspaceIdentity: task.workspaceIdentity } : {}),
+        })),
       );
       const deleted = new Set(sessions.deleted.map((entry) => entry.sessionId));
       const deletedTasks = tasks.filter((task) => deleted.has(task.taskId));
@@ -128,7 +161,7 @@ export function createProjectDataCommands(options: {
       // 从候选里消失，记忆与检查点永久漏删。任务行此时都还在。
       const directories = deletableDirectories(repository, rows, [id], survivors).get(id) ?? [];
       const folders = directories.length
-        ? await data.port.purgeDirectories(directories)
+        ? await data.port.purgeDirectories(await resolveDirectoriesWithIdentity(directories))
         : { bytes: 0, failed: [] };
       // CLI 已删行后才动 Host 行；CLI 失败的会话行原样保留，重试仍能找到。
       if (folders.failed.length) {

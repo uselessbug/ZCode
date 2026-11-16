@@ -11,6 +11,7 @@ import { createServiceDescriptor } from "#src/descriptors.js";
 import type { ProjectDataDeleteResult, ProjectDataMeasure } from "#src/project/data/contract.js";
 export type {
   ProjectDataDeleteResult,
+  ProjectDataDirectory,
   ProjectDataMeasure,
   ProjectDataPort,
   ProjectDataSession,

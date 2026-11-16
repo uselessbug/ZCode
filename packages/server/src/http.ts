@@ -93,26 +93,37 @@ const log = (...args: unknown[]) =>
 // Adapt only the standalone browser's "local" project label to this server.
 // Storage remains owned by the canonical remote host; other hosts still fail closed.
 function projectHost(value: unknown, from: string, to: string): any {
-  if (Array.isArray(value)) return value.map(item => projectHost(item, from, to));
-  if (value === null || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
-    key, key === 'hostId' && item === from ? to : projectHost(item, from, to),
-  ]));
+  if (Array.isArray(value)) return value.map((item) => projectHost(item, from, to));
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      key === "hostId" && item === from ? to : projectHost(item, from, to),
+    ]),
+  );
 }
 
 function createStandaloneProjectAlias<T extends object>(service: T, ownerHostId: string): T {
-  if (!ownerHostId || ownerHostId === 'local') throw new Error('Canonical remote owner required');
-  // 恢复项目同样以第二个位置参数传 Host，遗漏转换会把 local 错路由到离线 Host。
-  const positionalHostMethods = new Set(['deleteProject', 'restoreProject', 'reorderProjects', 'resolveSessionDirectories']);
+  if (!ownerHostId || ownerHostId === "local") throw new Error("Canonical remote owner required");
+  // 恢复项目与本服务器项目数据估算/清理同样以第二个位置参数传 Host，遗漏转换会把 local 错路由到离线 Host。
+  const positionalHostMethods = new Set([
+    "deleteProject",
+    "restoreProject",
+    "reorderProjects",
+    "resolveSessionDirectories",
+    "measureProjectData",
+    "deleteProjectData",
+  ]);
   return new Proxy(service, {
     get(target, property) {
       const method = Reflect.get(target, property);
-      if (typeof method !== 'function') return method;
+      if (typeof method !== "function") return method;
       return async (...args: unknown[]) => {
-        const input = args.map(arg => projectHost(arg, 'local', ownerHostId));
-        if (positionalHostMethods.has(String(property)) && input[1] === 'local') input[1] = ownerHostId;
+        const input = args.map((arg) => projectHost(arg, "local", ownerHostId));
+        if (positionalHostMethods.has(String(property)) && input[1] === "local")
+          input[1] = ownerHostId;
         const result = await method.apply(target, input);
-        return projectHost(result, ownerHostId, 'local');
+        return projectHost(result, ownerHostId, "local");
       };
     },
   });
@@ -162,13 +173,23 @@ function setupChannelServer(
       },
     });
   }
-  if (clientMode === "web-remote-replayable" && process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1") {
-    const ownerHostId = remoteHostIdFromWorkspaceIdentity(buildServerRemoteWorkspaceIdentity({
-      serverId: resolveHttpServerId(), workspacePath: "/",
-    }));
+  if (
+    clientMode === "web-remote-replayable" &&
+    process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"
+  ) {
+    const ownerHostId = remoteHostIdFromWorkspaceIdentity(
+      buildServerRemoteWorkspaceIdentity({
+        serverId: resolveHttpServerId(),
+        workspacePath: "/",
+      }),
+    );
     const projectService = services.getOptional(IProjectService);
-    if (!ownerHostId || !projectService) throw new Error("Standalone Web project authority unavailable");
-    overrides.set(IProjectService.channelName, createStandaloneProjectAlias(projectService, ownerHostId));
+    if (!ownerHostId || !projectService)
+      throw new Error("Standalone Web project authority unavailable");
+    overrides.set(
+      IProjectService.channelName,
+      createStandaloneProjectAlias(projectService, ownerHostId),
+    );
   }
   services.exposeOnChannelServer(server, overrides);
   socket.onClose(() => {

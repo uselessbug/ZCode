@@ -4257,6 +4257,17 @@ export function createZCodeAgentService(
     return client;
   }
 
+  async function isWorkspaceOwnedByCurrentHostForSessionData(
+    workspace: ZCodeAgentWorkspaceTarget,
+  ): Promise<boolean> {
+    if (workspace.remoteSessionId) return false;
+    const hasWorkspaceIdentity = Boolean(workspace.workspaceIdentity?.trim());
+    if (!hasWorkspaceIdentity) {
+      return isLocalActiveWorkspaceClient(workspace);
+    }
+    return Boolean(await options?.isDeletionWorkspaceOwnedByCurrentHost?.(workspace));
+  }
+
   async function resolveSessionDeletionClient(
     workspace: ZCodeAgentWorkspaceTarget,
   ): Promise<ZCodeProtocolClient> {
@@ -4272,12 +4283,7 @@ export function createZCodeAgentService(
       }
       // 保留 isLocalActiveWorkspaceClient 原边界不变；仅对无远端标识的本机工作区，或由装配层
       // 确认属于当前 standalone Host canonical 身份且无 remoteSessionId 的工作区回落控制面。
-      const hasWorkspaceIdentity = Boolean(workspace.workspaceIdentity?.trim());
-      const canFallback =
-        !workspace.remoteSessionId &&
-        (hasWorkspaceIdentity
-          ? Boolean(await options?.isDeletionWorkspaceOwnedByCurrentHost?.(workspace))
-          : isLocalActiveWorkspaceClient(workspace));
+      const canFallback = await isWorkspaceOwnedByCurrentHostForSessionData(workspace);
       if (!canFallback) {
         throw error;
       }
@@ -4978,6 +4984,15 @@ export function createZCodeAgentService(
     },
 
     async measureSessionData(params) {
+      // 携带 workspaceIdentity 的目录必须归属本机或当前 standalone Host，拒绝异域身份。
+      for (const directory of params.directories) {
+        if (
+          directory.workspaceIdentity?.trim() &&
+          !(await isWorkspaceOwnedByCurrentHostForSessionData(directory))
+        ) {
+          throw new Error("project.data-local-only");
+        }
+      }
       // 只读测量：和全局工作流同一载体选择（本机已活跃 runtime，否则管理面进程）。
       const { client } = await resolveGlobalSavedWorkflowCarrier();
       return client.request(
@@ -4988,12 +5003,20 @@ export function createZCodeAgentService(
     },
 
     async purgeSessionData({ workspace, ...params }) {
-      if (!isLocalActiveWorkspaceClient(workspace)) throw new Error("project.data-local-only");
-      // 会话可能已加载在该 cwd 的 Agent 进程里：必须由那个进程删除，它才能判断运行中并释放会话；
-      // 绝不为删除拉起该项目的 Agent（文件夹可能已不存在），没有进程时交给管理面进程。
-      const client = await getReadOnlyClient(workspace, "existing-only").catch(() =>
-        getPluginManagementClient(),
-      );
+      if (!(await isWorkspaceOwnedByCurrentHostForSessionData(workspace))) {
+        throw new Error("project.data-local-only");
+      }
+      for (const directory of params.directories) {
+        if (
+          directory.workspaceIdentity?.trim() &&
+          !(await isWorkspaceOwnedByCurrentHostForSessionData(directory))
+        ) {
+          throw new Error("project.data-local-only");
+        }
+      }
+      // 复用 resolveSessionDeletionClient 同源门禁：优先命中热运行 CLI 保护 busy 会话，
+      // 仅在 ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE 且归属当前 Host 时回落管理面进程，绝不吞掉其他异常。
+      const client = await resolveSessionDeletionClient(workspace);
       return client.request(V4_METHODS.sessionDataPurge, params, v4SessionDataPurgeResultSchema);
     },
 

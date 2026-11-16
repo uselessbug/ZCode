@@ -7,6 +7,13 @@
 export interface ProjectDataSession {
   sessionId: string;
   workspacePath: string;
+  workspaceIdentity?: string;
+}
+
+/** 彻底删除数据的一个目录：standalone 下需补齐当前 Host 的 canonical workspaceIdentity。 */
+export interface ProjectDataDirectory {
+  workspacePath: string;
+  workspaceIdentity?: string;
 }
 
 /**
@@ -14,7 +21,7 @@ export interface ProjectDataSession {
  * 大小只统计真正从磁盘删除的文件；数据库行删除不计入（库文件不收缩）。
  */
 export interface ProjectDataPort {
-  measure(input: { sessions: ProjectDataSession[]; directories: string[] }): Promise<{
+  measure(input: { sessions: ProjectDataSession[]; directories: ProjectDataDirectory[] }): Promise<{
     sessions: Array<{ sessionId: string; bytes: number }>;
     directories: Array<{ path: string; memoryBytes: number; checkpointBytes: number }>;
   }>;
@@ -25,7 +32,9 @@ export interface ProjectDataPort {
     failed: string[];
   }>;
   /** 删除这些目录的记忆与文件检查点。 */
-  purgeDirectories(directories: string[]): Promise<{ bytes: number; failed: string[] }>;
+  purgeDirectories(
+    directories: ProjectDataDirectory[],
+  ): Promise<{ bytes: number; failed: string[] }>;
 }
 
 export interface ProjectDataMeasure {
