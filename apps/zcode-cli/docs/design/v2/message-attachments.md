@@ -697,3 +697,13 @@ Composer PDF 使用独立的 `TurnAttachment.type = "pdf"` 和 shared
 omit PDF data 并保留 `[PDF: source: <path>]`，切回支持模型时从同一 artifact 恢复。Composer 和
 已发送 row 维持文档卡片形态，但统一使用 PdfViewer 与精确 row/part 授权的 attachment range
 read；relay/main 不保存 PDF bytes 或 session 业务状态。
+
+## 普通上传文件物化与字节分流（2026-11-16）
+
+- 协议边界（`attachment-refs.ts`）：对于 `zcode-artifact://` URI 形态的普通文件引用（非本地路径、非 `image`/`video`/`pdf`），统一保留 `{ content: ref.ref, type: "file", ...displayMeta }`（保留 `sourceKind` 与 `messageCount`），不在协议映射层提前按 UTF-8 解码，也不因 `bytes > 64 KiB` 丢弃 `ref.ref` 或将 `ref.fileName` 冒充本地磁盘路径 `path`。
+- core 分流解析（`attachments.ts` / `attachment-path-reference.ts`）：在通用 `resolvedInlineAttachment` fallback 之前，对 `attachment.type === "file"` 且 `attachment.content?.startsWith("zcode-artifact://")` 的普通上传文件按真实解码字节分流（既有媒体/PDF 与本地路径分支保持不变；`clipboard-text` / `topic-history` 在落盘为会话级 `.txt` 文件时，除保留真实磁盘 `path`、`source` 与 `pathReferenceText` 外，同样保留新原始字节 `file.uri` 到 `url` 以及原上传 `inline.artifactUri` 到 `metadata.artifactUri` / `metadata.originalUrl`，以保障冷恢复与 fork 会话 `listArtifactReferrers` / `purgeSessionDataWith` 引用保护）：
+  1. 通过 `artifactStore.readToolResultArtifact` 读回原上传 `data:` artifact 并解码 base64 真实字节，不根据展示字段 `sizeBytes` 跳过校验，也不把 `data:...` 原串注入 prompt。
+  2. **可安全内联的小 UTF-8 文本**必须同时满足：实际解码字节数 `<= 64 KiB`（含 `0` 字节空文本文件）；具有正面文本类型依据（基于扩充的 `isTextLikePath` 常见源码/配置扩展名或无扩展名时的显式安全文本 MIME，同时显式排除 `.zip`、`.docx`、`.xlsx`、`.pptx`、`.jar`、`.apk`、`.wasm`、`.exe`、`.dll`、`.so`、`.dylib`、`.bin` 等二进制扩展名，不单凭宽泛 MIME 放行）；`new TextDecoder("utf-8", { fatal: true })` 解码成功；不含 NUL（`0x00`）或除 `\t`/`\n`/`\r` 外的 C0 控制字节。满足时构造内联文本结果，保留原上传 `artifactUri`、`preview.text`（`truncated: false`）与真实字节数，并在 `file-part-hydration.ts` 确保 `application/json` 等文本 MIME 冷恢复时不丢失正文。
+  3. **二进制文件、未知格式或 `> 64 KiB` 文本文件**：调用 `artifactStore.writeToolResultBinaryArtifact`（`retention: "session"`，提取并规范化原文件名扩展名，无扩展名使用 `.bin`）写入完整原始字节，获取真实磁盘 `path` 与新原始字节 artifact URI；复用 `resolvedPathReferenceAttachment` 生成 `storageKind: "local_ref"` 与包含真实磁盘 `path`、真实文件名、MIME 和真实字节数的 `pathReferenceText`（`> 64 KiB` 且通过文本判定用 `"text_too_large"`，其余用 `"binary_file"`）；同时保留双 artifact 引用（`url` 存新原始字节 artifact URI，`metadata.artifactUri` 与 `metadata.originalUrl` 存原上传 data URL artifact URI），以保障预览读取与 `listArtifactReferrers` / fork 引用保护。
+  4. **显式失败占位**：`artifactStore` 缺失、原 URI 读取/解码失败、或原始字节落盘失败/无有效磁盘路径时，返回 `attachment_read_failed` 占位结果，不静默返回空内容成功附件。
+- 内部字节解码与网关边界：`create-app.ts` 的 `decodePromptAttachmentDataUrl` 放开合法 `type/subtype` MIME 的 base64 data URL 解码，保证上传的 `.zip`/`.docx`/`.json` 等 artifact 在内部字节读取时不被拒绝；`v4-gateway.ts` 原有的媒体预览白名单边界保持不变。

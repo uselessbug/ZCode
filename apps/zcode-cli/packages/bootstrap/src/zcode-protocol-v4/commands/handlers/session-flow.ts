@@ -82,7 +82,7 @@ async function sendText(
     : rawPayload;
   // canonical intent 必须和 admission 看同一份净荷，否则 transcript 会留下没有凭据的加速标记。
   const intentEnvelope = { ...envelope, payload } as CommandEnvelope;
-  const attachments = await mapAttachmentRefsToTurnAttachments(record.app, payload.attachments);
+  const attachments = mapAttachmentRefsToTurnAttachments(payload.attachments);
   const submittedExecutionState = resolveSubmittedExecutionState(record, payload);
   const submissionIntent = (options: Parameters<typeof inputIntentMetadata>[1]) =>
     inputIntentMetadata(intentEnvelope, {

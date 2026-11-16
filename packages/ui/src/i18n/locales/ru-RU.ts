@@ -7347,6 +7347,8 @@ const ruRU: Record<string, string> = {
     "Видео {filename} слишком большое ({size}). Сожмите его до {maxSize} или меньше и повторите попытку.",
   "chat.attachments.oversizedInlinePdf":
     "PDF {filename} слишком большой ({size}). Сожмите его до {maxSize} или меньше и повторите попытку.",
+  "chat.attachments.oversizedInlineFile":
+    "Вложение {filename} слишком большое ({size}). Максимальный размер одного файла — {maxSize}.",
   "chat.attachments.restoreDropped":
     "Некоторые вложения черновика не удалось восстановить после перезапуска. Добавьте их снова: {filenames}",
   "chat.attachments.clipboardText": "Вставленный текст",

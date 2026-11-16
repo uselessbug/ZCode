@@ -7,15 +7,11 @@ import type { AttachmentRef } from "@zcode/shared/zcode-protocol-v4";
 import { WORKSPACE_FILE_DRAG_MIME } from "@/lib/workspaceFileDrag.js";
 import {
   MAX_CHAT_ATTACHMENTS,
-  MissingInlinePdfContentError,
-  OversizedInlinePdfAttachmentError,
-  OversizedInlineVideoAttachmentError,
   createChatComposerAttachment,
   createChatComposerPathAttachment,
   createClipboardTextAttachmentFilenameForDate,
   createClipboardTextComposerAttachment,
   createClipboardTextPathComposerAttachment,
-  formatAttachmentSize,
   revokeChatComposerAttachment,
   serializeChatComposerAttachment,
   shouldCreateClipboardTextAttachment,
@@ -43,7 +39,13 @@ import {
   type ComposerAttachmentUploadItem,
   type ComposerAttachmentUploadStatus,
 } from "@/store/composerAttachmentUploadStore.js";
-import { uploadComposerAttachment, type AttachmentPutFn } from "@/v4/composer/attachmentUpload.js";
+import {
+  REMOTE_ATTACHMENT_NOT_STAGED_ERROR_CODE,
+  formatAttachmentUploadError,
+  isTransientAttachmentUploadError,
+  uploadComposerAttachment,
+  type AttachmentPutFn,
+} from "@/v4/composer/attachmentUpload.js";
 
 export const COMPOSER_ATTACHMENT_UPLOAD_CONCURRENCY = 2;
 export const COMPOSER_ATTACHMENT_AUTO_RETRY_DELAY_MS = 500;
@@ -54,7 +56,6 @@ export const COMPOSER_ATTACHMENT_COMPLETE_VISIBLE_MS = 300;
  */
 export const COMPOSER_ATTACHMENT_REBUILD_RETRY_LIMIT = 5;
 const EMPTY_COMPOSER_ATTACHMENTS: ComposerAttachmentUploadItem[] = [];
-const REMOTE_ATTACHMENT_NOT_STAGED_ERROR_CODE = "remoteAttachmentNotStaged";
 export type {
   ComposerAttachmentUploadItem,
   ComposerAttachmentUploadStatus,
@@ -212,33 +213,8 @@ export function setComposerAttachmentPreviewUrlForScope(
   return true;
 }
 
-function isAbortError(error: unknown): boolean {
-  if (error instanceof Error && error.name === "AbortError") return true;
-  return error instanceof Error && error.cause !== undefined ? isAbortError(error.cause) : false;
-}
-
 class RemoteAttachmentNotStagedError extends Error {
   readonly code = REMOTE_ATTACHMENT_NOT_STAGED_ERROR_CODE;
-}
-
-export function isTransientAttachmentUploadError(error: unknown): boolean {
-  if (isAbortError(error)) return false;
-  if (error instanceof OversizedInlineVideoAttachmentError) return false;
-  if (error instanceof OversizedInlinePdfAttachmentError) return false;
-  if (error instanceof MissingInlinePdfContentError) return false;
-  if (
-    error instanceof Error &&
-    "code" in error &&
-    error.code === REMOTE_ATTACHMENT_NOT_STAGED_ERROR_CODE
-  ) {
-    return false;
-  }
-  const message = error instanceof Error ? error.message : String(error);
-  // video 超限错误必须在黑名单里，否则会触发一次无意义重试；按错误类型精确拦截，
-  // 避免扩大 message 正则后改变 image 超限的既有判定。
-  return !/(?:payloadTooLarge|invalidBase64|invalidServerProgress|frameTooLarge|permission|EACCES|ENOENT|not found|unsupported|附件缺少|缺少可读取内容|远端附件未完成物化)/iu.test(
-    message,
-  );
 }
 
 function progressPercent(uploadedBytes: number, totalBytes: number): number {
@@ -473,33 +449,7 @@ export function useComposerAttachments(
         );
         if (!current) return;
         // 结构化超限错误在 UI 层按 locale 格式化（与 chatAttachments 序列化边界约定一致）。
-        const message =
-          error instanceof OversizedInlineVideoAttachmentError
-            ? intl.formatMessage(
-                { id: "chat.attachments.oversizedInlineVideo" },
-                {
-                  filename: error.filename,
-                  size: formatAttachmentSize(error.sizeBytes),
-                  maxSize: formatAttachmentSize(error.maxSizeBytes),
-                },
-              )
-            : error instanceof OversizedInlinePdfAttachmentError
-              ? intl.formatMessage(
-                  { id: "chat.attachments.oversizedInlinePdf" },
-                  {
-                    filename: error.filename,
-                    size: formatAttachmentSize(error.sizeBytes),
-                    maxSize: formatAttachmentSize(error.maxSizeBytes),
-                  },
-                )
-              : error instanceof MissingInlinePdfContentError
-                ? intl.formatMessage(
-                    { id: "chat.attachments.missingInlinePdfContent" },
-                    { filename: error.filename },
-                  )
-                : error instanceof Error
-                  ? error.message
-                  : String(error);
+        const message = formatAttachmentUploadError(intl, error);
         const transient = isTransientAttachmentUploadError(error);
         if (transient && current.autoRetryCount < 1) {
           updateItem(targetScopeKey, attachmentId, (item) => ({

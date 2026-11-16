@@ -47,7 +47,7 @@ export async function filePartToContentBlock(
   }
 
   const previewText = part.metadata?.preview?.text;
-  if (part.mime.startsWith("text/") && typeof previewText === "string") {
+  if (typeof previewText === "string" && isInlineTextFilePart(part)) {
     return { type: "text", text: previewText };
   }
 
@@ -159,6 +159,42 @@ function attachmentRefFromFilePart(part: FilePart): AttachmentRef {
 function durableArtifactUriFromFilePart(part: FilePart): string | undefined {
   const artifactUri = part.metadata?.artifactUri ?? part.url;
   return artifactUri.startsWith("zcode-artifact://") ? artifactUri : undefined;
+}
+
+const TEXT_LIKE_APPLICATION_MIMES = new Set([
+  "application/ecmascript",
+  "application/graphql",
+  "application/javascript",
+  "application/json",
+  "application/ld+json",
+  "application/sql",
+  "application/toml",
+  "application/typescript",
+  "application/x-javascript",
+  "application/x-sh",
+  "application/x-typescript",
+  "application/x-yaml",
+  "application/xml",
+  "application/yaml",
+  "image/svg+xml",
+]);
+
+function isInlineTextFilePart(part: FilePart): boolean {
+  const normalizedMime = part.mime.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  if (
+    normalizedMime.startsWith("text/") ||
+    TEXT_LIKE_APPLICATION_MIMES.has(normalizedMime) ||
+    normalizedMime.endsWith("+json") ||
+    normalizedMime.endsWith("+xml")
+  ) {
+    return true;
+  }
+  // 修复原因：部分内联文本（如未标注 text/* 的源码或配置文件）在冷恢复时不应丢失 preview.text。
+  return (
+    part.metadata?.storageKind === "inline" &&
+    (part.metadata.recoverability === "provider_ready" ||
+      part.metadata.recoverability === "preview_only")
+  );
 }
 
 function isImageMime(mime: string): boolean {

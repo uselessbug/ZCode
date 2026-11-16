@@ -1096,9 +1096,12 @@ describe("prompt attachment provider content order", () => {
 });
 
 describe("话题历史文本附件", () => {
-  it("在目标 runtime 落盘，只把路径交给模型", async () => {
+  it("在目标 runtime 落盘，只把路径交给模型并保留双 artifact 引用", async () => {
     const text = "PRIVATE_TOPIC_HISTORY";
-    const writeToolResultBinaryArtifact = vi.fn(async () => ({ path: "/target/history.txt" }));
+    const writeToolResultBinaryArtifact = vi.fn(async () => ({
+      path: "/target/history.txt",
+      uri: "zcode-artifact://s1/raw-history",
+    }));
     const result = await resolveTurnAttachments(
       [
         {
@@ -1129,7 +1132,300 @@ describe("话题历史文本附件", () => {
       }),
       expect.anything(),
     );
+    expect(result[0]).toMatchObject({
+      url: "zcode-artifact://s1/raw-history",
+      source: { type: "file", path: "/target/history.txt" },
+      metadata: {
+        artifactUri: "zcode-artifact://history",
+        originalUrl: "zcode-artifact://history",
+        storageKind: "local_ref",
+        pathReferenceText: expect.stringContaining("/target/history.txt"),
+      },
+    });
     expect(JSON.stringify(result)).not.toContain(text);
     expect(JSON.stringify(result)).toContain("/target/history.txt");
+  });
+
+  it("clipboard-text 上传 artifact 落盘后同样保留双 artifact 引用且不进入 prompt_attachment", async () => {
+    const text = "CLIPBOARD_LONG_PASTE_TEXT";
+    const writeToolResultBinaryArtifact = vi.fn(async () => ({
+      path: "/target/clipboard.txt",
+      uri: "zcode-artifact://s1/raw-clipboard",
+    }));
+    const result = await resolveTurnAttachments(
+      [
+        {
+          type: "file",
+          content: "zcode-artifact://s1/upload-clipboard",
+          filename: "pasted.txt",
+          mimeType: "text/plain",
+          sourceKind: "clipboard-text",
+        },
+      ],
+      {
+        workingDirectory: "/target",
+        sessionId: "s1" as never,
+        traceContext: {} as never,
+        artifactStore: {
+          readToolResultArtifact: vi.fn(async () => ({
+            content: `data:text/plain;charset=utf-8;base64,${Buffer.from(text).toString("base64")}`,
+          })),
+          writeToolResultBinaryArtifact,
+        } as never,
+      },
+    );
+    expect(result[0]).toMatchObject({
+      url: "zcode-artifact://s1/raw-clipboard",
+      source: { type: "file", path: "/target/clipboard.txt" },
+      metadata: {
+        artifactUri: "zcode-artifact://s1/upload-clipboard",
+        originalUrl: "zcode-artifact://s1/upload-clipboard",
+        storageKind: "local_ref",
+        pathReferenceText: expect.stringContaining("/target/clipboard.txt"),
+      },
+    });
+    const entries = buildRuntimeUserEntriesFromTurn("Summarize if needed.", result);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.metadata).toEqual({ source: "real_user" });
+  });
+});
+
+describe("普通上传文件 artifact 分流解析", () => {
+  it("安全小 UTF-8 文本（.vue / .json / 0 字节 .txt）内联并保留原 artifactUri", async () => {
+    const vueText = "<template><div>Hello</div></template>\n";
+    const jsonText = '{"ok":true,"count":2}';
+    const artifacts: Record<string, string> = {
+      "zcode-artifact://vue": `data:application/octet-stream;base64,${Buffer.from(vueText).toString("base64")}`,
+      "zcode-artifact://json": `data:application/json;base64,${Buffer.from(jsonText).toString("base64")}`,
+      "zcode-artifact://empty": "data:text/plain;base64,",
+    };
+    const writeToolResultBinaryArtifact = vi.fn();
+    const resolved = await resolveTurnAttachments(
+      [
+        {
+          type: "file",
+          content: "zcode-artifact://vue",
+          filename: "App.vue",
+          mimeType: "application/octet-stream",
+          sizeBytes: 999_999, // 故意伪造超大 sizeBytes，验证不轻信展示字段
+        },
+        {
+          type: "file",
+          content: "zcode-artifact://json",
+          filename: "config.json",
+          mimeType: "application/json",
+        },
+        {
+          type: "file",
+          content: "zcode-artifact://empty",
+          filename: "empty.txt",
+          mimeType: "text/plain",
+        },
+      ],
+      {
+        workingDirectory: "/tmp/project",
+        sessionId: createSessionId("uploaded-small-text"),
+        traceContext: { traceId: "trace_uploaded_small_text" },
+        artifactStore: {
+          readToolResultArtifact: vi.fn(async ({ uri }) => ({ content: artifacts[uri]! })),
+          writeToolResultBinaryArtifact,
+        } as never,
+      },
+    );
+
+    expect(writeToolResultBinaryArtifact).not.toHaveBeenCalled();
+    expect(resolved[0]).toMatchObject({
+      contentBlock: { type: "text", text: vueText },
+      filename: "App.vue",
+      mime: "text/plain",
+      url: "zcode-artifact://vue",
+      metadata: {
+        artifactUri: "zcode-artifact://vue",
+        originalUrl: "zcode-artifact://vue",
+        preview: { text: vueText, truncated: false, originalBytes: Buffer.byteLength(vueText) },
+        recoverability: "provider_ready",
+        sizeBytes: Buffer.byteLength(vueText),
+        storageKind: "inline",
+      },
+    });
+    expect(resolved[1]).toMatchObject({
+      contentBlock: { type: "text", text: jsonText },
+      filename: "config.json",
+      mime: "application/json",
+      url: "zcode-artifact://json",
+      metadata: {
+        artifactUri: "zcode-artifact://json",
+        originalUrl: "zcode-artifact://json",
+        preview: { text: jsonText, truncated: false, originalBytes: Buffer.byteLength(jsonText) },
+        recoverability: "provider_ready",
+        storageKind: "inline",
+      },
+    });
+    expect(resolved[2]).toMatchObject({
+      contentBlock: { type: "text", text: "" },
+      filename: "empty.txt",
+      mime: "text/plain",
+      url: "zcode-artifact://empty",
+      metadata: {
+        artifactUri: "zcode-artifact://empty",
+        originalUrl: "zcode-artifact://empty",
+        preview: { text: "", truncated: false, originalBytes: 0 },
+        recoverability: "provider_ready",
+        sizeBytes: 0,
+        storageKind: "inline",
+      },
+    });
+  });
+
+  it("二进制、>64KiB 大文本与含 NUL/非法 UTF-8 的伪文本落盘原始字节并保留双 URI", async () => {
+    const zipBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0x10]);
+    const largeLogBytes = Buffer.from("line\n".repeat(14_000)); // > 64 KiB
+    const fakeTxtBytes = Buffer.from([0x48, 0x69, 0x00, 0xff, 0xfe]); // NUL + invalid UTF-8
+    const artifacts: Record<string, string> = {
+      "zcode-artifact://zip": `data:text/plain;base64,${zipBytes.toString("base64")}`,
+      "zcode-artifact://big": `data:text/plain;base64,${largeLogBytes.toString("base64")}`,
+      "zcode-artifact://fake": `data:text/plain;base64,${fakeTxtBytes.toString("base64")}`,
+    };
+    const writeToolResultBinaryArtifact = vi.fn(async (req) => ({
+      id: `bin-${req.toolCallId}`,
+      uri: `zcode-artifact://s1/bin-${req.toolCallId}`,
+      path: `/tmp/artifacts/s1/${req.toolCallId}${req.extension}`,
+      bytes: req.content.byteLength,
+      contentType: req.contentType,
+      createdAt: new Date(),
+    }));
+
+    const resolved = await resolveTurnAttachments(
+      [
+        {
+          type: "file",
+          content: "zcode-artifact://zip",
+          filename: "archive.zip",
+          mimeType: "text/plain",
+        },
+        {
+          type: "file",
+          content: "zcode-artifact://big",
+          filename: "server.log",
+          mimeType: "text/plain",
+        },
+        {
+          type: "file",
+          content: "zcode-artifact://fake",
+          filename: "notes.txt",
+          mimeType: "text/plain",
+        },
+      ],
+      {
+        workingDirectory: "/tmp/project",
+        sessionId: createSessionId("s1"),
+        traceContext: { traceId: "trace_uploaded_binary" },
+        artifactStore: {
+          readToolResultArtifact: vi.fn(async ({ uri }) => ({ content: artifacts[uri]! })),
+          writeToolResultBinaryArtifact,
+        } as never,
+      },
+    );
+
+    expect(writeToolResultBinaryArtifact).toHaveBeenCalledTimes(3);
+    expect(resolved[0]).toMatchObject({
+      filename: "archive.zip",
+      url: "zcode-artifact://s1/bin-file-attachment-0",
+      metadata: {
+        artifactUri: "zcode-artifact://zip",
+        originalUrl: "zcode-artifact://zip",
+        storageKind: "local_ref",
+        sizeBytes: zipBytes.byteLength,
+        pathReferenceText: expect.stringContaining("/tmp/artifacts/s1/file-attachment-0.zip"),
+      },
+    });
+    expect(resolved[1]).toMatchObject({
+      filename: "server.log",
+      mime: "text/plain",
+      url: "zcode-artifact://s1/bin-file-attachment-1",
+      metadata: {
+        artifactUri: "zcode-artifact://big",
+        originalUrl: "zcode-artifact://big",
+        storageKind: "local_ref",
+        sizeBytes: largeLogBytes.byteLength,
+        pathReferenceText: expect.stringContaining(
+          "text file is larger than the inline text budget",
+        ),
+      },
+    });
+    expect(resolved[2]).toMatchObject({
+      filename: "notes.txt",
+      mime: "application/octet-stream",
+      url: "zcode-artifact://s1/bin-file-attachment-2",
+      metadata: {
+        artifactUri: "zcode-artifact://fake",
+        originalUrl: "zcode-artifact://fake",
+        storageKind: "local_ref",
+        sizeBytes: fakeTxtBytes.byteLength,
+        pathReferenceText: expect.stringContaining("not a known text attachment"),
+      },
+    });
+  });
+
+  it("原 artifact 缺失/损坏或二进制落盘失败时返回 attachment_read_failed 占位", async () => {
+    const [missingStore] = await resolveTurnAttachments(
+      [{ type: "file", content: "zcode-artifact://x", filename: "a.txt", mimeType: "text/plain" }],
+      {
+        workingDirectory: "/tmp/project",
+        traceContext: { traceId: "trace_missing_store" },
+      },
+    );
+    expect(missingStore).toMatchObject({
+      metadata: { errorCode: "attachment_read_failed", recoverability: "metadata_only" },
+    });
+
+    const [badDataUrl] = await resolveTurnAttachments(
+      [
+        {
+          type: "file",
+          content: "zcode-artifact://bad",
+          filename: "a.zip",
+          mimeType: "application/zip",
+        },
+      ],
+      {
+        workingDirectory: "/tmp/project",
+        sessionId: createSessionId("s1"),
+        traceContext: { traceId: "trace_bad_data_url" },
+        artifactStore: {
+          readToolResultArtifact: vi.fn(async () => ({
+            content: "data:application/zip;base64,%%%",
+          })),
+        } as never,
+      },
+    );
+    expect(badDataUrl).toMatchObject({
+      metadata: { errorCode: "attachment_read_failed", recoverability: "metadata_only" },
+    });
+
+    const [writeFailed] = await resolveTurnAttachments(
+      [
+        {
+          type: "file",
+          content: "zcode-artifact://zip",
+          filename: "a.zip",
+          mimeType: "application/zip",
+        },
+      ],
+      {
+        workingDirectory: "/tmp/project",
+        sessionId: createSessionId("s1"),
+        traceContext: { traceId: "trace_write_failed" },
+        artifactStore: {
+          readToolResultArtifact: vi.fn(async () => ({
+            content: "data:application/zip;base64,UEs=",
+          })),
+          writeToolResultBinaryArtifact: vi.fn(async () => ({ uri: "zcode-artifact://s1/x" })), // 缺少 path
+        } as never,
+      },
+    );
+    expect(writeFailed).toMatchObject({
+      metadata: { errorCode: "attachment_read_failed", recoverability: "metadata_only" },
+    });
   });
 });

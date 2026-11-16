@@ -7374,6 +7374,8 @@ const jaJP: Record<string, string> = {
     "動画の添付ファイル {filename}が大きすぎます（{size}）。{maxSize} 以下に圧縮してから、もう一度お試しください。",
   "chat.attachments.oversizedInlinePdf":
     "PDF の添付ファイル {filename}が大きすぎます（{size}）。{maxSize} 以下に圧縮してから、もう一度お試しください。",
+  "chat.attachments.oversizedInlineFile":
+    "添付ファイル {filename} が大きすぎます（{size}）。1 ファイルあたりの上限は {maxSize} です。",
   "chat.attachments.restoreDropped":
     "再起動後、一部の下書きの添付ファイルを復元できませんでした。もう一度追加してください: {filenames}",
   "chat.attachments.clipboardText": "貼り付けたテキスト",

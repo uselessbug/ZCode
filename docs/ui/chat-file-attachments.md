@@ -37,7 +37,21 @@ Web/inline bytes --------> V4 begin/chunk/commit ---------> ready
 ```
 
 - 本地 desktop 真实路径不伪造上传进度。
-- Web/inline 使用现有 V4 chunk transaction，wire schema 不变；高层 put 提供进度和取消。
+- Web/inline 使用现有 V4 chunk transaction；高层 put 提供进度和取消。仅放宽 `attachment/put` 的
+  `dataBase64` 允许空串（0 字节文件），与 `begin(totalBytes=0, totalChunks=0)` 约束一致。
+- 无 `localPath` 的普通文件（`kind: "file"`，独立 Web / 手机网页）：renderer 不再按扩展名判断文本、
+  不再截断 `textContent`，统一读取真实文件字节，经 V4 `begin/chunk/commit` 上传，得到的
+  `AttachmentRef.bytes` 等于实际上传字节数。大小上限为 `PROTOCOL_V4_LIMITS.attachmentMaxBytes`
+  （20 MiB），超出时在读取字节前抛结构化 `OversizedInlineFileAttachmentError`，由 UI 按 locale 显示
+  `chat.attachments.oversizedInlineFile`，不自动重试、不产生 `begin`。
+- 0 字节文件序列化为 `dataBase64: ""`，上传为 `begin(totalBytes=0, totalChunks=0)`、0 次 `chunk`、
+  1 次 `commit`；浏览器对空 Blob 的 `readAsDataURL` 可能返回无逗号的 `"data:"`，因此序列化层对空文件
+  直接返回空串。媒体（image/video/pdf）空 base64 仍视为无内容。
+- 服务端 `topic-history` 的 `textContent` 与旧草稿恢复的 `textContent` 仍可上传（UTF-8 编码后同走 put），
+  但 renderer 新建的普通文件不再产生 `textContent`。
+- CLI 接收上传后的普通文件 ref：小体积合法 UTF-8 文本可安全内联；二进制文件与大于 64 KiB 的文本落盘为会话内
+  真实文件路径引用，模型通过文件读取工具按需访问，不把全文塞进 prompt。
+- 已发送的普通文件芯片保持静态展示（见下文“已发送图片预览”），不因字节上传而新增打开语义。
 - SSH/WSL/Docker 由桌面 host 把 host-local path 传到 remote runtime 可读的暂存路径，不允许把桌面路径直接交给远程 Agent。
 - relay 和 desktop main 只透传 RPC，不保存附件草稿、进度、queue 或 session 业务状态。
 

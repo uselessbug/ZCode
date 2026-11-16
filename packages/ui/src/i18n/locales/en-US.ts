@@ -7641,6 +7641,8 @@ const enUS: Record<string, string> = {
     "Video attachment {filename} is too large ({size}). Please compress it to {maxSize} or smaller and try again.",
   "chat.attachments.oversizedInlinePdf":
     "PDF attachment {filename} is too large ({size}). Please compress it to {maxSize} or smaller and try again.",
+  "chat.attachments.oversizedInlineFile":
+    "Attachment {filename} is too large ({size}). Maximum size per attachment is {maxSize}.",
   "chat.attachments.restoreDropped":
     "Some draft attachments could not be restored after restart. Please add them again: {filenames}",
   "chat.attachments.clipboardText": "Pasted text",

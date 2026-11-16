@@ -312,4 +312,186 @@ describe("attachment history across durable cold resume", () => {
       }
     },
   );
+
+  it("preserves uploaded artifact-backed text (.json/.vue/empty) and binary/.log files across cold resume", async () => {
+    const f = await fixture();
+    try {
+      const jsonContent = '{"service":"zcode","ok":true}';
+      const vueContent = "<template><p>Hello</p></template>\n";
+      const zipBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xaa, 0xbb]);
+      const largeLogBytes = Buffer.from("log-entry\n".repeat(8000));
+
+      const upload = async (name: string, mime: string, bytes: Buffer) =>
+        f.artifactStore.writeToolResultArtifact({
+          sessionId: f.runtime.sessionId,
+          toolCallId: `upload-${name}`,
+          toolName: "prompt-attachment:upload",
+          content: `data:${mime};base64,${bytes.toString("base64")}`,
+          contentType: "text/plain",
+          retention: "session",
+        });
+
+      const [jsonArt, vueArt, emptyArt, zipArt, logArt] = await Promise.all([
+        upload("config.json", "application/json", Buffer.from(jsonContent)),
+        upload("App.vue", "application/octet-stream", Buffer.from(vueContent)),
+        upload("empty.txt", "text/plain", Buffer.alloc(0)),
+        upload("archive.zip", "application/zip", zipBytes),
+        upload("app.log", "text/plain", largeLogBytes),
+      ]);
+
+      const resolved = await resolveTurnAttachments(
+        [
+          {
+            type: "file",
+            content: jsonArt.uri,
+            filename: "config.json",
+            mimeType: "application/json",
+          },
+          {
+            type: "file",
+            content: vueArt.uri,
+            filename: "App.vue",
+            mimeType: "application/octet-stream",
+          },
+          { type: "file", content: emptyArt.uri, filename: "empty.txt", mimeType: "text/plain" },
+          {
+            type: "file",
+            content: zipArt.uri,
+            filename: "archive.zip",
+            mimeType: "application/zip",
+          },
+          { type: "file", content: logArt.uri, filename: "app.log", mimeType: "text/plain" },
+        ],
+        { ...f.runtime, traceContext: { traceId: "fixture" } },
+      );
+
+      f.history.addEntries(buildRuntimeUserEntriesFromTurn("Inspect uploaded files.", resolved));
+      await f.runtime.persistUserPrompt(
+        createMessageId("uploaded-files"),
+        "Inspect uploaded files.",
+        resolved,
+        { traceId: "fixture" },
+      );
+
+      const cold = await f.cold();
+      const zipPart = cold.messages[0]!.parts.find(
+        (p) => p.type === "file" && p.filename === "archive.zip",
+      );
+      expect(zipPart).toMatchObject({
+        type: "file",
+        metadata: {
+          artifactUri: zipArt.uri,
+          originalUrl: zipArt.uri,
+          storageKind: "local_ref",
+        },
+      });
+      expect(zipPart?.type === "file" && zipPart.url).not.toBe(zipArt.uri);
+      expect(zipPart?.type === "file" && zipPart.url.startsWith("zcode-artifact://")).toBe(true);
+
+      const liveMessages = buildProviderRequestMessages({
+        entries: f.history.toRuntimeEntries(),
+      }).messages;
+      const coldMessages = buildProviderRequestMessages({
+        entries: cold.history.toRuntimeEntries(),
+      }).messages;
+      expect(coldMessages).toEqual(liveMessages);
+      const coldText = coldMessages
+        .map((m) =>
+          typeof m.content === "string"
+            ? m.content
+            : m.content.map((b) => (b.type === "text" ? b.text : "")).join("\n"),
+        )
+        .join("\n");
+      expect(coldText).toContain(jsonContent);
+      expect(coldText).toContain(vueContent);
+      for (const provider of ["anthropic", "openai"] as const) {
+        expect(await captureWire(coldMessages, provider)).toEqual(
+          await captureWire(liveMessages, provider),
+        );
+      }
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("preserves uploaded clipboard-text dual artifact URIs across cold resume and listArtifactReferrers", async () => {
+    const f = await fixture();
+    try {
+      const clipboardText = "clipboard line 1\nclipboard line 2\n";
+      const uploadArt = await f.artifactStore.writeToolResultArtifact({
+        sessionId: f.runtime.sessionId,
+        toolCallId: "upload-clipboard",
+        toolName: "prompt-attachment:upload",
+        content: `data:text/plain;charset=utf-8;base64,${Buffer.from(clipboardText).toString("base64")}`,
+        contentType: "text/plain",
+        retention: "session",
+      });
+      const resolved = await resolveTurnAttachments(
+        [
+          {
+            type: "file",
+            content: uploadArt.uri,
+            filename: "pasted.txt",
+            mimeType: "text/plain",
+            sourceKind: "clipboard-text",
+          },
+        ],
+        { ...f.runtime, traceContext: { traceId: "fixture" } },
+      );
+
+      expect(resolved[0]).toMatchObject({
+        metadata: {
+          artifactUri: uploadArt.uri,
+          originalUrl: uploadArt.uri,
+          storageKind: "local_ref",
+        },
+      });
+      expect(resolved[0]?.url).toMatch(/^zcode-artifact:\/\//);
+      expect(resolved[0]?.url).not.toBe(uploadArt.uri);
+
+      f.history.addEntries(buildRuntimeUserEntriesFromTurn("Inspect clipboard.", resolved));
+      await f.runtime.persistUserPrompt(
+        createMessageId("clip-msg-1"),
+        "Inspect clipboard.",
+        resolved,
+        { traceId: "fixture" },
+      );
+
+      const cold = await f.cold();
+      expect(
+        buildProviderRequestMessages({ entries: cold.history.toRuntimeEntries() }).messages,
+      ).toEqual(buildProviderRequestMessages({ entries: f.history.toRuntimeEntries() }).messages);
+
+      const forkId = createSessionId("attachment-resume-fork");
+      await f.runtime.sessionStore!.createSession({
+        id: forkId,
+        projectID: createProjectId("fixture"),
+        slug: "fork",
+        directory: f.root,
+        title: "fork",
+        version: "1",
+      });
+      const clipPart = cold.messages[0]!.parts.find((p) => p.type === "file")!;
+      await f.runtime.sessionStore!.saveMessage({
+        id: createMessageId("fork-clip-msg"),
+        sessionID: forkId,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "fixture",
+      });
+      await f.runtime.sessionStore!.savePart({
+        ...clipPart,
+        id: "fork-clip-part",
+        sessionID: forkId,
+        messageID: createMessageId("fork-clip-msg"),
+      });
+
+      const referrers = await f.runtime.sessionStore!.listArtifactReferrers?.([
+        f.runtime.sessionId,
+      ]);
+      expect(referrers?.get(f.runtime.sessionId)).toEqual([forkId]);
+    } finally {
+      await f.close();
+    }
+  });
 });

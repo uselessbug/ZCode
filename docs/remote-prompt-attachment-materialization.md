@@ -125,3 +125,14 @@ mobile /remote
   -> 不创建新 runtime，不在 relay/main 保存附件状态
   -> replayable 只恢复已 admission 的 conversation intent，不恢复 renderer-local 上传进度
 ```
+
+## 普通上传文件 URI 物化（runtime-local）
+
+普通文件通过 V4 分块上传为 `zcode-artifact://`（`data:<mime>;base64,...`）后：
+
+1. **协议边界保留 URI**：`attachment-refs.ts` 对普通文件 URI ref 统一输出 `{ content: ref.ref, type: "file", ...displayMeta }`，保留 `sourceKind` 与 `messageCount`，不提前在命令映射层按 UTF-8 解码，也不因 `bytes > 64 KiB` 丢弃 `ref.ref` 或将 `fileName` 冒充本地 `path`。
+2. **runtime 按真实字节分流**：`resolveTurnAttachments` 在通用 inline fallback 之前先读回原 artifact 并解码真实字节：
+   - 满足实际字节 `<= 64 KiB`（含 `0` 字节）、正面文本类型依据（扩充 `isTextLikePath` 并排除 `.zip`/`.docx`/`.xlsx`/`.pptx`/`.jar`/`.apk`/`.wasm`/`.exe`/`.dll`/`.so`/`.dylib`/`.bin` 等二进制扩展名，不单凭宽泛 MIME 放行）、严格 UTF-8 解码成功且无 `0x00` 或非 `\t`/`\n`/`\r` 的 C0 控制字节时，作为安全小文本内联，保留原 `artifactUri` 与完整 `preview.text`。
+   - 二进制文件、未知格式或 `> 64 KiB` 文本文件经 `writeToolResultBinaryArtifact`（`retention: "session"`，规范化扩展名或 `.bin`）在目标 runtime 会话目录落盘为完整原始字节文件，生成 `local_ref` 与包含真实磁盘 `path`、文件名、MIME、真实字节数的 `pathReferenceText`（`> 64 KiB` 文本用 `"text_too_large"`，其余用 `"binary_file"`），同时在 `FilePart` 保留双 artifact 引用（`url` 存新原始字节 URI，`metadata.artifactUri` 与 `metadata.originalUrl` 存原上传 URI）以保障预览与 fork 引用保护。
+   - 若 `artifactStore` 缺失、原 URI 读取/解码失败或落盘失败/无有效路径，返回 `attachment_read_failed` 占位结果，不伪造仅元信息的成功附件。
+   - `clipboard-text` / `topic-history` 经 `writeToolResultBinaryArtifact` 落盘为 `.txt` 文件时，除保留真实磁盘 `path`、`source` 与 `pathReferenceText` 外，同步保留新原始字节 `file.uri`（`url`）及原上传 `inline.artifactUri`（`metadata.artifactUri` / `metadata.originalUrl`），保证冷恢复与 fork 引用保护（`listArtifactReferrers` / `purgeSessionDataWith`）。

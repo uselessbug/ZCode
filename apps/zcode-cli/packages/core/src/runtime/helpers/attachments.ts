@@ -13,9 +13,9 @@ import type {
   TurnId,
 } from "../deps.js";
 import { readTextFileForModel } from "../../tool/handlers/read-text.js";
-import type { ResolvedTurnAttachment } from "../types.js";
+import { INLINE_TEXT_ATTACHMENT_MAX_BYTES, type ResolvedTurnAttachment } from "../types.js";
 import { readInlineAttachmentContent } from "./attachment-artifacts.js";
-import { parseDataUrlHeader } from "./attachment-data-url.js";
+import { isStrictBase64Payload, parseDataUrlHeader } from "./attachment-data-url.js";
 import {
   resolveInlineMediaAttachment,
   resolveLocalMediaAttachment,
@@ -23,6 +23,7 @@ import {
 import { resolvedPlaceholderAttachment } from "./attachment-placeholder.js";
 import { inferImageMimeFromPath } from "./attachment-image.js";
 import {
+  hasPositiveTextAttachmentType,
   inferAttachmentMimeFromPath,
   isDataOrArtifactUrl,
   isTextLikePath,
@@ -142,10 +143,22 @@ async function resolveTurnAttachment(
       { signal: options.abortSignal },
     );
     if (!file.path) throw new Error("Text attachment path unavailable");
-    return resolvedPathReferenceAttachment({ ...attachment, path: file.path }, file.path, {
+    const source: FilePartSource = {
+      type: "file",
+      path: file.path,
+      text: { value: file.path, start: 0, end: file.path.length },
+    };
+    // 修复原因：原分支只传本地磁盘 path，丢失了新原始字节文件的 file.uri 与原上传
+    // inline.artifactUri，导致 fork 后 SqliteSessionStore.listArtifactReferrers 扫不到引用，
+    // 源会话 purge 时误删仍被 fork 会话引用的原始文件。
+    return resolvedPathReferenceAttachment(attachment, file.path, {
+      ...(inline.artifactUri ? { artifactUri: inline.artifactUri } : {}),
       filename: attachment.filename,
       mime: "text/plain",
+      ...(inline.artifactUri ? { originalUrl: inline.artifactUri } : {}),
       sizeBytes: data.length,
+      source,
+      url: file.uri ?? inline.artifactUri ?? file.path,
       reason:
         attachment.sourceKind === "topic-history"
           ? "deferred_topic_history"
@@ -166,6 +179,11 @@ async function resolveTurnAttachment(
           sizeBytes: attachment.sizeBytes,
         },
       );
+    }
+    if (attachment.type === "file" && attachment.content.startsWith("zcode-artifact://")) {
+      // 修复原因：普通上传文件曾落入通用 resolvedInlineAttachment fallback，把整段 data:...base64
+      // 原串当作文本注入 prompt；这里在 fallback 前按真实解码字节分流为安全小文本内联或落盘 local_ref。
+      return await resolveUploadedFileArtifactAttachment(attachment, index, options);
     }
     if (attachment.type !== "image" && !isDataOrArtifactUrl(attachment.content)) {
       return resolvedInlineTextAttachment(attachment, index);
@@ -198,6 +216,212 @@ async function resolveTurnAttachment(
 
   const placeholder = attachment.path ?? `attachment-${index + 1}`;
   return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed");
+}
+
+const VALID_MIME_TYPE_PATTERN = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u;
+
+function decodeUploadedFileDataUrl(
+  content: string,
+  fallbackMime: string,
+): { bytes: Buffer; mediaType: string } | undefined {
+  const commaIndex = content.indexOf(",");
+  if (content.slice(0, "data:".length).toLowerCase() !== "data:" || commaIndex < 0) {
+    return undefined;
+  }
+  const headerParts = content.slice("data:".length, commaIndex).split(";");
+  const rawMediaType = headerParts.shift()?.trim().toLowerCase() ?? "";
+  const mediaType = rawMediaType || fallbackMime;
+  if (!VALID_MIME_TYPE_PATTERN.test(mediaType)) {
+    return undefined;
+  }
+  const payload = content.slice(commaIndex + 1);
+  const isBase64 = headerParts.at(-1)?.trim().toLowerCase() === "base64";
+  if (isBase64) {
+    if (!isStrictBase64Payload(payload)) return undefined;
+    return { bytes: Buffer.from(payload, "base64"), mediaType };
+  }
+  try {
+    return { bytes: Buffer.from(decodeURIComponent(payload), "utf8"), mediaType };
+  } catch {
+    return undefined;
+  }
+}
+
+function hasDisallowedControlBytes(bytes: Uint8Array): boolean {
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index]!;
+    if (byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function decodeSafeUtf8Text(bytes: Uint8Array): string | undefined {
+  if (hasDisallowedControlBytes(bytes)) return undefined;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizedFileExtension(filename: string | undefined): string {
+  if (!filename) return ".bin";
+  const base = basename(filename);
+  const dotIndex = base.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === base.length - 1) return ".bin";
+  const sanitized = base
+    .slice(dotIndex + 1)
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .slice(0, 15)
+    .toLowerCase();
+  return sanitized.length > 0 ? `.${sanitized}` : ".bin";
+}
+
+async function resolveUploadedFileArtifactAttachment(
+  attachment: TurnAttachment,
+  index: number,
+  options: ResolveAttachmentOptions,
+): Promise<ResolvedTurnAttachment> {
+  const placeholder = attachment.path ?? attachment.filename ?? `attachment-${index + 1}`;
+  const fallbackMime =
+    attachment.mimeType?.split(";", 1)[0]?.trim().toLowerCase() || "application/octet-stream";
+
+  if (!options.artifactStore || !attachment.content) {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: fallbackMime,
+    });
+  }
+
+  let artifactContent: string;
+  try {
+    const artifact = await options.artifactStore.readToolResultArtifact(
+      {
+        trace: options.traceContext,
+        uri: attachment.content,
+      },
+      { signal: options.abortSignal },
+    );
+    artifactContent = artifact.content;
+  } catch {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: fallbackMime,
+    });
+  }
+
+  const decoded = decodeUploadedFileDataUrl(artifactContent, fallbackMime);
+  if (!decoded) {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: fallbackMime,
+    });
+  }
+
+  const { bytes, mediaType } = decoded;
+  const hasPositiveTextType = hasPositiveTextAttachmentType(attachment.filename, mediaType);
+  const decodedText = hasPositiveTextType ? decodeSafeUtf8Text(bytes) : undefined;
+
+  if (decodedText !== undefined && bytes.byteLength <= INLINE_TEXT_ATTACHMENT_MAX_BYTES) {
+    const resolvedTextMime =
+      mediaType !== "application/octet-stream"
+        ? mediaType
+        : attachment.filename
+          ? inferAttachmentMimeFromPath(attachment.filename)
+          : "text/plain";
+    return {
+      contentBlock: { type: "text", text: decodedText },
+      filename: attachment.filename,
+      metadata: {
+        artifactUri: attachment.content,
+        originalUrl: attachment.content,
+        preview: {
+          text: decodedText,
+          truncated: false,
+          originalBytes: bytes.byteLength,
+        },
+        recoverability: "provider_ready",
+        sizeBytes: bytes.byteLength,
+        storageKind: "inline",
+      },
+      mime: resolvedTextMime,
+      url: attachment.content,
+    };
+  }
+
+  const reason =
+    decodedText !== undefined && bytes.byteLength > INLINE_TEXT_ATTACHMENT_MAX_BYTES
+      ? "text_too_large"
+      : "binary_file";
+  const resolvedBinaryMime =
+    reason === "text_too_large"
+      ? mediaType !== "application/octet-stream"
+        ? mediaType
+        : attachment.filename
+          ? inferAttachmentMimeFromPath(attachment.filename)
+          : "text/plain"
+      : hasPositiveTextType
+        ? "application/octet-stream"
+        : mediaType;
+
+  const write = options.artifactStore.writeToolResultBinaryArtifact?.bind(options.artifactStore);
+  if (!write || !options.sessionId) {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: resolvedBinaryMime,
+      sizeBytes: bytes.byteLength,
+    });
+  }
+
+  let written: { uri?: string; path?: string };
+  try {
+    written = await write(
+      {
+        sessionId: options.sessionId,
+        turnId: options.turnId,
+        trace: options.traceContext,
+        toolCallId: `file-attachment-${index}`,
+        toolName: "prompt-attachment:file",
+        content: bytes,
+        contentType: resolvedBinaryMime,
+        extension: normalizedFileExtension(attachment.filename),
+        retention: "session",
+      },
+      { signal: options.abortSignal },
+    );
+  } catch {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: resolvedBinaryMime,
+      sizeBytes: bytes.byteLength,
+    });
+  }
+
+  if (!written.path) {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: resolvedBinaryMime,
+      sizeBytes: bytes.byteLength,
+    });
+  }
+
+  const source: FilePartSource = {
+    type: "file",
+    path: written.path,
+    text: { value: written.path, start: 0, end: written.path.length },
+  };
+  return resolvedPathReferenceAttachment(attachment, written.path, {
+    artifactUri: attachment.content,
+    filename: attachment.filename,
+    mime: resolvedBinaryMime,
+    originalUrl: attachment.content,
+    reason,
+    sizeBytes: bytes.byteLength,
+    source,
+    url: written.uri ?? attachment.content,
+  });
 }
 
 async function resolvedInlineAttachment(

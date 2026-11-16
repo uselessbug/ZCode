@@ -29,7 +29,7 @@
 
 Agent 接收该标记后必须把它当作用户上传的临时本地文件附件处理：模型请求里只出现文件路径附件引用，不自动读取文件正文，也不生成 `prompt_attachment` system reminder。只有模型后续显式调用文件读取工具时，临时文件内容才进入上下文。普通用户上传的小型文本文件保持既有行为，可以继续被投影为 Read-like 附件上下文。
 
-普通 Web 没有宿主文件系统时不支持该能力；手机 Web 远控必须通过 shared-host/platform proxy 写到已连接的桌面宿主临时目录，不在手机浏览器本地伪造路径。
+普通 Web 没有宿主文件系统，不能写宿主临时目录，也不伪造 `localPath`：长文本在内存中构造 `File`（`text/plain`，保留 `sourceKind: "clipboard-text"`），发送时读取真实 UTF-8 字节，经 V4 `begin/chunk/commit` 字节上传，上限为 `PROTOCOL_V4_LIMITS.attachmentMaxBytes`（20 MiB），超出报 `chat.attachments.oversizedInlineFile`。renderer 不再按 64K 字符截断正文，`AttachmentRef.bytes` 等于实际 UTF-8 字节数。手机 Web 远控优先通过 shared-host/platform proxy 写到已连接的桌面宿主临时目录，不在手机浏览器本地伪造路径。
 
 ## UI 展示
 

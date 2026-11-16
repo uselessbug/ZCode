@@ -142,7 +142,7 @@ async function editUserQuery(
     throw new V4InputAdmissionRejectedError("proto.invalidPayload", "input must not be empty");
   }
   // 附件映射在 rewind 前完成：引用失效要在截断历史之前暴露，避免半程失败。
-  const attachments = await mapAttachmentRefsToTurnAttachments(record.app, attachmentRefs);
+  const attachments = mapAttachmentRefsToTurnAttachments(attachmentRefs);
   // 编辑重发按新的主动发送处理：只认本次重新 prepare 的卡（本会话 taskId、未过期），
   // 且 Selection 必须真的指向加速 Provider，避免拿旧凭据或跨会话卡加速。
   const highspeedEdit =
@@ -326,7 +326,7 @@ async function retryTurn(
     throw new V4RetryTargetNotLatestError(payload.target.rowId);
   }
   const attachmentRefs = stableAttachmentRefs(resolution.editTarget);
-  const attachments = await mapAttachmentRefsToTurnAttachments(record.app, attachmentRefs);
+  const attachments = mapAttachmentRefsToTurnAttachments(attachmentRefs);
   // retry 与 edit 共用破坏性 branch cut；模型不可用时必须保留原活动分支。
   await preflightCanonicalIntent(
     host,

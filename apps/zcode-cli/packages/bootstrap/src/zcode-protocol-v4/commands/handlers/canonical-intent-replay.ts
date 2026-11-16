@@ -106,7 +106,7 @@ export async function preflightCanonicalIntent(
   editTarget: ConversationEditTarget,
   text: string,
   attachmentRefs: ReturnType<typeof stableAttachmentRefs>,
-  attachments: Awaited<ReturnType<typeof mapAttachmentRefsToTurnAttachments>>,
+  attachments: ReturnType<typeof mapAttachmentRefsToTurnAttachments>,
   highspeed?: CanonicalHighspeed,
 ): Promise<void> {
   if (editTarget.intent.kind === "sendGoalCommand") return;
@@ -136,7 +136,7 @@ export async function startCanonicalIntent(
   editTarget: ConversationEditTarget,
   text: string,
   attachmentRefs: ReturnType<typeof stableAttachmentRefs>,
-  attachments: Awaited<ReturnType<typeof mapAttachmentRefsToTurnAttachments>>,
+  attachments: ReturnType<typeof mapAttachmentRefsToTurnAttachments>,
   highspeed?: CanonicalHighspeed,
   options?: { requireQueue?: boolean },
 ): Promise<void> {

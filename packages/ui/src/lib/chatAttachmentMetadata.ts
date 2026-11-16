@@ -64,17 +64,6 @@ export function inferAttachmentMimeType(filename: string): string {
   return "application/octet-stream";
 }
 
-export function isTextLikeAttachment(attachment: { filename: string; mimeType: string }): boolean {
-  const mimeType = attachment.mimeType || inferAttachmentMimeType(attachment.filename);
-  if (mimeType.startsWith("text/")) {
-    return true;
-  }
-
-  return /\.(cjs|conf|cpp|cs|css|csv|go|h|hpp|html|ini|java|js|json|jsx|log|md|mjs|py|rs|sh|sql|toml|ts|tsx|txt|xml|yaml|yml)$/iu.test(
-    attachment.filename,
-  );
-}
-
 export function formatAttachmentSize(sizeBytes: number): string {
   const mib = sizeBytes / (1024 * 1024);
   return mib >= 1 ? `${mib.toFixed(mib >= 10 ? 0 : 1)} MB` : `${Math.ceil(sizeBytes / 1024)} KB`;

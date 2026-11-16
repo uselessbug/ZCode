@@ -42,7 +42,10 @@ async function createSession(
   }
   // "已创建 worktree" 只描述 cwd 指向的 worktree；缺 cwd 时没有可绑定的目录。
   if (payload.worktreeCreation && !payload.cwd) {
-    throw new V4InputAdmissionRejectedError("proto.invalidPayload", "worktreeCreation requires cwd");
+    throw new V4InputAdmissionRejectedError(
+      "proto.invalidPayload",
+      "worktreeCreation requires cwd",
+    );
   }
   // 完全空的 firstInput 必须在创建 record 前拒绝，避免失败请求遗留无效 deferred session。
   if (
@@ -107,10 +110,7 @@ async function createSession(
     const durableAdmission =
       (await host.admitInputCommand?.(envelope, sessionId, admission)) ?? null;
     try {
-      const attachments = await mapAttachmentRefsToTurnAttachments(
-        record.app,
-        payload.firstInput.attachments,
-      );
+      const attachments = mapAttachmentRefsToTurnAttachments(payload.firstInput.attachments);
       const intent = inputIntentMetadata(envelope, {
         text: payload.firstInput.text,
         requestedDelivery: "startNow",

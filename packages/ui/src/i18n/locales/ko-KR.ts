@@ -7205,6 +7205,8 @@ const koKR: Record<string, string> = {
     "동영상 첨부 파일 {filename}이(가) 너무 큽니다({size}). {maxSize} 이하로 압축한 후 다시 시도하세요.",
   "chat.attachments.oversizedInlinePdf":
     "PDF 첨부 파일 {filename}이(가) 너무 큽니다({size}). {maxSize} 이하로 압축한 후 다시 시도하세요.",
+  "chat.attachments.oversizedInlineFile":
+    "첨부 파일 {filename}이(가) 너무 큽니다({size}). 파일당 최대 크기는 {maxSize}입니다.",
   "chat.attachments.restoreDropped":
     "다시 시작한 후 일부 초안 첨부 파일을 복원할 수 없습니다. 다시 추가하세요: {filenames}",
   "chat.attachments.clipboardText": "붙여넣은 텍스트",
