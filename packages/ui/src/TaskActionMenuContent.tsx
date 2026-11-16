@@ -25,6 +25,7 @@ export function TaskActionMenuContent({
   disabledReason,
   archiveDisabledReason,
   hideMobileUnsupportedActions = false,
+  canOpenLocalFiles = true,
   Item,
   Separator,
   onTogglePinTask,
@@ -35,6 +36,7 @@ export function TaskActionMenuContent({
   restartPending = false,
   onOpenTaskFeedback,
   onOpenTaskPathInFileManager,
+  onOpenTaskFiles,
   onCopyWorkspacePath,
   onCopyTaskPath,
   onCopyTaskLogPath,
@@ -63,6 +65,8 @@ export function TaskActionMenuContent({
   /** 归档专属的禁用原因（运行中任务）；其余操作不受影响。 */
   archiveDisabledReason?: string;
   hideMobileUnsupportedActions?: boolean;
+  /** 平台可调用本机文件管理器/编辑器；缺省 true 保持桌面原样，Web 传 false。 */
+  canOpenLocalFiles?: boolean;
   Item: React.ComponentType<TaskActionMenuItemProps>;
   Separator: React.ComponentType<TaskActionMenuSeparatorProps>;
   onTogglePinTask: () => void;
@@ -74,6 +78,8 @@ export function TaskActionMenuContent({
   restartPending?: boolean;
   onOpenTaskFeedback?: () => void;
   onOpenTaskPathInFileManager: () => void;
+  /** 无本机文件管理器时的回退入口：在侧栏打开任务工作目录文件树；不传则隐藏该项。 */
+  onOpenTaskFiles?: () => void;
   onCopyWorkspacePath: () => void;
   onCopyTaskPath: () => void;
   onCopyTaskLogPath: () => void;
@@ -141,17 +147,19 @@ export function TaskActionMenuContent({
         </Item>
       ) : null}
       <Separator />
-      {!hideMobileUnsupportedActions ? (
+      {/* 修复原因：独立 Web 无法调用本机文件管理器，改为与桌面侧栏一致的「显示文件树」入口；
+          没有 onOpenTaskFiles（顶栏、手机远控）时两种入口都不显示。 */}
+      {!hideMobileUnsupportedActions && (canOpenLocalFiles || onOpenTaskFiles) ? (
         <Item
           disabled={disableTaskActions}
           title={disableTaskActions ? disabledReason : undefined}
           onSelect={() => {
-            if (!disableTaskActions) {
-              onOpenTaskPathInFileManager();
-            }
+            if (disableTaskActions) return;
+            if (canOpenLocalFiles) onOpenTaskPathInFileManager();
+            else onOpenTaskFiles?.();
           }}
         >
-          {fileManagerLabel}
+          {canOpenLocalFiles ? fileManagerLabel : intl.formatMessage({ id: "git.action.showTree" })}
         </Item>
       ) : null}
       <Item
@@ -190,9 +198,9 @@ export function TaskActionMenuContent({
           {intl.formatMessage({ id: "appHeader.copySessionId" })}
         </Item>
       ) : null}
-      {!hideMobileUnsupportedActions ? (
-        /* Bugfix: 手机远控运行在浏览器里，无法可靠打开桌面端 provider 配置文件。
-           这里只在远控移动端隐藏入口，桌面端仍沿用“路径已知即可前往配置”的能力。 */
+      {!hideMobileUnsupportedActions && canOpenLocalFiles ? (
+        /* Bugfix: 手机远控与独立 Web 运行在浏览器里，无法打开本机 provider 配置文件。
+           这里在这两类环境隐藏入口，桌面端仍沿用“路径已知即可前往配置”的能力。 */
         <Item
           disabled={disableTaskActions || providerConfigFile.loading || !providerConfigFile.path}
           title={disableTaskActions ? disabledReason : undefined}

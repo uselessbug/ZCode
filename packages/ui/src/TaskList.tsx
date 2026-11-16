@@ -52,6 +52,7 @@ export const TaskList = memo(function TaskList({
   mobileActiveTaskKey,
   readOnlyReason,
   onOpenFileTree,
+  onOpenTaskFiles,
   organizationActions,
   renameOnDoubleClick = true,
 }: {
@@ -81,6 +82,8 @@ export const TaskList = memo(function TaskList({
   mobileActiveTaskKey?: string | null;
   readOnlyReason?: string;
   onOpenFileTree?: () => void | Promise<void>;
+  /** 仅供右键菜单「显示文件树」使用，与行 hover 按钮的 onOpenFileTree 门禁相互独立；按菜单所属任务回调。 */
+  onOpenTaskFiles?: (task: ZCodeTaskMeta) => void | Promise<void>;
   renameOnDoubleClick?: boolean;
 }) {
   const { intl } = useZCodeIntl();
@@ -484,6 +487,7 @@ export const TaskList = memo(function TaskList({
                   onStartRenameTask={handleStartRenameTask}
                   onArchiveTask={handleArchiveTask}
                   onMarkTaskAsUnread={handleMarkTaskAsUnread}
+                  onOpenTaskFiles={onOpenTaskFiles}
                   disableTaskActions={Boolean(readOnlyReason)}
                   disabledReason={readOnlyReason}
                 />

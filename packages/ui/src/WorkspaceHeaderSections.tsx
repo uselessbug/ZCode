@@ -176,6 +176,7 @@ export function WorkspaceHeaderTitleSection({
     taskNativeSessionLogFile,
     providerConfigFile,
     fileManagerLabel,
+    canOpenLocalFiles,
     handleCopyText,
     handleOpenTaskPathInFileManager,
     handleOpenProviderConfig,
@@ -562,6 +563,8 @@ export function WorkspaceHeaderTitleSection({
                 intl={intl}
                 isPinned={isPinned}
                 fileManagerLabel={fileManagerLabel}
+                // 顶栏不传 onOpenTaskFiles：Web 下「文件管理器」与「前往配置」两项自动隐藏。
+                canOpenLocalFiles={canOpenLocalFiles}
                 taskSessionFile={taskSessionFile}
                 activeSessionId={activeSessionId}
                 taskNativeSessionLogFile={taskNativeSessionLogFile}

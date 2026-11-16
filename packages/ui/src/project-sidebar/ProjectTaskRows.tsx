@@ -1,4 +1,5 @@
 import { Fragment, memo, useCallback, useContext, useMemo, useState } from "react";
+import type { ZCodeTaskMeta } from "@zcode/shared";
 import type { ProjectTask, ProjectSidebarProps } from "@/project-sidebar/contract.js";
 import { TaskGroupTaskMenu } from "@/project-sidebar/TaskGroupTaskMenu.js";
 import { TaskList } from "@/TaskList.js";
@@ -43,6 +44,22 @@ export const ProjectTaskRow = memo(function Row({
     () => presentation.onOpenTaskFiles?.(task, remoteSessionId ?? undefined),
     [presentation.onOpenTaskFiles, task, remoteSessionId],
   );
+  // TaskList 的菜单回调按 ZCodeTaskMeta 声明（参数逆变不能收窄为 ProjectTask）；
+  // 这里校验菜单所属任务就是当前行，再用带 hostId 的行任务调用，避免未来多任务复用时打开错任务。
+  const openTaskFilesFromPresentation = presentation.onOpenTaskFiles;
+  const openMenuTaskFiles = useCallback(
+    async (menuTask: ZCodeTaskMeta) => {
+      if (menuTask.taskId !== task.taskId) return;
+      await openTaskFilesFromPresentation?.(task, remoteSessionId ?? undefined);
+    },
+    [openTaskFilesFromPresentation, task, remoteSessionId],
+  );
+  // 原因：远端任务必须已有 session 才能解析文件树；手机远控侧栏不提供本机文件入口，菜单里一并隐藏。
+  const canOpenTaskFiles = Boolean(
+    presentation.onOpenTaskFiles &&
+    !presentation.isWebRemoteControl &&
+    (!task.workspaceIdentity?.trim() || remoteSessionId),
+  );
   // 原因：内联 JSX 每次都会创建新引用，导致 TaskList 的 memo 比较失效。
   const organizationActions = useMemo(() => <TaskGroupTaskMenu task={task} />, [task]);
   // 项目身份详情只由项目入口承载；会话行使用任务卡，不复用项目详情。
@@ -67,6 +84,8 @@ export const ProjectTaskRow = memo(function Row({
             ? openFiles
             : undefined
         }
+        // 独立 Web 无本机文件管理器：菜单改用「显示文件树」，不依赖 showFiles（仅置顶区有 hover 按钮）。
+        onOpenTaskFiles={canOpenTaskFiles ? openMenuTaskFiles : undefined}
         showCreateButton={false}
         showFooter={false}
         showEmptyState={false}
