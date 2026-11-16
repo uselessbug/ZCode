@@ -40,13 +40,13 @@ sequenceDiagram
 
 ### 浏览器数据：区分三类浏览器
 
-| 概念                | 运行位置                                             | 设置页行为                                   |
-| ------------------- | ---------------------------------------------------- | -------------------------------------------- |
-| Electron 内置浏览器 | 桌面主进程 `<webview>` guest，`browser-use` 插件驱动 | Chrome 数据导入/清理、忽略证书校验仅桌面可用 |
-| Chromium MCP        | 服务端/Agent 运行所在 Host 的无头 Chromium（MCP）    | 不受内置浏览器数据设置限制，Web 上仍可用     |
-| Web 页面自身浏览器  | 渲染 Web UI 的手机/电脑浏览器                        | 无控制桥；`openExternal` 仅 `window.open`    |
+| 概念                | 运行位置                                                          | 设置页行为                                   |
+| ------------------- | ----------------------------------------------------------------- | -------------------------------------------- |
+| Electron 内置浏览器 | 桌面主进程 `<webview>` guest，`browser-use` 插件驱动              | Chrome 数据导入/清理、忽略证书校验仅桌面可用 |
+| 服务端无头浏览器    | 服务端/Agent 所在 Host 的受管无头 Chromium（官方 Browser Use 等） | 不受内置浏览器数据设置限制，Web 上仍可用     |
+| Web 页面自身浏览器  | 渲染 Web UI 的手机/电脑浏览器                                     | 无控制桥；`openExternal` 仅 `window.open`    |
 
-- `BrowserSettingsSection` 在 `!nativeActionsAvailable` 时按平台区分提示：桌面缺方法用 `settings.browser.desktopOnly`；Web/手机用 `settings.browser.webUnsupported`，明确当前网页无法导入用户电脑 Chrome 数据/清理 Electron 内置浏览器数据，且服务端 Agent 的 Chromium MCP 不受此限制。
+- `BrowserSettingsSection` 在 `!nativeActionsAvailable` 时按平台区分提示：桌面缺方法用 `settings.browser.desktopOnly`；Web/手机用 `settings.browser.webUnsupported`，明确当前网页无法导入用户电脑 Chrome 数据/清理 Electron 内置浏览器数据，且服务端 Agent 使用的无头浏览器不受此限制。
 - 保留已有 `browser-use` 插件开关与安全区（`isDesktop` 门禁），不新增远程浏览器界面或导入协议。
 
 ## 记忆正文：页内查看与最小编辑（本仓新增）
@@ -78,6 +78,7 @@ sequenceDiagram
 1. 云端 Web / 桌面：记忆分区点击某文件进入页内查看，渲染 Markdown 正文；顶部提供复制路径、编辑、关闭。
 2. 进入编辑修改正文并保存：服务器文件内容更新，列表更新时间刷新；重新打开可见新内容。
 3. 读取后文件被外部改写/删除，再保存：提示冲突（`PROJECT_MEMORY_FILE_CHANGED`），**不写入**，编辑框保留草稿；可刷新后重新编辑。
+   - 验收规则：冲突后查看器内的「重新加载」按钮使用专用 testid `settings-memory-reload`（`TID_SETTINGS_MEMORY_RELOAD`），不得复用列表刷新的 `settings-memory-refresh`，两者在页面中各唯一；在确认弹窗取消丢弃时草稿保留，确认丢弃后加载最新文件内容，列表刷新行为不变。
 4. 桌面端行为不变，外部编辑器按钮组在该分区不再出现。
 
 ## 技能“打开路径”与工作区 `.zcodeignore`“打开文件位置”状态说明
@@ -179,4 +180,4 @@ sequenceDiagram
 1. 桌面端：设置页仍为左侧导航 + 内容双栏，导航项在窄窗口保持 68px 图标栏；记忆浏览与浏览器数据行为不变。
 2. 云端 Web / 手机远控（已连桥）：记忆设置可浏览**服务端/被控端**项目记忆，不读手机本机文件；`memoryEnabled` 开关与存储格式不变。
 3. 手机窄屏 Web（`< 640px`，非桌面）：设置页顶部显示返回按钮与横向可滚动分区导航条，下方占满宽度展示当前分区内容，说明文字正常换行、控件不挤压变形；点击返回按钮回到工作区。
-4. Web 设置页“浏览器数据”提示为 `settings.browser.webUnsupported`，说明 Chromium MCP 不受限（独立 HTTP Web 下 Agent 侧 `browser-use` 受管 CDP 边界另见 [独立 HTTP Web Browser Use 规格](standalone-web-browser-use.md)）；桌面端提示不变，Chrome 数据导入/清理按钮在 Web 仍禁用。
+4. Web 设置页“浏览器数据”提示为 `settings.browser.webUnsupported`，说明服务端 Agent 使用的无头浏览器不受限（独立 HTTP Web 下 Agent 侧 `browser-use` 受管 CDP 边界另见 [独立 HTTP Web Browser Use 规格](standalone-web-browser-use.md)）；桌面端提示不变，Chrome 数据导入/清理按钮在 Web 仍禁用。

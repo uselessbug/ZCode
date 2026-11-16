@@ -89,6 +89,8 @@ jobs:
             const db = new DatabaseSync(":memory:");
             if (db.prepare("select 1 as ok").get().ok !== 1) process.exit(1);
             db.close();
+            const pw = createRequire("/app/zcode/agent/zcode.cjs")("playwright-core");
+            if (typeof pw?.chromium?.launch !== "function") process.exit(1);
             const pty = createRequire("/app/zcode/server/entry-http.js")("node-pty");
             const p = pty.spawn("/bin/echo", ["pty-ok"], {cols:80, rows:24});
             let output = "";
@@ -96,7 +98,6 @@ jobs:
             p.onExit(() => process.exit(output.includes("pty-ok") ? 0 : 1));
             setTimeout(() => process.exit(1), 10000).unref();'
           docker run --rm --entrypoint gh zcode:build --version
-          docker run --rm --entrypoint /opt/browser-mcp/node_modules/.bin/playwright-mcp zcode:build --help
           docker run --rm --entrypoint /usr/bin/chromium zcode:build --version
       # 内置插件（含默认 skill-creator）与 bundled-skills 资产必须在镜像内真实落盘。
       # 清单只从只读挂载的仓库读取；命中路径限定在 /app/zcode，避免源码资源造成假通过。

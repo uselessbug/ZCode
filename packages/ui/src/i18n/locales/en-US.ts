@@ -4170,7 +4170,7 @@ const enUS: Record<string, string> = {
   "settings.browser.data.section": "Browser data",
   "settings.browser.desktopOnly": "Browser data can only be managed in the ZCode desktop app.",
   "settings.browser.webUnsupported":
-    "This web page cannot import Chrome sign-in data from your computer or clear the ZCode desktop app's built-in browser data; those are only available in the ZCode desktop app. The server-side agent's Chromium MCP headless browser is not affected.",
+    "This web page cannot import Chrome sign-in data from your computer or clear the ZCode desktop app's built-in browser data; those are only available in the ZCode desktop app. The server-side agent's headless browser is not affected.",
   "settings.browser.import.title": "Import Chrome sign-in state",
   "settings.browser.import.description":
     "Bring your Chrome sign-in state into the built-in browser once, so the AI can open sites you are already signed in to and work more smoothly.",

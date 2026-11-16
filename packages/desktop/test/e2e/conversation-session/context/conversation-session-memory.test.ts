@@ -2,19 +2,28 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  TID_CONFIRM_DIALOG_CONFIRM,
   TID_SETTINGS_BACK_BUTTON,
+  TID_SETTINGS_MEMORY_CONFLICT,
+  TID_SETTINGS_MEMORY_CONTENT,
   TID_SETTINGS_MEMORY_COUNT,
+  TID_SETTINGS_MEMORY_EDIT,
   TID_SETTINGS_MEMORY_FILE,
   TID_SETTINGS_MEMORY_FILE_EDITOR_ACTIONS,
   TID_SETTINGS_MEMORY_FILE_ICON,
   TID_SETTINGS_MEMORY_FILE_NAME,
+  TID_SETTINGS_MEMORY_FILE_OPEN,
   TID_SETTINGS_MEMORY_FILE_UPDATED_AT,
+  TID_SETTINGS_MEMORY_PREVIEW,
   TID_SETTINGS_MEMORY_REFRESH,
+  TID_SETTINGS_MEMORY_RELOAD,
+  TID_SETTINGS_MEMORY_SAVE,
   TID_SETTINGS_MEMORY_SCOPE_ICON,
   TID_SETTINGS_MEMORY_SCOPE_TRIGGER,
   TID_SETTINGS_MEMORY_SEARCH_CLEAR,
   TID_SETTINGS_MEMORY_SEARCH_INPUT,
   TID_SETTINGS_MEMORY_SWITCH,
+  TID_SETTINGS_MEMORY_VIEWER_DIALOG,
   TID_SETTINGS_MEMORY_WORKSPACE,
   TID_SETTINGS_PAGE,
   TID_SETTINGS_SECTION_NAV,
@@ -74,6 +83,8 @@ const PROJECT_MEMORY_UPDATED_INDEX_CONTENT = `${PROJECT_MEMORY_INDEX_CONTENT}\n$
 const SECOND_PROJECT_MEMORY_INDEX_CONTENT =
   "- [Incident review policy](incident-review-policy.md) — preserve the original evidence";
 const REFRESHED_MEMORY_FACT_MARKER = "E2E_MEMORY_SETTINGS_REFRESHED_FACT";
+const CONFLICT_DRAFT_MARKER = "E2E_MEMORY_SETTINGS_CONFLICT_DRAFT";
+const CONFLICT_EXTERNAL_MARKER = "E2E_MEMORY_SETTINGS_CONFLICT_EXTERNAL";
 const MEMORY_ENABLED_MAIN_FIXTURES = [
   { id: "memory-window-default-branch-boundary", index: "initial" },
   { id: "memory-window-default-branch-final", index: "initial" },
@@ -406,8 +417,194 @@ async function verifyMemorySettingsViewer(expectedSessionId: string): Promise<vo
   expect(refreshedScope.label).toContain(SECOND_PROJECT_MEMORY_WORKSPACE_LABEL);
   expect(refreshedScope.countText).toMatch(/3/u);
 
+  await verifyMemoryConflictReload("incident-review-policy.md", SECOND_PROJECT_MEMORY_FACT);
+
   expect((await readProviderCapture()).records).toHaveLength(requestCountBefore);
   await closeSettings(expectedSessionId);
+}
+
+// 回归：查看器内冲突「重新加载」与列表「刷新」必须使用不同 testid，
+// 否则 E2E 与 DOM 查询会命中同一选择器的两个按钮；同时覆盖取消/确认丢弃草稿两条路径。
+async function verifyMemoryConflictReload(fileName: string, filePath: string): Promise<void> {
+  const originalContent = await readFile(filePath, "utf8");
+  const externalContent = `${originalContent}\n${CONFLICT_EXTERNAL_MARKER}\n`;
+  // 只有主体断言全部通过才允许清理失败向外抛出；主体失败时保留原始错误，不被清理错误覆盖。
+  let verified = false;
+  try {
+    await clickTestIdByDom(testId(TID_SETTINGS_MEMORY_FILE_OPEN, fileName), {
+      timeout: 15_000,
+      timeoutMsg: `Memory 列表没有 ${fileName} 的页内查看入口`,
+    });
+    await waitForTestId(TID_SETTINGS_MEMORY_PREVIEW, "Memory 查看器没有显示正文预览");
+    await clickTestIdByDom(TID_SETTINGS_MEMORY_EDIT, {
+      timeout: 15_000,
+      timeoutMsg: "Memory 查看器没有编辑按钮",
+    });
+    await waitForTestId(TID_SETTINGS_MEMORY_CONTENT, "Memory 查看器没有进入编辑态");
+    await setMemoryDraft(CONFLICT_DRAFT_MARKER);
+
+    // 草稿存在后由外部改写真实文件，保存时必须触发 PROJECT_MEMORY_FILE_CHANGED 冲突。
+    await writeFile(filePath, externalContent, "utf8");
+    await clickTestIdByDom(TID_SETTINGS_MEMORY_SAVE, {
+      timeout: 15_000,
+      timeoutMsg: "Memory 查看器没有保存按钮",
+    });
+    await waitForTestId(TID_SETTINGS_MEMORY_CONFLICT, "外部改写后保存没有出现冲突提示");
+    // 冲突必须拒绝覆盖：磁盘上仍是外部写入的版本，而不是用户草稿。
+    expect(await readFile(filePath, "utf8")).toBe(externalContent);
+
+    expect(await countTestId(TID_SETTINGS_MEMORY_RELOAD)).toBe(1);
+    expect(await countTestId(TID_SETTINGS_MEMORY_REFRESH)).toBe(1);
+
+    // 取消丢弃：草稿与冲突提示保持不变。
+    await clickTestIdByDom(TID_SETTINGS_MEMORY_RELOAD, {
+      timeout: 15_000,
+      timeoutMsg: "冲突后没有重新加载按钮",
+    });
+    await waitForTestId(TID_CONFIRM_DIALOG_CONFIRM, "重新加载没有弹出丢弃草稿确认");
+    await clickConfirmDialogCancel();
+    await browser.waitUntil(async () => !(await hasTestId(TID_CONFIRM_DIALOG_CONFIRM)), {
+      timeout: 15_000,
+      timeoutMsg: "取消丢弃后确认弹窗没有关闭",
+    });
+    expect(await readMemoryDraft()).toBe(CONFLICT_DRAFT_MARKER);
+    expect(await hasTestId(TID_SETTINGS_MEMORY_CONFLICT)).toBe(true);
+
+    // 确认丢弃：加载磁盘上的最新内容，退出编辑态与冲突态。
+    await clickTestIdByDom(TID_SETTINGS_MEMORY_RELOAD, {
+      timeout: 15_000,
+      timeoutMsg: "取消后没有重新加载按钮",
+    });
+    await clickTestIdByDom(TID_CONFIRM_DIALOG_CONFIRM, {
+      timeout: 15_000,
+      timeoutMsg: "重新加载没有丢弃草稿确认按钮",
+    });
+    await browser.waitUntil(
+      async () =>
+        !(await hasTestId(TID_SETTINGS_MEMORY_CONFLICT)) &&
+        (await readTestIdText(TID_SETTINGS_MEMORY_PREVIEW)).includes(CONFLICT_EXTERNAL_MARKER),
+      { timeout: 15_000, timeoutMsg: "确认丢弃后没有加载最新文件内容" },
+    );
+    expect(await readTestIdText(TID_SETTINGS_MEMORY_PREVIEW)).not.toContain(CONFLICT_DRAFT_MARKER);
+    expect(await hasTestId(TID_SETTINGS_MEMORY_CONTENT)).toBe(false);
+    verified = true;
+  } finally {
+    await cleanupMemoryConflictFixture(filePath, originalContent, verified);
+  }
+}
+
+// 还原 fixture 并关闭查看器。主体通过时清理失败必须暴露；主体已失败时只尽力清理，
+// 否则清理错误（如脏草稿拦住 Escape）会覆盖真正的失败原因。
+async function cleanupMemoryConflictFixture(
+  filePath: string,
+  originalContent: string,
+  bodyVerified: boolean,
+): Promise<void> {
+  const cleanup = async (): Promise<void> => {
+    await writeFile(filePath, originalContent, "utf8");
+    // 主体中途失败时可能还停在丢弃草稿确认弹窗上；先取消它，再让 Escape 关闭查看器。
+    if (await hasTestId(TID_CONFIRM_DIALOG_CONFIRM)) await clickConfirmDialogCancel();
+    if (!(await hasTestId(TID_SETTINGS_MEMORY_VIEWER_DIALOG))) return;
+    await browser.keys("Escape");
+    // 脏草稿会让关闭先弹出丢弃确认；清理阶段的目标就是丢弃 fixture 草稿，直接确认。
+    await browser.waitUntil(
+      async () => {
+        if (!(await hasTestId(TID_SETTINGS_MEMORY_VIEWER_DIALOG))) return true;
+        if (await hasTestId(TID_CONFIRM_DIALOG_CONFIRM)) {
+          await clickTestIdByDom(TID_CONFIRM_DIALOG_CONFIRM, { timeout: 5_000 });
+        }
+        return false;
+      },
+      { timeout: 15_000, timeoutMsg: "Memory 查看器没有关闭" },
+    );
+  };
+  if (bodyVerified) {
+    await cleanup();
+    return;
+  }
+  await cleanup().catch(() => undefined);
+}
+
+async function waitForTestId(testIdValue: string, timeoutMsg: string): Promise<void> {
+  await browser.waitUntil(() => hasTestId(testIdValue), { timeout: 15_000, timeoutMsg });
+}
+
+function countTestId(testIdValue: string): Promise<number> {
+  return browser.execute(
+    (currentTestId) => document.querySelectorAll(`[data-testid="${currentTestId}"]`).length,
+    testIdValue,
+  );
+}
+
+function readTestIdText(testIdValue: string): Promise<string> {
+  return browser.execute(
+    (currentTestId) =>
+      document.querySelector<HTMLElement>(`[data-testid="${currentTestId}"]`)?.textContent ?? "",
+    testIdValue,
+  );
+}
+
+function readMemoryDraft(): Promise<string> {
+  return browser.execute(
+    (contentTestId) =>
+      document.querySelector<HTMLTextAreaElement>(`[data-testid="${contentTestId}"]`)?.value ?? "",
+    TID_SETTINGS_MEMORY_CONTENT,
+  );
+}
+
+async function setMemoryDraft(value: string): Promise<void> {
+  const dispatched = await browser.execute(
+    ({ contentTestId, nextValue }) => {
+      const textarea = document.querySelector<HTMLTextAreaElement>(
+        `[data-testid="${contentTestId}"]`,
+      );
+      if (!textarea) return false;
+      // 与 setMemorySearch 相同：用原生 setter + input 事件驱动受控 Textarea 的 onChange。
+      // 必须走原型 setter，绕过 React 挂在实例上的 value tracker，否则 React 会认为值未变而忽略事件。
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      if (!setter) return false;
+      setter.call(textarea, nextValue);
+      textarea.dispatchEvent(new InputEvent("input", { bubbles: true, data: nextValue }));
+      return true;
+    },
+    { contentTestId: TID_SETTINGS_MEMORY_CONTENT, nextValue: value },
+  );
+  expect(dispatched).toBe(true);
+  // DOM value 在 setter 调用后必然等于目标值，不能证明 React 收到了 onChange。
+  // 读取 React 已提交的受控 props.value：只有 draft state 更新并重渲染后才会等于目标值。
+  await browser.waitUntil(
+    () =>
+      browser.execute(
+        ({ contentTestId, nextValue }) => {
+          const textarea = document.querySelector<HTMLTextAreaElement>(
+            `[data-testid="${contentTestId}"]`,
+          );
+          if (!textarea) return false;
+          const propsKey = Object.keys(textarea).find((key) => key.startsWith("__reactProps$"));
+          const props = propsKey
+            ? (textarea as unknown as Record<string, { value?: unknown }>)[propsKey]
+            : undefined;
+          return props?.value === nextValue && textarea.value === nextValue;
+        },
+        { contentTestId: TID_SETTINGS_MEMORY_CONTENT, nextValue: value },
+      ),
+    { timeout: 5_000, timeoutMsg: "Memory 草稿输入没有被 React 受控 Textarea 接收" },
+  );
+}
+
+// ConfirmDialog 的取消按钮没有专用 testid；它在确认按钮的同一按钮组内紧邻其前
+// （requiredAcknowledgement 才会省略取消，Memory 丢弃确认不属于该类）。
+async function clickConfirmDialogCancel(): Promise<void> {
+  const clicked = await browser.execute((confirmTestId) => {
+    const confirm = Array.from(document.querySelectorAll<HTMLElement>("[data-testid]")).find(
+      (element) => element.dataset.testid === confirmTestId,
+    );
+    const cancel = confirm?.previousElementSibling;
+    if (!(cancel instanceof HTMLButtonElement) || cancel.disabled) return false;
+    cancel.click();
+    return true;
+  }, TID_CONFIRM_DIALOG_CONFIRM);
+  expect(clicked).toBe(true);
 }
 
 async function openMemoryScopeMenu(): Promise<void> {

@@ -18,6 +18,7 @@ import {
   TID_SETTINGS_MEMORY_COPY_PATH,
   TID_SETTINGS_MEMORY_EDIT,
   TID_SETTINGS_MEMORY_PREVIEW,
+  TID_SETTINGS_MEMORY_RELOAD,
   TID_SETTINGS_MEMORY_SAVE,
   TID_SETTINGS_MEMORY_VIEWER_DIALOG,
 } from "@zcode/shared/test-ids";
@@ -463,7 +464,7 @@ function MemoryFileViewerDialog({
               variant="outline"
               size="sm"
               className="gap-1.5"
-              data-testid={TID_SETTINGS_MEMORY_REFRESH}
+              data-testid={TID_SETTINGS_MEMORY_RELOAD}
               disabled={saving || loading}
               onClick={() => {
                 void confirmDiscard().then((confirmed) => {

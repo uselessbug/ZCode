@@ -84,6 +84,13 @@ sequenceDiagram
      - 异域身份（如 `remote:ssh:*`、`remote:wsl:*`、其他 `remote:server:*` 或同 server 错 `workspacePath`）以及非 runtime-unavailable 异常均严禁回落，原样透传错误。
   3. 无论走热 runtime 还是控制面 carrier，`session/delete/preview` 与 `session/delete/execute` 请求体都完整保留原始 `workspace`（`workspacePath` + `workspaceIdentity`）、`revision` 与 `operationId`，由 CLI `permanent-deletion` 继续执行身份一致性、`revision` 冲突与幂等保护。
 
+### 补充边界：项目恢复的 Host 别名
+
+- 仅在 `web-remote-replayable` 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS=1` 时，由 HTTP 包装把 `restoreProject(id, "local")` 的第二个参数重写为当前服务器 canonical owner；对象内的 `hostId` 与返回结果沿用既有转换。
+- Toast 撤销移除与已移除项目列表恢复共用该路径。重复恢复、roots、主要目录与任务归属由原项目服务处理；其他 Host 参数原样传递，普通桌面与未开启别名的连接不变。
+- 不把 `measureProjectData`、`deleteProjectData` 加入位置参数转换；服务器数据清理仍受 `project.data-local-only` 限制。
+- 回归直接执行源码别名包装，验证恢复参数转换、返回 Host、重复调用及其他 Host/数据清理方法不被额外重写；实际网页撤销、刷新后恢复状态与数据保留另行验收。
+
 ### 补充项：非项目工作模式与项目 root
 
 ```mermaid

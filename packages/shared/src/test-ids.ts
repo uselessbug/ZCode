@@ -509,6 +509,8 @@ export const TID_SETTINGS_MEMORY_CANCEL = "settings-memory-cancel";
 export const TID_SETTINGS_MEMORY_COPY_PATH = "settings-memory-copy-path";
 /** Memory 保存冲突提示 */
 export const TID_SETTINGS_MEMORY_CONFLICT = "settings-memory-conflict";
+/** Memory 保存冲突后查看器内的重新加载按钮（区别于列表刷新按钮） */
+export const TID_SETTINGS_MEMORY_RELOAD = "settings-memory-reload";
 /** 常规设置中的 AskUserQuestion 自动继续开关 */
 export const TID_SETTINGS_ASK_USER_QUESTION_AUTO_RESOLUTION_SWITCH =
   "settings-ask-user-question-auto-resolution-switch";

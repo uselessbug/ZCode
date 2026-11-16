@@ -6,7 +6,7 @@ Use the official WebRemoteControlMobileShell Home/Chat navigation. Do not fake a
 
 Phone acceptance: full-width task home and chat, readable UI (minimum 16px base, respecting larger preferences), 44px main touch targets, dynamic viewport/safe area, visible model label rather than an unexplained cube icon, model/thinking menu within the screen, working back navigation and portrait/landscape recovery. Reuse current model menu and store; no new model state, routing or task framework.
 
-Memory uses the existing connected Host memory service. A false isDesktop flag must not hide a working server memory catalog. Browser settings distinguish Electron-only computer browser import/cache operations from the existing server Chromium MCP. Do not pretend the user's local browser data is accessible remotely.
+Memory uses the existing connected Host memory service. A false isDesktop flag must not hide a working server memory catalog. Browser settings distinguish Electron-only computer browser import/cache operations from the server-side headless browser (Browser Use). Do not pretend the user's local browser data is accessible remotely.
 
 Validate actual phone interactions at 360/390/412px, settings navigation, memory catalog, model menu, themes and wide Web. No paid Argon/Claude calls. DeepSeek assists only within its explicitly assigned files. Tests/build stay in GitHub Actions; only ZCode is replaced after acceptance, with rollback image and data backup.
 

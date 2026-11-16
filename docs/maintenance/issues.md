@@ -2,19 +2,12 @@
 
 本文是独立 Web 与移动端适配问题的唯一维护入口，按用户可见症状记录当前状态。
 
-## 未修复（代码审查发现，1 项）
+## 已修改，待 CI / 部署 / 交互验证（1 项）
 
 1. **独立 Web 项目管理“撤销移除 / 恢复已移除项目”缺少 `restoreProject` Host 别名重写**
    - **症状（代码审查发现，尚未经用户现场复现）**：在独立 Web「设置 -> 项目」移除项目后点击 Toast「撤销」，或在「已移除的项目」中点击恢复时，客户端以位置参数调用 `restoreProject(id, "local")`，服务端路由会因未知本地 Host 报 `project.host-offline`。
    - **已确认根因**：`packages/server/src/http.ts` 的 `createStandaloneProjectAlias` 中 `positionalHostMethods` 仅包含 `deleteProject`、`reorderProjects`、`resolveSessionDirectories`，遗漏了同样以第 2 个位置参数传入 `hostId` 的 `restoreProject(id, hostId)`，导致 `"local"` 未重写为当前服务器 `ownerHostId`。
-   - **状态**：未修复（代码审查发现，待补齐 `positionalHostMethods` 与回归测试）。
-
-## CI 构建已通过 -> 待部署验证（1 项，附 3 项代码清理）
-
-1. **独立 Web / HTTP Server 下官方 `browser-use` 插件 `agent.browsers.list()` 返回 `[]`**
-   - **症状**：官方 `browser-use` 插件已启用且运行模块可加载，但调用 `agent.browsers.list()` 返回 `[]`。
-   - **已确认根因**：环境已安装 Chromium 且发行包内 Playwright 可解析；`services/zcodeAgentService` 缺少 `browserControlExecutor` 时 `agent.browsers.list()` 直接返回 `[]`，桌面端（desktop）已注入而独立 HTTP Server 入口未接线。
-   - **状态**：CI 构建与镜像校验已通过，待部署验证（代码提交 `ab4ab3ac`，同批含 `ce24c4cf` 3 项冗余参数/字段清理；`29c3c4dc` 已通过 GitHub Actions [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) 并发布 `sha-29c3c4dc`，当前线上服务仍运行 `4e959bab`）。CI 与产物证据见[部署与实机验证清单](./standalone-web-deployment-checklist.md)，设计见[Browser Use 规格](../standalone-web-browser-use.md)。
+   - **状态**：已修改，待 CI / 部署 / 交互验证（2026-11-16 已补齐 `restoreProject` 位置参数转换；源码包装与真实项目服务 / SQLite 回归通过，未扩大数据清理权限；线上仍为 `29c3c4dc`。检查证据见[部署与实机验证清单](./standalone-web-deployment-checklist.md)）。
 
 ## 待评估建议与暂缓项（2 项）
 
@@ -27,6 +20,11 @@
    - **状态**：暂缓（低优先级，待实际使用需求明确后再评估）。
 
 ## 已修复
+
+- **独立 Web / HTTP Server 下官方 `browser-use` 插件 `agent.browsers.list()` 返回 `[]`**
+  - **症状**：官方 `browser-use` 插件已启用且运行模块可加载，但调用 `agent.browsers.list()` 返回 `[]`。
+  - **已确认根因**：环境已安装 Chromium 且发行包内 Playwright 可解析；`services/zcodeAgentService` 缺少 `browserControlExecutor` 时 `agent.browsers.list()` 直接返回 `[]`，桌面端（desktop）已注入而独立 HTTP Server 入口未接线。
+  - **状态**：已修复（提交 `ab4ab3ac` 与同批 `ce24c4cf` 3 项冗余代码清理随 `29c3c4dc` 发布镜像 `sha-29c3c4dc` 并部署生效；2026-11-15 网页访问与读取实测通过且用户确认，证据与独立 Browser MCP 移除进展见[部署与实机验证清单](./standalone-web-deployment-checklist.md)，设计见[Browser Use 规格](../standalone-web-browser-use.md)）。
 
 - **设置页删除自定义模型后底部“正在删除模型…”提示持续转圈不消失**
   - **症状**：在「设置 -> 模型供应商」删除模型后，详情栏底部删除进度横幅持续停留在转圈（`pending`）状态，未替换为“已删除”或失败提示。
@@ -94,12 +92,12 @@
 ## 桌面专属能力边界与暂不支持项（非独立 Web 缺陷 / 不计为已修复）
 
 - **技能详情“打开路径”打开服务器目录（独立 Web 暂不支持）**：在「设置 -> 技能」点击技能路径原调用本机文件管理器；此前尝试打开右侧「文件管理」栏因文件树以当前项目为根、无法定位项目外技能目录，已撤回该适配（`SkillsSection` 退回原本地文件管理器调用与失败提示，技能页“当前服务器”范围文案保留）。**不计为功能已修复，独立 Web 暂不支持，不再单独追踪待验证。**
-- **Electron 内置浏览器与本机 Chrome 数据导入/清理**：访问者电脑 Chrome Cookie 导入、内置浏览器缓存清理与证书设置仅适用于桌面端 Electron 内置浏览器；独立 Web 已区分提示。服务端浏览器自动化需区分两条链路：用户级独立 `@playwright/mcp`（`mcp__browser__*`）直接驱动服务端无头 Chromium；官方 `browser-use` 插件走 `agent.browsers.*`（`browserControlExecutor`）链路，独立 HTTP Server 受管无头 Chromium 接线已通过 CI 构建发布，待部署生效（见上方“CI 构建已通过 -> 待部署验证”第 1 项及[Browser Use 规格](../standalone-web-browser-use.md)）。
+- **Electron 内置浏览器与本机 Chrome 数据导入/清理**：访问者电脑 Chrome Cookie 导入、内置浏览器缓存清理与证书设置仅适用于桌面端 Electron 内置浏览器；独立 Web 已区分提示。服务端浏览器自动化统一采用官方 `browser-use` 插件（走 `agent.browsers.*` / `browserControlExecutor` 受管无头 Chromium 链路），已随 `29c3c4dc` 部署并通过网页访问读取验证；早期独立 `@playwright/mcp` 运行态用户级配置已移除，镜像与脚本清理源码改动已完成，待提交/发布/部署（详见[部署与实机验证清单](./standalone-web-deployment-checklist.md)与[Browser Use 规格](../standalone-web-browser-use.md)）。
 - **原生桌面交互（GenUI 沙箱、系统托盘、本机 WSL 等）**：依赖桌面宿主桥接，独立 Web 按平台能力隐藏或给出说明，不伪装为桌面可用。
 
 ## 内部工程与测试标识小项（非用户故障）
 
-- **`MemorySettingsViewer` 冲突重载按钮 `data-testid` 重复**：`packages/ui/src/settings/MemorySettingsViewer.tsx` 中记忆列表顶栏刷新按钮（`SettingsResourceHeaderActions`）与弹窗冲突态“重新加载”按钮（`MemoryFileViewerDialog`）共用 `TID_SETTINGS_MEMORY_REFRESH`（`settings-memory-refresh`），冲突态弹窗打开时 DOM 内存在重复 `data-testid`。不影响用户功能与交互，仅影响自动化测试选择器唯一性。
+- **`MemorySettingsViewer` 冲突重载按钮 `data-testid` 重复（已分离并通过组件回归）**：冲突重载改用 `TID_SETTINGS_MEMORY_RELOAD`（`settings-memory-reload`），列表刷新保留原标识。真实组件浏览器 fixture 验证唯一性、取消保留草稿与确认加载最新文件通过，旧标识变异能被检出；WDIO 回归已补，完整 Electron 用例尚未运行。证据见[部署与实机验证清单](./standalone-web-deployment-checklist.md)。
 
 ## 相关设计说明
 

@@ -4,11 +4,12 @@
 
 在独立 HTTP Web 模式（`packages/server/src/entry-http.ts`）中，Agent 侧通过 `node_repl` 注入的 `agent.browsers.list()` 调用协议方法 `interaction/browserList`，此前由于 `entry-http.ts` 与 `createServerHostServices` 未接入 `browserControlExecutor`，`zcodeAgentService` 始终返回 `{ browsers: [] }`，导致 `agent.browsers.list()` 为空。
 
-独立 HTTP Web 复用官方受管无头 Chromium。浏览器能力分为三条链路：
+独立 HTTP Web 复用官方受管无头 Chromium，区分两种运行环境：
 
 1. **Desktop 内嵌浏览器（`type: "iab"`）**：仅存在于 Electron Desktop（`WebContentsView` + Main CDP），支持界面可见性、Chrome 导入与用户标签接管；独立 HTTP 服务端不引入 Electron。
-2. **外部 `@playwright/mcp` MCP Server**：容器内独立预装的 MCP 工具集（`/opt/browser-mcp`），走 MCP tool 通道，不服务 `agent.browsers.*` JS 运行时接口。
-3. **独立 HTTP 受管 CDP 运行时（`type: "cdp"`）**：复用官方 `@zcode/adapters/browser` 的 `createManagedCdpBrowserRuntime`，由 `@zcode/server` 受管模块 `server-browser-control` 持有并注入 `createServerHostServices`，为 `agent.browsers.*` 提供真实 headless Chromium / Playwright 执行后端。
+2. **独立 HTTP 受管 CDP 运行时（`type: "cdp"`）**：复用官方 `@zcode/adapters/browser` 的 `createManagedCdpBrowserRuntime`，由 `@zcode/server` 受管模块 `server-browser-control` 持有并注入 `createServerHostServices`，为 `agent.browsers.*` 提供真实 headless Chromium / Playwright 执行后端。
+
+独立部署早期预装的外部 `@playwright/mcp` 不服务 `agent.browsers.*`。2026-11-15 官方 Browser Use 网页访问与信息读取验证通过后，移除镜像中的 `/opt/browser-mcp` 安装、专属 CI 探针及当前服务器用户级 `browser` MCP 配置。保留 Chromium、发行包 `agent/node_modules/playwright-core`、Node REPL 与 Browser Use 插件；部署验收脚本直接复用发行包的 `playwright-core`，不再依赖外部 MCP 的间接依赖。
 
 ## 2. 所有者与架构边界
 
@@ -85,5 +86,8 @@ flowchart LR
 ## 5. 验证状态
 
 - 本地真实 Chromium、脚本化 app-server 回归 15 项与发行布局加载器校验通过，涵盖服务协议反向请求、页面读写与截图、隔离、取消、关闭和同一历史会话重新接入。
-- 代码提交 `ab4ab3ac` 随 `29c3c4dc` 已通过 GitHub Actions [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) 全量门禁、容器内 `ci-browser` Browser Use 回归与 ARM64 发行镜像构建校验，并发布镜像 `sha-29c3c4dc`（完整 CI 与镜像 digest 证据见[独立 Web 部署与实机验证清单](maintenance/standalone-web-deployment-checklist.md)）。
-- 待容器部署验证；当前线上运行服务仍为 `4e959bab`，尚未包含本次适配。
+- 代码提交 `ab4ab3ac`（同批含 `ce24c4cf` 清理）随 `29c3c4dc` 通过 GitHub Actions [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) 全量门禁、容器内 `ci-browser` Browser Use 回归与 ARM64 发行镜像构建校验，并发布镜像 `sha-29c3c4dc`（完整 CI 与镜像 digest 证据见[独立 Web 部署与实机验证清单](maintenance/standalone-web-deployment-checklist.md)）。
+- 2026-11-15 镜像 `sha-29c3c4dc`（源码 `29c3c4dc0ecfe54b640b40a332a97862619787af`）已部署上线（容器 `healthy`、`restarts: 0`），线上网页访问与读取实测通过且用户确认（具体验证范围与证据见[独立 Web 部署与实机验证清单](maintenance/standalone-web-deployment-checklist.md)）。
+- 独立 Browser MCP 移除进展：
+  - **运行时配置已移除**：当前服务器 `/home/agent/.zcode/cli/config.json` 已删除 `mcp.servers.browser`（保留 `mcp.servers.rea` 与官方 `browser-use` 插件），新会话不再按此配置加载；存量会话已运行的 `playwright-mcp` 连接不立即热卸载，随会话重载释放；配置删除后复测 `browser-use` 网页读取正常。
+  - **源码安装移除待后续 CI 镜像发布与部署**：`Dockerfile` `/opt/browser-mcp` 安装与 CI 独立探针移除、6 个部署脚本迁移至发行包 `playwright-core` 及设置提示/`mobileParity` 断言清理等源码改动已完成，本地针对性检查通过，待提交/发布/部署；当前运行镜像 `sha-29c3c4dc` 只读层仍含 `/opt/browser-mcp`，留待后续镜像更新消失（检查细目见[独立 Web 部署与实机验证清单](maintenance/standalone-web-deployment-checklist.md)）。

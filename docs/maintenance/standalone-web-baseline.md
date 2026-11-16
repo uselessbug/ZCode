@@ -9,9 +9,10 @@
   - 模型删除/保存反馈竞态修复提交：`454b2832`
   - CI 依赖安装竞态修复提交：`bf8c2105`
   - 容器内置 Docker CLI / Compose 插件提交：`4e959bab`
+  - 3 项冗余参数/字段清理与独立 HTTP Web 官方 `browser-use` 受管 CDP 适配：`ce24c4cf`、`ab4ab3ac`（发布基线 `29c3c4dc`）
 - 升级前 `main` 基线：`f40a4597`（`docs(maintenance): record standalone MCP deployment acceptance`）
-- 当前状态：`4e959bab` 已合并至 `main` 并由 GitHub Actions 完成构建、校验与镜像发布（`sha-4e959bab`）；已完成宿主容器更新、Agent 基础运行验收（容器 `healthy`、`restarts: 0`，HTTP 页面 `200`、鉴权 `serverinfo` `200` / 未授权 `401`、WebSocket 握手通过，运行日志无启动/凭据/`Unknown channel`/未捕获异常/OOM 关键错误）及 2026-11-15 用户实机验收（模型保存/删除提示、归档任务永久删除、实体手机重连、手机工作区与 `compact-web` 设置页、任务分组、子代理设置与权限弹窗、新建技能/插件试用预填跳转、新建项目目录选择与任务工作区归属均确认正常；归档永久删除同步经运行日志 `previewArchivedTaskDeletion` 与 `permanentlyDeleteArchivedTask` `OK` 印证）。
-- 后续增量（CI 已通过、待部署）：3 项冗余参数/字段清理（`ce24c4cf`）与独立 HTTP Web 官方 `browser-use` 受管 CDP 适配（`ab4ab3ac`）已在 `29c3c4dc` 通过 GitHub Actions [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) 全量校验并发布镜像 `sha-29c3c4dc`（当前线上仍运行 `4e959bab`，CI 与镜像证据见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）；另经代码审查发现 `http.ts` 中 `restoreProject` 遗漏 `positionalHostMethods` 别名重写（未修复，详见 [issues.md](./issues.md)）。
+- 当前状态：线上容器运行 `29c3c4dc`（完整 SHA：`29c3c4dc0ecfe54b640b40a332a97862619787af`，GitHub Actions 运行 [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) `success`，镜像 `sha-29c3c4dc`），容器 `healthy`、`restarts: 0`，基础 HTTP/鉴权/WebSocket 探针通过；`ce24c4cf` 3 项冗余清理已随镜像生效，官方 `browser-use` 2026-11-15 网页访问读取通过且用户确认（具体证据见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）。早前 `4e959bab` 部署阶段已完成运行日志 5446 行无关键错误核验及 2026-11-15 用户实机验收（模型保存/删除提示、归档任务永久删除、实体手机重连、手机工作区与 `compact-web` 设置页、任务分组、子代理设置与权限弹窗、新建技能/插件试用预填跳转、新建项目目录选择与任务工作区归属均确认正常；归档永久删除同步经运行日志 `previewArchivedTaskDeletion` 与 `permanentlyDeleteArchivedTask` `OK` 印证）。
+- 待发布改动（2026-11-16）：`restoreProject` HTTP 位置参数转换、记忆冲突重载专用标识与独立 Browser MCP 镜像 / 脚本 / 文案清理已完成。项目服务 / SQLite 回归与记忆真实组件浏览器 fixture 通过，完整 WDIO 尚未运行；当前服务仍为 `29c3c4dc`。检查细目见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)。
 
 ### 1.1 升级保护能力范围
 
@@ -20,7 +21,7 @@
    - **归档任务删除（3.18.2 用户可见变化）**：采用上游 3.18.2 官方「归档预检 + 二次确认永久删除」及同 Host 归档删除 carrier 路由，不再保留旧版软删除 guard helper，不自动清理既有历史数据（2026-11-15 已实机确认）。
 3. **移动端与输入适配**：手机 Home/Chat 单栏导航与设置页官方 `compact-web` 横向导航布局、子代理颜色选中居中与模型菜单 44px 触控尺寸、权限弹窗子代理来源完整换行与有界滚动、新建技能/插件试用预填自动跳转聊天页、系统原生剪贴板长文本粘贴转内存 `File` 附件。
 4. **服务端记忆、范围文案与目录交互**：项目记忆目录展示与 Markdown 页内预览/编辑/保存、服务端个性化指令（`AGENTS.md`）读写、`settings.scope.server`“当前服务器”文案、从服务器目录添加插件来源、`.zcodeignore` 打开右侧文件栏定位项目根目录（已实现，未单列验收；技能详情打开路径维持撤回、独立 Web 暂不支持）。
-5. **独立 Web MCP 服务端路由与 Node 统一发行包**：独立 Web “当前服务器”与项目 MCP 路由至服务端 Host 读写/启停/重连；`zcode` / `zcode --web` 发行包内置官方插件与 `bundled-skills` 随包组装及容器 `sha-<8位>` 标签发布。
+5. **独立 Web MCP 服务端路由、Browser Use 受管 CDP 与 Node 统一发行包**：独立 Web “当前服务器”与项目 MCP 路由至服务端 Host 读写/启停/重连；独立 HTTP Server 接入官方受管无头 Chromium（`server-browser-control` -> `agent.browsers.*`）；`zcode` / `zcode --web` 发行包内置官方插件与 `bundled-skills` 随包组装及容器 `sha-<8位>` 标签发布。
 
 ### 1.2 3.18.2 凭据强校验与回退限制
 

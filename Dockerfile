@@ -11,9 +11,10 @@ ENV NODE_OPTIONS=--max-old-space-size=8192
 # 串行执行依赖构建及同步，避免并发改写嵌套目录，仍保留 prepare 与原生构建脚本。
 RUN pnpm install --frozen-lockfile --child-concurrency=1
 RUN pnpm typecheck && pnpm lint
-# 依赖就绪即可运行、不需要构建产物的门禁：发行包收集器契约与四个独立 Web/server 验收脚本。
+# 依赖就绪即可运行的发行包契约与独立 Web/server 回归。
 RUN node --test scripts/zcode-distribution.test.mjs scripts/test/dockerfile-install-contract.test.mjs
-RUN pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-memory-files.mjs \
+RUN node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-project-alias.mjs \
+    && pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-memory-files.mjs \
     && pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-multi-root-projects.mjs \
     && node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-mcp-routing.mjs \
     && pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-archived-deletion-carrier.mjs
@@ -95,9 +96,6 @@ RUN set -eu \
     && chmod 0755 /usr/local/bin/gh \
     && rm "/tmp/gh_${GH_CLI_VERSION}_linux_arm64.tar.gz" /tmp/gh-cli-checksums.txt /tmp/gh-cli-release.json \
     && gh --version
-ARG PLAYWRIGHT_MCP_VERSION=0.0.83
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-RUN npm install --prefix /opt/browser-mcp --omit=dev --save-exact @playwright/mcp@${PLAYWRIGHT_MCP_VERSION}
 RUN groupadd --gid 1001 agent && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash agent
 COPY --from=build /runtime/zcode /app/zcode
 RUN mkdir /workspace /artifacts && chown agent:agent /workspace /artifacts

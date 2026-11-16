@@ -4,7 +4,7 @@
 
 ## 1. 上游 3.18.2 升级基线、部署要求与验证清单
 
-- **固定基线与当前状态**：3.18.2 合并与提交链详见 [standalone-web-baseline.md](./standalone-web-baseline.md)。当前线上运行实例为 `4e959bab`（`healthy`），已完成容器部署、Agent 基础运行探针与 2026-11-15 用户实机验收。后续增量 `29c3c4dc`（含 `ab4ab3ac` Browser Use 受管 CDP 适配与 `ce24c4cf` 3 项冗余清理）已通过 GitHub Actions 构建校验并发布 `sha-29c3c4dc` 镜像，待部署切换（见下方“CI 构建已通过、待部署验证”）。
+- **固定基线与当前状态**：3.18.2 合并与提交链详见 [standalone-web-baseline.md](./standalone-web-baseline.md)。当前服务仍为 `29c3c4dc`，容器健康，Browser Use 网页读取已验收。2026-11-16 的项目恢复、记忆重载标识与独立 Browser MCP 清理待本批 CI 和部署验证，细目见下方。
 - **3.18.2 凭据密钥部署要求与步骤说明（保持上游强校验，参见 [`docs/plans/2026-10-29-system-credential-storage.md`](../plans/2026-10-29-system-credential-storage.md)）**：
   - **启动约束与默认路径自动发现（`:99-104`）**：独立 Web HTTP 服务在开放前会初始化凭据后端。无系统 keyring 的部署环境支持：
     - **默认路径自动发现**：当未设置 `ZCODE_CREDENTIAL_SECRET` 与 `ZCODE_CREDENTIAL_SECRET_FILE` 时，服务端按 UTF-8 自动读取 `<zcodeHomeDir>/v2/credential-secret`（容器默认 `/home/agent/.zcode/v2/credential-secret`，32–4096 字节随机文本密钥，权限 `0600`，属主为容器运行 UID `1001`）。若持久化目录中已存在合规的默认密钥文件，直接沿用上游自动发现即可，无须补设 `ZCODE_CREDENTIAL_SECRET_FILE`。
@@ -27,10 +27,16 @@
   - [x] **归档任务删除端到端与实机验证（3.18.2 用户可见变化）**：2026-11-15 用户实机执行归档任务永久删除确认正常；运行日志同步确认 `zcode-task.previewArchivedTaskDeletion`（`2026-11-15T14:00:51.756Z`，`OK 1051ms`）与 `zcode-task.permanentlyDeleteArchivedTask`（`2026-11-15T14:00:56.749Z`，`OK 1143ms`）均成功完成且无对应失败（未声称做独立磁盘逐文件审计）。
   - [x] **设置页删除/保存模型反馈实机验证**：2026-11-15 用户实机确认模型保存与删除提示正常。
   - [x] **移动端、重连与工作区交互实机确认**：2026-11-15 用户实机确认实体手机重连未见明显问题，手机工作区与 `compact-web` 新版设置页、手机子代理设置、权限确认弹窗、新建技能/插件试用预填跳转聊天页、任务分组、新建项目目录选择（默认 `/workspace`）以及任务工作区归属均正常。
-- **CI 构建已通过、待部署验证（镜像已发布，当前线上仍运行 `4e959bab`）**：
-  - **统一 CI 与发布产物证据**：提交链 `ce24c4cf`（3 项冗余参数/字段清理）→ `ab4ab3ac`（独立 HTTP Web `browser-use` 受管 CDP 接线）→ `29c3c4dc`，GitHub Actions 运行 [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) `success`（`typecheck`、`lint`、架构检查、`ci-browser` Browser Use 真实 Chromium 回归、ARM64 发行镜像构建、native 工具、随包资源与 HTTP 鉴权探针全部通过），已发布镜像 `latest` 与 `sha-29c3c4dc`（digest `sha256:afef497a850fb3424f125be498badc2206e818eb301349b6c5d0508b2e007b00`）。
-  - [ ] **独立 HTTP Web 官方 `browser-use`（`agent.browsers.*`）线上部署与验证**（代码 `ab4ab3ac`，规格见 [`docs/standalone-web-browser-use.md`](../standalone-web-browser-use.md)）：CI 与镜像构建校验已通过，待部署至运行容器并完成线上实测。
-  - [ ] **3 项冗余代码清理随镜像部署生效**（代码 `ce24c4cf`：移除 `rootStartupGate` 未使用 `providerStartupSyncPending` 参数、`ConversationTimeline` 废弃 `compactForRemoteControl` 属性、`scripts/zcode-distribution/assets.mjs` 未使用 `version` 字段）：CI 已通过，随 `sha-29c3c4dc` 或后续镜像部署生效。
+- **已完成 `29c3c4dc` 部署、Browser Use 实测及独立 Browser MCP 移除进展（2026-11-15）**：
+  - **统一 CI 与发布产物证据**：提交链 `ce24c4cf`（3 项冗余参数/字段清理）→ `ab4ab3ac`（独立 HTTP Web `browser-use` 受管 CDP 接线）→ `29c3c4dc`，GitHub Actions 运行 [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) `success`（`typecheck`、`lint`、架构检查、`ci-browser` Browser Use 真实 Chromium 回归、ARM64 发行镜像构建、native 工具、随包资源与 HTTP 鉴权探针全部通过），发布镜像 `latest` 与 `sha-29c3c4dc`（digest `sha256:afef497a850fb3424f125be498badc2206e818eb301349b6c5d0508b2e007b00`）。
+  - [x] **`29c3c4dc` 容器部署、健康探针与 3 项冗余代码清理生效**（代码 `ce24c4cf`）：线上容器核实运行源码 `29c3c4dc0ecfe54b640b40a332a97862619787af`，状态 `healthy`（`restarts: 0`），HTTP 首页 `200`、鉴权 `serverinfo` `200` / 未授权 `401`、WebSocket 握手通过，检查启动日志 70 行无匹配关键错误；移除 `rootStartupGate` 未使用 `providerStartupSyncPending` 参数、`ConversationTimeline` 废弃 `compactForRemoteControl` 属性、`scripts/zcode-distribution/assets.mjs` 未使用 `version` 字段均已随镜像部署生效。
+  - [x] **独立 HTTP Web 官方 `browser-use`（`agent.browsers.*`）线上部署与网页访问/读取验证**（代码 `ab4ab3ac`，规格见 [`docs/standalone-web-browser-use.md`](../standalone-web-browser-use.md)）：在线上会话中经 `browser-use` 技能 -> `mcp__node_repl__js` -> `agent.browsers` 成功访问 `https://example.com/`，读取标题 `Example Domain`、多语正文及 `Learn more` 链接 `https://iana.org/help/example-domains`，用户确认“看起来没问题”（本轮仅验证访问与读取，其余交互不扩称为已全部线上验收）。
+  - [x] **移除当前服务器用户级 `browser` MCP 配置并复测 `browser-use`**：按用户授权从 `/home/agent/.zcode/cli/config.json` 删除 `mcp.servers.browser`，保留 `mcp.servers.rea` 与官方 `browser-use` 插件；删除后重新通过 `browser-use` 运行时列出原 `example.com` 标签并读取 `title`、`url` 与 `domSnapshot`（`Example Domain`、正文及 `Learn more` 链接）成功，确认配置移除不影响官方 `browser-use` 网页读取。新会话不再按此配置加载 `browser` MCP；现有存量会话已运行的 `playwright-mcp` 进程与工具目录不立即热卸载，随会话重载自然释放，无须为此重启服务或强杀其他会话。
+- **待发布批次（2026-11-16，当前线上仍为 `29c3c4dc`）**：
+  - [ ] **项目恢复**：已补齐 `restoreProject` 位置参数转换，不扩大数据清理权限。`standalone-project-alias.mjs` 执行源码包装与真实项目服务 / SQLite，覆盖恢复、幂等、roots / 主目录 / 任务保留、重开数据库、其他 Host 及 `data-local-only`；恢复旧白名单的负向对照失败。尚未穿过 HTTP / WebSocket 或实际网页。
+  - [ ] **独立 Browser MCP 移除**：镜像安装、专属 CI 探针、6 个部署脚本的依赖与设置页中英文旧文案均已清理；当前运行镜像的 `/opt/browser-mcp` 随后续部署移除。
+  - [ ] **记忆冲突重载标识**：新增 `settings-memory-reload`，列表保留 `settings-memory-refresh`。真实 `MemorySettingsViewer` 与 `ConfirmDialogHost` 浏览器 fixture 通过冲突、标识唯一、取消保留草稿、确认加载外部内容及清理；旧标识变异如期失败。fixture 替换了 Markdown 等无关依赖，完整 WDIO / Electron 回归已补但未运行。
+  - **本地检查**：全仓 `pnpm lint` 通过（0 errors、539 条既有 warnings），架构检查 0 违规，SQLite 结构契约 8/8，Dockerfile 契约通过。`pnpm typecheck` 因缺少 `vitest` / Node 类型依赖失败；发行包与 Dockerfile 契约合计 12 项中 10 通过、2 项缺少 node-pty x64 预构建或 `@hono/node-server`；架构工具 61 项中 52 通过、9 项缺少完整 `oxlint` 包路径。完整依赖检查与镜像构建交由 CI，不能把本地环境失败记为通过。
 
 ---
 
@@ -86,13 +92,13 @@
 
 - **实机验证结果（2026-11-13）**：已通过。用户部署后确认独立云端 Web「设置 -> MCP」中“当前服务器”已安装列表为空（`已安装 0`、`browser` / `rea` 不显示）问题已修复完成。
 - **后续回归关注要点**：
-  - 在“当前服务器”与具体项目间切换，用户级 MCP（如 `browser`、`rea`）与项目级 MCP 在“已安装”分组正常展示并刷新连接状态。
+  - 在“当前服务器”与具体项目间切换，用户级 MCP（如 `rea`；历史验收时含已移除的 `browser`）与项目级 MCP 在“已安装”分组正常展示并刷新连接状态。
   - 新增、编辑、删除、启停 MCP 持久化到当前服务器，刷新页面或重连后保持；首次加载不闪现假空列表；Desktop 本机、手机 `/remote` 与跨 Host 远端行为不退化。
 
-## 4. 未修复项、暂缓项与内部小项
+## 4. 待验证改动、暂缓项与内部小项
 
-- **未修复（代码审查发现，尚未经用户现场复现）**：`packages/server/src/http.ts` 的 `createStandaloneProjectAlias` 中 `positionalHostMethods` 遗漏 `restoreProject`，独立 Web 下撤销移除项目或恢复已移除项目时 `"local"` 未重写为 `ownerHostId`。
+- **已修改，待 CI / 部署 / 交互验证**：`packages/server/src/http.ts` 的 `createStandaloneProjectAlias` 已将 `restoreProject` 补入 `positionalHostMethods`（不开放 data methods；状态与后续验证见第 1 节及 [issues.md](./issues.md)）。
 - **暂缓 / 暂不做**：
   - 设置页“记忆”列表项菜单直接“编辑”入口（暂不做，页内点击查看与编辑已可用）。
   - 依赖宿主专属容器的插件自定义交互页（UI Plugin）独立 Web 承载（暂缓，低优先级）。
-- **内部工程小项（非用户故障）**：`MemorySettingsViewer.tsx` 列表刷新与冲突弹窗重载按钮共用 `TID_SETTINGS_MEMORY_REFRESH`。
+- **内部工程小项（非用户故障）**：记忆列表刷新与冲突重载已分离测试标识，真实组件 fixture 通过，完整 WDIO 尚未运行（见第 1 节与 [issues.md](./issues.md)）。

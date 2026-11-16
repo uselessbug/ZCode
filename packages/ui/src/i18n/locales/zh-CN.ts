@@ -3906,7 +3906,7 @@ const zhCN: Record<string, string> = {
   "settings.browser.data.section": "浏览器数据",
   "settings.browser.desktopOnly": "浏览器数据只能在 ZCode 桌面端管理。",
   "settings.browser.webUnsupported":
-    "当前网页无法导入你电脑上 Chrome 的登录数据，也无法清理 ZCode 桌面端内置浏览器的数据，这两项仅在 ZCode 桌面端可用。服务端 Agent 使用的 Chromium MCP 无头浏览器不受此限制。",
+    "当前网页无法导入你电脑上 Chrome 的登录数据，也无法清理 ZCode 桌面端内置浏览器的数据，这两项仅在 ZCode 桌面端可用。服务端 Agent 使用的无头浏览器不受此限制。",
   "settings.browser.import.title": "导入 Chrome 登录状态",
   "settings.browser.import.description":
     "一次性把 Chrome 登录状态带到内置浏览器，AI 就能直接打开你已经登录的网站，操作更流畅。",

@@ -346,7 +346,7 @@ export function BrowserSettingsSection({
           <div className="rounded-lg border border-border bg-surface px-4 py-3 text-ui-base text-foreground-subtle">
             {intl.formatMessage({
               // Electron 内置浏览器的数据导入/清理只在桌面端存在；Web 页面没有该能力，
-              // 但服务端 Agent 使用的 Chromium MCP 无头浏览器不受此限制。
+              // 但服务端 Agent 使用的无头浏览器不受此限制。
               id: isDesktop ? "settings.browser.desktopOnly" : "settings.browser.webUnsupported",
             })}
           </div>

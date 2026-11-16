@@ -102,7 +102,8 @@ function projectHost(value: unknown, from: string, to: string): any {
 
 function createStandaloneProjectAlias<T extends object>(service: T, ownerHostId: string): T {
   if (!ownerHostId || ownerHostId === 'local') throw new Error('Canonical remote owner required');
-  const positionalHostMethods = new Set(['deleteProject', 'reorderProjects', 'resolveSessionDirectories']);
+  // 恢复项目同样以第二个位置参数传 Host，遗漏转换会把 local 错路由到离线 Host。
+  const positionalHostMethods = new Set(['deleteProject', 'restoreProject', 'reorderProjects', 'resolveSessionDirectories']);
   return new Proxy(service, {
     get(target, property) {
       const method = Reflect.get(target, property);
