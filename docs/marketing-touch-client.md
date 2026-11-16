@@ -16,6 +16,15 @@ iframe ready 前不发 hover；ready 后同步当前值。减少动态效果时�
 
 状态：客户端实现完成，本地隔离接口的 macOS App E2E 已通过；真实服务端/官方版本安全校验及其他平台联调待验收。服务端依据 marketing_touch_design.md；本文固定客户端语义，替代旧手动领取 Banner 的 preview 轮询约束。公共展示契约见 cloud-content-dialog.md。
 
+## 非桌面 Web 停用营销轮询（维护分支）
+
+营销 runtime 与轮询器只服务桌面入口。`Root` 未声明 `isDesktop` 的非桌面网页入口（独立 Web、手机网页）下，`MarketingTouchProvider` 的 `createRuntime` 在 `desktop` 为 false 时直接返回 `null`：不创建营销 runtime 和 poller，不挂载 body `MutationObserver`，不发 `marketing-touch.query` RPC，也不请求 `/api/v1/marketing/touch`。消费方沿用既有 `null` 空态，不展示 Banner、Popup 或权益引导。非桌面入口不会进入 `marketingResources.ts`；该文件及 `prepareMarketingHero` 的 `desktop` 参数保持上游签名不变，桌面入口行为和服务端协议不变。
+
+```text
+Root(isDesktop=true)  -> createRuntime -> poller -> /api/v1/marketing/touch
+Root(isDesktop未声明) -> createRuntime 返回 null -> 无 runtime / 无 poller / 无请求
+```
+
 ## 契约与职责
 
 ### 领取结果不再使用 toast（2026-09-14）
@@ -368,7 +377,7 @@ P0 spec/fixture -> P1 DTO/service/adapter -> P2 assets -> P3 controller/poll -> 
 | MTC-07 | 独立 Popup 不叠加；关闭后同 ID 再下发可打开；候选撤下取消         | unit/E2E        |
 | MTC-08 | close cancel、success confirm、结果 close 不重报；失败不阻塞      | unit/E2E        |
 | MTC-09 | hidden暂停/恢复、串行、失败退避、空数组、语言/身份代次            | unit            |
-| MTC-10 | 不用跨窗口历史拦截投放；窄屏/主题/键盘；Web bundle 降级           | integration/E2E |
+| MTC-10 | 不用跨窗口历史拦截投放；窄屏/主题/键盘；非桌面 Web 不创建 runtime | integration/E2E |
 | MTC-11 | 同 ID Banner 关闭/成功后重新下发可展示和上报；旧响应不能复活实例  | unit/E2E        |
 
 fixture 使用本地受控端点、真实 ZIP/哈希与 request ledger，不领取线上套餐。要求 architecture:check、typecheck、lint、相关单测与 App E2E；未实际运行的平台/路径明确留缺口。测试和完成状态另行回填，不引用旧 mock 测试冒充正式接入通过。
@@ -395,7 +404,7 @@ App -> Marketing Touch GET -> URL/hash 授权 -> ZIP prepare/release -> Dialog
 - 下载允许的媒体：PNG/JPEG/WebP（8 MiB），MP4（16 MiB）；不接受 SVG/任意 HTML 作为图片。资源白名单仅由宿主验证过的 GET 响应授予 URL + SHA-256，生产关闭开发 mock 入口仍可加载已授权 ZIP。图片/视频通过校验后的 data URL 消费，ZIP 使用独立安全资源服务。网络请求最多30秒，解码最多10秒；失效后丢弃结果并释放 lease，不保证取消已经送达服务端的业务请求。
 - 缓存目录：宿主应用配置目录下 `cache/content-bundles/<host-instance-uuid>/`，安全解压与引用计数复用现有 ContentBundleCache；不写 workspace，也不把 ZIP entry 直接作为任意磁盘路径。
 - 不使用跨窗口营销 claim 或已处理广播；安全校验和业务请求只承诺当前 Controller 的同步防连点。服务端资格校验是跨窗口领取事实的权威，无法在缺少后端幂等键时承诺全局 exactly-once。
-- Web 复用组件与宿主服务，bundle 使用 fallback，不访问 Desktop loopback。独立 Web/server 若没有宿主 deviceMid，查询在 HTTP 前拒绝，不伪造新设备身份；不改变远控 host attachment 或 task realtime 链路。
+- 非桌面 Web（独立 Web、手机网页）不创建营销 runtime，不访问 Desktop loopback，也不请求营销接口；桌面端沿用宿主服务。独立 Web/server 若没有宿主 deviceMid，查询在 HTTP 前拒绝，不伪造新设备身份；不改变远控 host attachment 或 task realtime 链路。
 - 同 Campaign 的后续下发完全服从服务端，不需要补批次标识。主题、国际化、跨平台资源策略及 desktop-continuous/web-remote-replayable 消息语义不变。
 
 ## 2026-09-10 验证记录
