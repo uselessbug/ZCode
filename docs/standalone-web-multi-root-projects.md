@@ -17,8 +17,8 @@
 | 维度               | 普通远端（真实 Source / 桌面远控） | 独立云端 Web                    |
 | ------------------ | ---------------------------------- | ------------------------------- |
 | 开启条件           | 默认                               | 仅 standalone 装配显式开启      |
-| 项目 root 数量     | 必须 1                             | ≥ 1，可增删                     |
-| root 内容可变      | 否（`remote-root-immutable`）      | 是（至少保留 1 个）             |
+| 项目 root 数量     | 必须 1                             | 0..n，可增删与清空              |
+| root 内容可变      | 否（`remote-root-immutable`）      | 是（允许清空为 0 目录）         |
 | 无项目会话         | 拒绝（`remote-project-required`）  | 允许，cwd 必须在工作区根内      |
 | 任务 cwd 不在 root | 拒绝（`cwd-not-in-roots`）         | 允许，先确认再 `addMissingRoot` |
 | 任务 cwd 增补      | 不允许                             | 允许（`project_roots` 增行）    |
@@ -47,7 +47,7 @@ flowchart TD
   B -->|否| Z["按本地契约继续"]
   B -->|是| C{"allowStandaloneMultiRoot?"}
   C -->|"否: 普通远端"| D["roots != 1 -> remote-single-root-required<br/>变更既有 root -> remote-root-immutable"]
-  C -->|"是: 独立 Web"| E["roots < 1 -> remote-single-root-required<br/>允许增删 root"]
+  C -->|"是: 独立 Web"| E["允许 0..n roots（清空 / 增删 root）<br/>首次 prepareSession 懒建 .zcode/workspace/<id>"]
 ```
 
 ### 移动任务（缺 root）
@@ -85,9 +85,9 @@ sequenceDiagram
 4. 独立 Web `moveTask` 带 `addMissingRoot: true`：项目 roots 增加该 cwd，任务 `project_id` 变为目标项目，任务 `root_path` 与文件不变。
 5. 普通远端 `moveTask` 任务 cwd 不在唯一 root：仍是 `project.cwd-not-in-roots`，且 `addMissingRoot: true` 也不能把项目变成 2 root。
 6. 跨 Host 移动（任务 Host 与项目 Host 不同）仍抛 `project.cross-host-move`。
-7. 独立 Web 不会产生 0 root 项目：新建时未选目录自动分配唯一 root；既有项目提交空 root 集合时沿用原 root。编辑器对独立 Web 的最后一个 root 不提供移除入口，避免「移除后保存没有任何变化」。
-8. UI：独立 Web 项目编辑弹层允许新增 / 移除多个源文件夹、设置主要 root；真实远端仍只有 1 个源文件夹且既有 root 不可移除。真机需人工复核（见验收脚本头部说明）。
+7. 独立 Web 0 目录项目生命周期对齐官方桌面：0 目录新建时保留 `roots: []` 与干净默认名（未填名称时为 `New project` / `defaultName`，磁盘不提前创建目录）；编辑已有项目传入 `roots: []` 时允许清空为 0 目录（`roots: undefined` 保持沿用旧 roots）；首次 `prepareSession({ projectId })` 时复用 `initializeProjectRoot` 在 `<standaloneWorkspaceRoot>/.zcode/workspace/<projectId>` 懒创建并登记工作目录。
+8. UI：独立 Web 项目编辑弹层允许新增 / 移除多个源文件夹（包含清空至 0 个）、设置主要 root；真实远端仍只有 1 个源文件夹且既有 root 不可移除。真机需人工复核（见验收脚本头部说明）。
 
 可重复验收脚本见
-`packages/web/test/e2e/manual-review/pending/standalone-multi-root-projects.mjs`（真实 SQLite + 真实
+`packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-multi-root-projects.mjs`（真实 SQLite + 真实
 `ProjectRepository` / `createProjectService`，逐条覆盖 1–7）。

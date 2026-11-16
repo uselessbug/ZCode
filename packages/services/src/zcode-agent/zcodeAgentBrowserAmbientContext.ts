@@ -34,6 +34,35 @@ export interface BrowserAmbientContextExecutor {
     sessionContext: "live" | "cached";
     command: BrowserCommand;
   }): Promise<{ ok: boolean; [key: string]: unknown }>;
+  /** 任务归档/删除后彻底销毁对应会话的受管浏览器上下文，绝不拉起 Chromium。 */
+  closeTaskSessions?(params: {
+    workspacePath: string;
+    workspaceIdentity?: string;
+    sessionIds: readonly string[];
+  }): Promise<void>;
+}
+
+/** 归档、删除、清理成功后 best-effort 回收无头浏览器上下文；异常仅记 warn，不回滚已提交状态。 */
+export async function closeTaskBrowserSessionsBestEffort(
+  executor: BrowserAmbientContextExecutor | undefined,
+  params: {
+    workspacePath: string;
+    workspaceIdentity?: string;
+    sessionIds: readonly string[];
+  },
+  onWarn?: (error: unknown) => void,
+): Promise<void> {
+  const sessionIds = [...new Set(params.sessionIds.filter((id) => id.trim().length > 0))];
+  if (!executor?.closeTaskSessions || sessionIds.length === 0) return;
+  try {
+    await executor.closeTaskSessions({
+      workspacePath: params.workspacePath,
+      ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+      sessionIds,
+    });
+  } catch (error) {
+    onWarn?.(error);
+  }
 }
 
 interface BrowserAmbientContextTarget {

@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- 独立 HTTP Web Browser Use 全链路与任务生命周期清理集成回归。 */
 // 独立 HTTP Web Browser Use（`agent.browsers.*`）定向回归验收脚本。
 //
 // 针对 docs/standalone-web-browser-use.md 描述的受管无头 CDP 运行时：
@@ -275,7 +276,8 @@ async function buildServicesBundle({ outDir, nodeModulesRoot }) {
     entryPath,
     [
       `export * from ${JSON.stringify(join(REPO_ROOT, "packages/services/src/node.ts"))};`,
-      `export { IZCodeAgentService } from ${JSON.stringify(join(REPO_ROOT, "packages/services/src/zcode-agent/zcodeAgent.ts"))};`,
+      `export { IZCodeAgentService, IZCodeTaskService, IProviderSettingsService } from ${JSON.stringify(join(REPO_ROOT, "packages/services/src/index.ts"))};`,
+      `export { TaskIndexRepo } from ${JSON.stringify(join(REPO_ROOT, "packages/services/src/session/taskIndexRepo.ts"))};`,
       `export { buildServerRemoteWorkspaceIdentity, remoteHostIdFromWorkspaceIdentity } from ${JSON.stringify(join(REPO_ROOT, "packages/shared/src/remote-workspace-identity.ts"))};`,
       "",
     ].join("\n"),
@@ -640,6 +642,338 @@ async function verifyServicesInjection({
   }
 
   await verifyInteractionRpc({ services, factoryModule, playwright, fixtureUrl, buildDir });
+  await verifyTaskLifecycleCleanup({ services, factoryModule, playwright, fixtureUrl });
+}
+
+// 验证归档 / 删除 / 数据清理统一触发 closeTaskSessions，且清理异常不回滚业务状态。
+async function verifyTaskLifecycleCleanup({ services, factoryModule, playwright, fixtureUrl }) {
+  if (
+    typeof services.createLocalServices !== "function" ||
+    !services.IZCodeTaskService ||
+    !services.IZCodeAgentService ||
+    !services.TaskIndexRepo
+  ) {
+    gap("services.lifecycle-cleanup", "services bundle lacks task/agent/repo exports");
+    return;
+  }
+  const root = mkdtempSync(join(tmpdir(), "zcode-verify-browser-lifecycle-"));
+  const workspacePath = join(root, "ws-lifecycle");
+  mkdirSync(workspacePath, { recursive: true });
+  const serverId = "verify-browser-lifecycle";
+  const workerPath = join(root, "lifecycle-worker.mjs");
+  writeFileSync(
+    workerPath,
+    `
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  while (buf.includes("\\n")) {
+    const idx = buf.indexOf("\\n");
+    const line = buf.slice(0, idx).trim();
+    buf = buf.slice(idx + 1);
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if (msg.id === undefined) continue;
+    if (msg.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { protocolName: "ZCode Protocol", protocolVersion: 1 } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "runtime/capabilities") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");
+      continue;
+    }
+    if (msg.method === "provider/refreshRegistry") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { refreshed: true } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "provider/updateAccountConfig") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: {
+          receivedRevision: msg.params.revision ?? "rev-1",
+          providerCount: Array.isArray(msg.params.providers) ? msg.params.providers.length : 0,
+          status: "received",
+        },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "workspace/updateInteractionPreferences") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: {
+          workspace: msg.params.workspace,
+          askUserQuestionAutoResolutionEnabled: msg.params.askUserQuestionAutoResolutionEnabled ?? true,
+          snoozedInteractionCount: 0,
+        },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "workspace/updateModelIoPreferences") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: {
+          workspace: msg.params.workspace,
+          fullRetentionEnabled: msg.params.fullRetentionEnabled ?? false,
+          updatedSessionCount: 0,
+        },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "workspace/updateOffPeakToolPolicy" || msg.method === "workspace/updateDynamicWorkflowPolicy") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: { workspace: msg.params.workspace, enabled: false },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "v4/conversation/subscribe") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: { ack: { subscriptionId: "sub-1", mode: "snapshot", logEpoch: "epoch-1" } },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "v4/sessionsIndex/reconcile" || msg.method === "session/list") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { sessions: [] } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "v4/command") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { status: "accepted", commandId: msg.params.commandId, revisionAtDecision: 1 } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "v4/storage/sessionData/deletionExecute") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { sessionId: msg.params.sessionId, status: "deleted", sessionIds: [msg.params.sessionId, "sess-perm-child"], retainedArtifacts: 0 } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "v4/storage/sessionData/purge") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: {
+          deleted: [{
+            sessionId: "sess-purge-deleted",
+            bytes: 10,
+            sessionIds: ["sess-purge-deleted", "sess-purge-owned-child"],
+          }],
+          kept: [{ sessionId: "sess-purge-kept", reason: "running" }],
+          failed: [{ sessionId: "sess-purge-failed", code: "EACCES" }],
+          memory: [],
+        },
+      }) + "\\n");
+      continue;
+    }
+    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");
+  }
+});
+`,
+  );
+  const savedEnv = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    ZCODE_DATA_BASE_DIR: process.env.ZCODE_DATA_BASE_DIR,
+    ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS: process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS,
+  };
+  process.env.HOME = root;
+  process.env.USERPROFILE = root;
+  process.env.ZCODE_DATA_BASE_DIR = root;
+  process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS = "1";
+
+  const browserHandle = factoryModule.createServerBrowserControl({
+    executablePath: CHROMIUM,
+    loadPlaywright: async () => playwright,
+  });
+  const closedCalls = [];
+  let shouldFailClose = false;
+  const instrumentedExecutor = {
+    list: (input) => browserHandle.executor.list(input),
+    execute: (input) => browserHandle.executor.execute(input),
+    closeTaskSessions: async (params) => {
+      closedCalls.push(params);
+      if (shouldFailClose) throw new Error("simulated closeTaskSessions failure");
+      await browserHandle.executor.closeTaskSessions?.(params);
+    },
+  };
+  let collection;
+  try {
+    const hostId = services.remoteHostIdFromWorkspaceIdentity(
+      services.buildServerRemoteWorkspaceIdentity({ serverId, workspacePath: "/" }),
+    );
+    services.setDataBaseDir(root);
+    await services.migrateApplicationStorage(undefined, hostId);
+    const aliasRepo = new services.SourceServerWorkspaceAliasRepo();
+    const sourceServerWorkspaceService = services.createSourceServerWorkspaceService(aliasRepo, {
+      defaultWorkspaceIdentity: (targetPath) =>
+        services.buildServerRemoteWorkspaceIdentity({ serverId, workspacePath: targetPath }),
+    });
+    const identity = (await sourceServerWorkspaceService.resolveWorkspace({ workspacePath }))
+      .canonicalWorkspaceKey;
+    collection = services.createLocalServices({
+      credentialCipherProvider: { encrypt: async (v) => v, decrypt: async (v) => v },
+      zcodeBuiltinProviderConfigFilePath: join(
+        REPO_ROOT,
+        "config/provider/zcode-builtin.test.json",
+      ),
+      serviceAuthorityMode: "standalone-server",
+      projectStorageHostId: hostId,
+      sourceServerWorkspaceService,
+      allowStandaloneCloudWorkspaces: true,
+      standaloneWorkspaceRoot: root,
+      allowStandaloneMultiRoot: true,
+      browserControlExecutor: instrumentedExecutor,
+      zcodeAgentCommandResolver: () => ({
+        command: process.execPath,
+        args: [workerPath],
+      }),
+    });
+
+    const providerSettings = collection.get(services.IProviderSettingsService);
+    await providerSettings.createPersonalProvider({
+      templateId: "zai-standard-api",
+      providerName: "Browser Lifecycle Provider",
+      initialConfig: {
+        access: { type: "api-key", apiKey: "sk-test-browser-lifecycle" },
+      },
+    });
+
+    const repo = new services.TaskIndexRepo(undefined, hostId);
+    await repo.ensureReady();
+    for (const sid of ["sess-archive-1", "sess-del-1", "sess-perm-1"]) {
+      await repo.applyCliFacts({
+        meta: {
+          taskId: sid,
+          traceId: `trace-${sid}`,
+          title: sid,
+          workspacePath,
+          workspaceIdentity: identity,
+          createdAt: Date.now() - 1000,
+          updatedAt: Date.now() - 1000,
+          mode: "build",
+          provider: "glm",
+        },
+      });
+    }
+    repo.close();
+
+    const taskService = collection.get(services.IZCodeTaskService);
+    const agentService = collection.get(services.IZCodeAgentService);
+
+    // 1. archiveTask 触发 closeTaskSessions
+    await taskService.archiveTask({
+      taskId: "sess-archive-1",
+      workspacePath,
+      workspaceIdentity: identity,
+    });
+    assert.deepEqual(closedCalls.at(-1)?.sessionIds, ["sess-archive-1"]);
+
+    // 2. deleteArchivedTask 触发 closeTaskSessions（且异常时不回滚已提交删除）
+    shouldFailClose = true;
+    const deletedOk = await taskService.deleteArchivedTask({
+      taskId: "sess-archive-1",
+      workspacePath,
+      workspaceIdentity: identity,
+    });
+    assert.equal(deletedOk, true, "closeTaskSessions error must not roll back deleteArchivedTask");
+    assert.deepEqual(closedCalls.at(-1)?.sessionIds, ["sess-archive-1"]);
+    shouldFailClose = false;
+
+    // 3. executeSessionDeletion 成功后触发 closeTaskSessions（含子会话）
+    const delResult = await agentService.executeSessionDeletion({
+      sessionId: "sess-perm-1",
+      workspace: { workspacePath, workspaceIdentity: identity },
+      revision: "rev-1",
+      operationId: "op-1",
+    });
+    assert.equal(delResult.status, "deleted");
+    assert.deepEqual(closedCalls.at(-1)?.sessionIds, ["sess-perm-1", "sess-perm-child"]);
+
+    // 4. purgeSessionData 展开已删会话树全部 sessionIds（parent + owned-child）销毁上下文，
+    //    并严格保留 kept（运行中/被引用）与 failed 会话上下文。
+    const openSessionWithTab = async (sessionId) => {
+      const ctx = makeContext({
+        sessionId,
+        workspaceKey: identity,
+        workspacePath,
+        workspaceIdentity: identity,
+      });
+      const cdp = await listCdp(browserHandle.executor, ctx);
+      const tab = await browserHandle.executor.execute({
+        ...ctx,
+        browserId: cdp.id,
+        browserGeneration: cdp.generation,
+        command: { method: "newTab" },
+      });
+      assert.equal(tab.ok, true);
+      const nav = await browserHandle.executor.execute({
+        ...ctx,
+        browserId: cdp.id,
+        browserGeneration: cdp.generation,
+        command: { method: "navigate", url: fixtureUrl, tabId: tab.tab?.tabId },
+      });
+      assert.equal(nav.ok, true);
+      return { ctx, cdp };
+    };
+    await openSessionWithTab("sess-purge-deleted");
+    await openSessionWithTab("sess-purge-owned-child");
+    const keptSession = await openSessionWithTab("sess-purge-kept");
+
+    const purgeResult = await agentService.purgeSessionData({
+      workspace: { workspacePath, workspaceIdentity: identity },
+      sessionIds: ["sess-purge-deleted", "sess-purge-kept", "sess-purge-failed"],
+      directories: [],
+    });
+    assert.equal(purgeResult.deleted.length, 1);
+    assert.equal(purgeResult.kept.length, 1);
+    assert.deepEqual(closedCalls.at(-1)?.sessionIds, [
+      "sess-purge-deleted",
+      "sess-purge-owned-child",
+    ]);
+
+    for (const destroyedId of ["sess-purge-deleted", "sess-purge-owned-child"]) {
+      const freshCtx = makeContext({
+        sessionId: destroyedId,
+        workspaceKey: identity,
+        workspacePath,
+        workspaceIdentity: identity,
+      });
+      const freshCdp = await listCdp(browserHandle.executor, freshCtx);
+      const listed = await browserHandle.executor.execute({
+        ...freshCtx,
+        browserId: freshCdp.id,
+        browserGeneration: freshCdp.generation,
+        command: { method: "list" },
+      });
+      assert.equal(
+        listed.tabs?.length,
+        0,
+        `${destroyedId} context must be destroyed by purgeSessionData`,
+      );
+    }
+    const keptTabs = await browserHandle.executor.execute({
+      ...keptSession.ctx,
+      requestId: randomUUID(),
+      browserId: keptSession.cdp.id,
+      browserGeneration: keptSession.cdp.generation,
+      command: { method: "list" },
+    });
+    assert.equal(keptTabs.ok, true, "kept session lease must stay active");
+    assert.equal(keptTabs.tabs?.length, 1, "kept session tab must remain preserved");
+
+    pass(
+      "services.lifecycle-cleanup",
+      "archiveTask/deleteArchivedTask/executeSessionDeletion/purgeSessionData(deleted-only) -> closeTaskSessions",
+    );
+  } catch (error) {
+    gap("services.lifecycle-cleanup", error?.stack ?? String(error));
+  } finally {
+    if (collection) await services.disposeServiceResourcesAndWait(collection).catch(() => {});
+    await browserHandle.close().catch(() => {});
+    process.env.HOME = savedEnv.HOME;
+    process.env.USERPROFILE = savedEnv.USERPROFILE;
+    process.env.ZCODE_DATA_BASE_DIR = savedEnv.ZCODE_DATA_BASE_DIR;
+    process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS =
+      savedEnv.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS;
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 async function waitForStubLog(logFile, timeoutMs) {

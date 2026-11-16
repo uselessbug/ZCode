@@ -45,6 +45,10 @@ import type {
 import { ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE } from "./zcodeAgent.js";
 import { formatTaskMetaModelSelectionFromSnapshot } from "./zcodeConfigOptions.js";
 
+import {
+  closeTaskBrowserSessionsBestEffort,
+  type BrowserAmbientContextExecutor,
+} from "./zcodeAgentBrowserAmbientContext.js";
 import { createTaskFacts, type TaskFactMutation } from "#src/task-facts/index.js";
 import {
   assertV4CommandAckOk,
@@ -175,6 +179,7 @@ export interface ZCodeTaskIndexSyncer {
 interface CreateZCodeTaskIndexSyncerOptions {
   agentService: IZCodeAgentService;
   taskIndexRepo: TaskIndexRepo;
+  browserControlExecutor?: BrowserAmbientContextExecutor;
 }
 
 /** phase 终态集合（sessions-index 的 conflated 最新态里判定迁移用）。 */
@@ -586,8 +591,25 @@ export function createZCodeTaskIndexSyncer(
 
   const refreshSessionFacts = (target: ZCodeAgentSessionTarget) =>
     taskFacts.refresh({ ...target, taskId: target.sessionId });
-  const mutateSessionFacts = (target: ZCodeAgentSessionTarget, intent: TaskFactMutation) =>
-    taskFacts.mutate({ ...target, taskId: target.sessionId }, intent);
+  const mutateSessionFacts = async (target: ZCodeAgentSessionTarget, intent: TaskFactMutation) => {
+    const meta = await taskFacts.mutate({ ...target, taskId: target.sessionId }, intent);
+    if (intent.type === "delete") {
+      await closeTaskBrowserSessionsBestEffort(
+        options.browserControlExecutor,
+        {
+          workspacePath: target.workspacePath,
+          ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+          sessionIds: [target.sessionId],
+        },
+        (error) =>
+          logger.warn(undefined, "任务删除后回收浏览器会话失败", {
+            taskId: target.sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+      );
+    }
+    return meta;
+  };
   const mirrorSummary = taskFacts.ingest;
 
   /** phase 终态迁移 → sqlite status 收敛 + 广播 + 回源正文索引。 */
@@ -1095,6 +1117,21 @@ export function createZCodeTaskIndexSyncer(
           workspaceIdentity: target.workspaceIdentity,
           taskId: delta.sessionId,
         })
+        .then(() =>
+          closeTaskBrowserSessionsBestEffort(
+            options.browserControlExecutor,
+            {
+              workspacePath: target.workspacePath,
+              ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+              sessionIds: [delta.sessionId],
+            },
+            (error) =>
+              logger.warn(undefined, "同步 CLI 删除事实后回收浏览器会话失败", {
+                taskId: delta.sessionId,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+          ),
+        )
         .catch((error) => logger.warn(undefined, "同步 CLI 删除事实失败", error));
     }
     state.indexSeq = frame.toSeq;

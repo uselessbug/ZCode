@@ -14,6 +14,9 @@ export const v4SessionDataParamsSchema = z
 export type V4SessionDataParams = z.infer<typeof v4SessionDataParamsSchema>;
 
 const sessionBytesSchema = z.object({ sessionId: z.string().min(1), bytes: bytesSchema }).strict();
+const purgedSessionSchema = sessionBytesSchema
+  .extend({ sessionIds: z.array(z.string().min(1)).optional() })
+  .strict();
 const memoryBytesSchema = z
   .object({ workspacePath: z.string().min(1), bytes: bytesSchema })
   .strict();
@@ -30,7 +33,7 @@ export type V4SessionDataMeasureResult = z.infer<typeof v4SessionDataMeasureResu
  */
 export const v4SessionDataPurgeResultSchema = z
   .object({
-    deleted: z.array(sessionBytesSchema),
+    deleted: z.array(purgedSessionSchema),
     kept: z.array(
       z
         .object({ sessionId: z.string().min(1), reason: z.enum(["running", "referenced"]) })

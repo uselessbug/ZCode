@@ -263,13 +263,13 @@ export class Cron {
     return join(cliStorageRoot, "memories", "projects", `${slug}-${hash}`, "memory");
   };
 
-  // 为 0 会话项目和冷项目分别写入 canonical 记忆文件、路径哈希对照文件、会话文件与检查点。
+  // 为 0 会话项目和冷项目分别写入 canonical 记忆文件、本地路径哈希记忆文件、会话文件与检查点。
   const zeroCanonicalMem = join(memoryDirFor(zeroSessionRoot, zeroIdentity), "MEMORY.md");
   const zeroPathHashMem = join(memoryDirFor(zeroSessionRoot, undefined), "MEMORY.md");
   await mkdir(dirname(zeroCanonicalMem), { recursive: true });
   await mkdir(dirname(zeroPathHashMem), { recursive: true });
   await writeFile(zeroCanonicalMem, "zero-canonical-memory-123"); // 25 bytes
-  await writeFile(zeroPathHashMem, "must-not-be-touched");
+  await writeFile(zeroPathHashMem, "zero-local-path-mem"); // 19 bytes
 
   const coldCanonicalMem = join(memoryDirFor(coldRoot, coldIdentity), "MEMORY.md");
   const coldSessionFile = join(cliStorageRoot, "sessions", coldSessionId, "state.json");
@@ -547,7 +547,8 @@ process.stdin.on("data", async (chunk) => {
       id: zeroProject.id,
       sessions: 0,
       sessionBytes: 0,
-      memoryBytes: Buffer.byteLength("zero-canonical-memory-123"),
+      memoryBytes:
+        Buffer.byteLength("zero-canonical-memory-123") + Buffer.byteLength("zero-local-path-mem"),
       checkpointBytes: 0,
     },
     {
@@ -559,14 +560,16 @@ process.stdin.on("data", async (chunk) => {
     },
   ]);
 
-  // 软删除并彻底清理 0 会话项目与冷项目（冷工作区安全回落管理面进程清理）
+  // 软删除并彻底清理 0 会话项目与冷项目（双记忆命名空间均需释放）
   await web.deleteProject(zeroProject.id, "local");
   const zeroPurged = await web.deleteProjectData(zeroProject.id, "local");
-  assert.equal(zeroPurged.freedBytes, Buffer.byteLength("zero-canonical-memory-123"));
+  assert.equal(
+    zeroPurged.freedBytes,
+    Buffer.byteLength("zero-canonical-memory-123") + Buffer.byteLength("zero-local-path-mem"),
+  );
   assert.equal(zeroPurged.failed, 0);
   await assert.rejects(stat(zeroCanonicalMem), { code: "ENOENT" });
-  // 路径哈希对照文件不得被误删
-  assert.equal(await readFile(zeroPathHashMem, "utf8"), "must-not-be-touched");
+  await assert.rejects(stat(zeroPathHashMem), { code: "ENOENT" });
 
   await web.deleteProject(coldProject.id, "local");
   const coldPurged = await web.deleteProjectData(coldProject.id, "local");
@@ -582,7 +585,14 @@ process.stdin.on("data", async (chunk) => {
   await assert.rejects(stat(coldSessionFile), { code: "ENOENT" });
   await assert.rejects(stat(coldCheckpointFile), { code: "ENOENT" });
 
-  // 3) 热运行 busy 会话命中对应 canonical workspace CLI 返回 kept: running，项目保持软删除可恢复
+  // 3) 热运行 busy 会话命中对应 canonical workspace CLI 返回 kept: running，项目保持软删除可恢复，
+  //    且共享主目录的两个记忆命名空间（本地路径哈希 + canonical 哈希）均受保护不误删。
+  const hotCanonicalMem = join(memoryDirFor(hotRoot, hotIdentity), "MEMORY.md");
+  const hotLocalPathMem = join(memoryDirFor(hotRoot, undefined), "MEMORY.md");
+  await mkdir(dirname(hotCanonicalMem), { recursive: true });
+  await mkdir(dirname(hotLocalPathMem), { recursive: true });
+  await writeFile(hotCanonicalMem, "hot-canonical-keep");
+  await writeFile(hotLocalPathMem, "hot-local-keep");
   const hotProject = await web.saveProject({
     hostId: "local",
     name: "Hot busy project",
@@ -599,6 +609,8 @@ process.stdin.on("data", async (chunk) => {
   assert.equal(hotPurged.runningSessions, 1);
   assert.equal(hotPurged.deletedSessions, 0);
   assert.equal(await readFile(hotSessionFile, "utf8"), "busy-session-bytes");
+  assert.equal(await readFile(hotCanonicalMem, "utf8"), "hot-canonical-keep");
+  assert.equal(await readFile(hotLocalPathMem, "utf8"), "hot-local-keep");
   const stillSoftDeleted = (await web.readProjects({ hostId: "local", includeDeleted: true })).find(
     (p) => p.id === hotProject.id,
   );
@@ -606,33 +618,35 @@ process.stdin.on("data", async (chunk) => {
   const recoveredHot = await web.restoreProject(hotProject.id, "local");
   assert.equal(recoveredHot.deleted, false);
 
-  // 3b) worktree 任务场景：每个可删目录独立解析 canonical workspaceIdentity，不把任务归属身份误套用到 cwd
+  // 3b) worktree 任务场景与多目录独立身份解析：
+  //     - 受管 worktree 任务的 cwd 位于临时 worktree_root 下，其项目记忆归属主 workspacePath，
+  //       即使 worktree 目录已被删除也不把临时 worktree 路径当作独立记忆 root 去估算或误删；
+  //     - 普通多目录项目（非 worktree 任务）的每个可删目录仍独立解析 canonical workspaceIdentity。
   const wtWorkspaceRoot = join(workspace, "wt-main");
-  const wtCwdDir = join(workspace, "wt-worktree-1");
-  await Promise.all([
-    mkdir(wtWorkspaceRoot, { recursive: true }),
-    mkdir(wtCwdDir, { recursive: true }),
-  ]);
+  const wtCwdDir = join(workspace, "wt-worktree-1-deleted");
+  await mkdir(wtWorkspaceRoot, { recursive: true });
   const wtMainIdentity = await resolveDirectoryWorkspaceIdentity(wtWorkspaceRoot);
   const wtCwdIdentity = await resolveDirectoryWorkspaceIdentity(wtCwdDir);
   assert.notEqual(wtMainIdentity, wtCwdIdentity);
   const wtMainMem = join(memoryDirFor(wtWorkspaceRoot, wtMainIdentity), "MEMORY.md");
+  const wtMainLocalPathMem = join(memoryDirFor(wtWorkspaceRoot, undefined), "MEMORY.md");
   const wtCwdMem = join(memoryDirFor(wtCwdDir, wtCwdIdentity), "MEMORY.md");
   const wtCwdPathHashMem = join(memoryDirFor(wtCwdDir, undefined), "MEMORY.md");
   await Promise.all(
-    [wtMainMem, wtCwdMem, wtCwdPathHashMem].map(async (f) => {
+    [wtMainMem, wtMainLocalPathMem, wtCwdMem, wtCwdPathHashMem].map(async (f) => {
       await mkdir(dirname(f), { recursive: true });
     }),
   );
   await writeFile(wtMainMem, "wt-main-123"); // 11 bytes
-  await writeFile(wtCwdMem, "wt-cwd-12345"); // 12 bytes
+  await writeFile(wtMainLocalPathMem, "wt-local-mem!"); // 13 bytes
+  await writeFile(wtCwdMem, "wt-cwd-unrelated");
   await writeFile(wtCwdPathHashMem, "path-hash-untouched");
   const wtProject = await web.saveProject({
     hostId: "local",
     name: "Worktree dir identity check",
     roots: [wtWorkspaceRoot],
   });
-  // 用 SQL 直接写入一个带 worktree root_path 的任务，模拟 worktree cwd 与归属 workspacePath 不同
+  // 用 SQL 直接写入一个带 worktree root_path 的任务，模拟 worktree cwd 与归属 workspacePath 不同（且 worktree 已删）
   db.prepare(
     `INSERT INTO tasks(workspace_key,workspace_path,workspace_identity,task_id,created_at,updated_at,host_id,root_path,project_id,handoff_pending,worktree_root)
      VALUES(?,?,?,?,0,0,?,?,?,1,?)`,
@@ -647,12 +661,47 @@ process.stdin.on("data", async (chunk) => {
     wtCwdDir,
   );
   const wtMeasured = await web.measureProjectData([wtProject.id], "local");
-  assert.equal(wtMeasured.projects[0].memoryBytes, 23);
+  assert.equal(
+    wtMeasured.projects[0].memoryBytes,
+    Buffer.byteLength("wt-main-123") + Buffer.byteLength("wt-local-mem!"),
+    "worktree 任务项目记忆只按主 workspacePath 统计（同时覆盖本地路径哈希与 canonical 双命名空间）",
+  );
   await web.deleteProject(wtProject.id, "local");
   await web.deleteProjectData(wtProject.id, "local");
   await assert.rejects(stat(wtMainMem), { code: "ENOENT" });
-  await assert.rejects(stat(wtCwdMem), { code: "ENOENT" });
+  await assert.rejects(stat(wtMainLocalPathMem), { code: "ENOENT" });
+  assert.equal(
+    await readFile(wtCwdMem, "utf8"),
+    "wt-cwd-unrelated",
+    "worktree 临时目录对应的 unrelated canonical 记忆不得被误删",
+  );
   assert.equal(await readFile(wtCwdPathHashMem, "utf8"), "path-hash-untouched");
+
+  // 多目录项目（非 worktree）：每个可删 root 各自独立解析 canonical workspaceIdentity
+  const multiDir1 = join(workspace, "multi-dir-1");
+  const multiDir2 = join(workspace, "multi-dir-2");
+  await Promise.all([mkdir(multiDir1, { recursive: true }), mkdir(multiDir2, { recursive: true })]);
+  const multiId1 = await resolveDirectoryWorkspaceIdentity(multiDir1);
+  const multiId2 = await resolveDirectoryWorkspaceIdentity(multiDir2);
+  const multiMem1 = join(memoryDirFor(multiDir1, multiId1), "MEMORY.md");
+  const multiMem2 = join(memoryDirFor(multiDir2, multiId2), "MEMORY.md");
+  await Promise.all([
+    mkdir(dirname(multiMem1), { recursive: true }),
+    mkdir(dirname(multiMem2), { recursive: true }),
+  ]);
+  await writeFile(multiMem1, "multi-1-mem"); // 11 bytes
+  await writeFile(multiMem2, "multi-2-mem!"); // 12 bytes
+  const multiProject = await web.saveProject({
+    hostId: "local",
+    name: "Multi root dir identity check",
+    roots: [multiDir1, multiDir2],
+  });
+  const multiMeasured = await web.measureProjectData([multiProject.id], "local");
+  assert.equal(multiMeasured.projects[0].memoryBytes, 23);
+  await web.deleteProject(multiProject.id, "local");
+  await web.deleteProjectData(multiProject.id, "local");
+  await assert.rejects(stat(multiMem1), { code: "ENOENT" });
+  await assert.rejects(stat(multiMem2), { code: "ENOENT" });
 
   // 4) 非 ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE 异常原样透传不吞并、不回落管理面进程
   await agentService.prepareStorage({ workspacePath: errorRoot, workspaceIdentity: errorIdentity });

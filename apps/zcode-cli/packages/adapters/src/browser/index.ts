@@ -24,11 +24,17 @@ import { ManagedCdpSession } from "./session.js";
 export interface ManagedCdpBrowserRuntimeOptions extends BrowserExecutableResolutionOptions {
   closeTimeoutMs?: number;
   loadPlaywright?: () => Promise<PlaywrightChromiumModule>;
+  /** 允许缓存的已释放空闲会话上限，默认 16。 */
+  maxReleasedSessions?: number;
+  /** 已释放空闲会话的回收 TTL（毫秒），默认 30 分钟。 */
+  releasedSessionIdleTtlMs?: number;
 }
 
 export interface ManagedCdpBrowserRuntime {
   browserControlPort: BrowserControlPort;
   close(): Promise<void>;
+  /** 释放会话租约并进入空闲缓存池，保留页面与 Cookie，超出上限或 TTL 到期后再回收。 */
+  releaseSession(sessionId: string): Promise<void>;
 }
 
 interface PendingRequest {
@@ -37,15 +43,27 @@ interface PendingRequest {
   turnId?: string;
 }
 
+interface ReleasedSessionState {
+  releasedAt: number;
+  timer: NodeJS.Timeout;
+}
+
 const DEFAULT_BROWSER_CLOSE_TIMEOUT_MS = 1_500;
+const DEFAULT_MAX_RELEASED_SESSIONS = 16;
+const DEFAULT_RELEASED_SESSION_IDLE_TTL_MS = 30 * 60_000;
 
 class ManagedCdpBrowserControlPort implements BrowserControlPort {
   readonly #browserId = `cdp:${randomUUID()}`;
   readonly #loadPlaywright: () => Promise<PlaywrightChromiumModule>;
   readonly #options: ManagedCdpBrowserRuntimeOptions;
   readonly #closeTimeoutMs: number;
+  readonly #maxReleasedSessions: number;
+  readonly #releasedSessionIdleTtlMs: number;
   readonly #closingSessionIds = new Set<string>();
   readonly #pending = new Map<string, PendingRequest>();
+  readonly #releasedSessions = new Map<string, ReleasedSessionState>();
+  readonly #sessionEpochs = new Map<string, number>();
+  readonly #sessionOpChains = new Map<string, Promise<void>>();
   readonly #sessionPromises = new Map<string, Promise<ManagedCdpSession>>();
   readonly #sessions = new Map<string, ManagedCdpSession>();
   #browser: Browser | undefined;
@@ -60,10 +78,19 @@ class ManagedCdpBrowserControlPort implements BrowserControlPort {
       1,
       Math.trunc(options.closeTimeoutMs ?? DEFAULT_BROWSER_CLOSE_TIMEOUT_MS),
     );
+    this.#maxReleasedSessions = Math.max(
+      0,
+      Math.trunc(options.maxReleasedSessions ?? DEFAULT_MAX_RELEASED_SESSIONS),
+    );
+    this.#releasedSessionIdleTtlMs = Math.max(
+      0,
+      Math.trunc(options.releasedSessionIdleTtlMs ?? DEFAULT_RELEASED_SESSION_IDLE_TTL_MS),
+    );
   }
 
   async list(input: BrowserControlListInput): Promise<BrowserBackendDescriptor[]> {
     await this.ensureBrowser(input.signal);
+    await this.reactivateReleasedSession(input.sessionId);
     return [this.descriptor()];
   }
 
@@ -92,7 +119,7 @@ class ManagedCdpBrowserControlPort implements BrowserControlPort {
     try {
       if (controller.signal.aborted) throw abortError();
       await this.ensureBrowser(controller.signal);
-      const session = await this.ensureSession(input.sessionId);
+      const session = await this.ensureSession(input.sessionId, controller.signal);
       if (controller.signal.aborted) throw abortError();
       dispatched = true;
       const partial = await raceWithAbort(
@@ -124,30 +151,78 @@ class ManagedCdpBrowserControlPort implements BrowserControlPort {
     }
   }
 
+  async releaseSession(sessionId: string): Promise<void> {
+    if (this.#disposed) return;
+    // 先中止当前会话在途请求，再串行化将已有 BrowserContext 迁入已释放空闲池。
+    this.abortPendingForSession(sessionId);
+    const evictions: Promise<void>[] = [];
+    await this.runSerializedSessionOp(sessionId, async () => {
+      if (this.#disposed || this.#closingSessionIds.has(sessionId)) return;
+      const session = this.#sessions.get(sessionId);
+      if (!session) return;
+      // 已处于 released 空闲态且无新活跃操作的会话重复 release 时直接幂等返回。
+      if (this.#releasedSessions.has(sessionId)) return;
+      if (this.#maxReleasedSessions <= 0) {
+        this.#sessions.delete(sessionId);
+        await waitForPromise(session.close(), this.#closeTimeoutMs);
+        if (this.#sessions.size === 0) await this.closeBrowser();
+        return;
+      }
+      const timer = setTimeout(() => {
+        void this.evictIdleSession(sessionId);
+      }, this.#releasedSessionIdleTtlMs);
+      timer.unref?.();
+      this.#releasedSessions.set(sessionId, { releasedAt: Date.now(), timer });
+
+      // 仅在当前 session 队列内同步摘除待 LRU 驱逐条目并从 #sessions 移除，退出当前队列锁后再关闭过期 context，避免跨 session 死锁与并发重入。
+      while (this.#releasedSessions.size > this.#maxReleasedSessions) {
+        const oldestSessionId = this.#releasedSessions.keys().next().value;
+        if (!oldestSessionId) break;
+        this.clearReleasedState(oldestSessionId);
+        const evictedSession = this.#sessions.get(oldestSessionId);
+        this.#sessions.delete(oldestSessionId);
+        if (evictedSession) {
+          evictions.push(this.evictDetachedReleasedSession(oldestSessionId, evictedSession));
+        }
+      }
+    });
+    if (evictions.length > 0) {
+      await Promise.all(evictions);
+    }
+  }
+
   async closeSession(input: BrowserControlListInput): Promise<void> {
     this.#closingSessionIds.add(input.sessionId);
-    for (const pending of this.#pending.values()) {
-      if (pending.sessionId === input.sessionId) pending.controller.abort(abortError());
-    }
-    const creating = this.#sessionPromises.get(input.sessionId);
-    if (creating) {
-      const settled = await waitForPromise(creating, this.#closeTimeoutMs);
-      if (!settled) {
-        // late launch/context 创建完成后仍需再次回收；closingSessionIds 防止它重新登记 session。
-        void creating.then(
-          async () => {
-            if (this.#sessions.size === 0) await this.closeBrowser();
-          },
-          async () => {
-            if (this.#sessions.size === 0) await this.closeBrowser();
-          },
-        );
+    this.#sessionEpochs.set(input.sessionId, (this.#sessionEpochs.get(input.sessionId) ?? 0) + 1);
+    this.abortPendingForSession(input.sessionId);
+    this.clearReleasedState(input.sessionId);
+    try {
+      const pendingChain = this.#sessionOpChains.get(input.sessionId);
+      if (pendingChain) {
+        await waitForPromise(pendingChain, this.#closeTimeoutMs);
       }
+      const creating = this.#sessionPromises.get(input.sessionId);
+      if (creating) {
+        const settled = await waitForPromise(creating, this.#closeTimeoutMs);
+        if (!settled) {
+          // late launch/context 创建完成后仍需再次回收；epoch 递增防止它重新登记 session。
+          void creating.then(
+            async () => {
+              if (this.#sessions.size === 0) await this.closeBrowser();
+            },
+            async () => {
+              if (this.#sessions.size === 0) await this.closeBrowser();
+            },
+          );
+        }
+      }
+      const session = this.#sessions.get(input.sessionId);
+      this.#sessions.delete(input.sessionId);
+      if (session) await waitForPromise(session.close(), this.#closeTimeoutMs);
+      if (this.#sessions.size === 0) await this.closeBrowser();
+    } finally {
+      this.#closingSessionIds.delete(input.sessionId);
     }
-    const session = this.#sessions.get(input.sessionId);
-    this.#sessions.delete(input.sessionId);
-    if (session) await waitForPromise(session.close(), this.#closeTimeoutMs);
-    if (this.#sessions.size === 0) await this.closeBrowser();
   }
 
   async close(): Promise<void> {
@@ -156,7 +231,13 @@ class ManagedCdpBrowserControlPort implements BrowserControlPort {
     const launchPromise = this.#launchPromise;
     for (const pending of this.#pending.values()) pending.controller.abort(abortError());
     this.#pending.clear();
+    this.clearAllReleasedStates();
     this.#closingSessionIds.clear();
+    await Promise.all(
+      [...this.#sessionOpChains.values()].map(async (chain) => {
+        await waitForPromise(chain, this.#closeTimeoutMs);
+      }),
+    );
     await Promise.all(
       [...this.#sessionPromises.values()].map(async (promise) => {
         await waitForPromise(promise, this.#closeTimeoutMs);
@@ -219,6 +300,7 @@ class ManagedCdpBrowserControlPort implements BrowserControlPort {
       browser.on("disconnected", () => {
         if (this.#browser !== browser) return;
         this.#browser = undefined;
+        this.clearAllReleasedStates();
         this.#sessions.clear();
         this.#generation += 1;
       });
@@ -237,44 +319,129 @@ class ManagedCdpBrowserControlPort implements BrowserControlPort {
     return browser;
   }
 
-  private async ensureSession(sessionId: string): Promise<ManagedCdpSession> {
-    if (this.#closingSessionIds.has(sessionId)) {
-      throw new Error(`Browser session '${sessionId}' is closing`);
+  private abortPendingForSession(sessionId: string): void {
+    for (const pending of this.#pending.values()) {
+      if (pending.sessionId === sessionId) pending.controller.abort(abortError());
     }
-    const existing = this.#sessions.get(sessionId);
-    if (existing) return existing;
-    const creating = this.#sessionPromises.get(sessionId);
-    if (creating) return await creating;
+  }
 
-    const promise = (async () => {
-      const browser = await this.ensureBrowser();
-      const generation = this.#generation;
-      const context = await browser.newContext({
-        acceptDownloads: false,
-        viewport: { width: 1280, height: 720 },
-      });
-      if (
-        this.#disposed ||
-        this.#closingSessionIds.has(sessionId) ||
-        this.#browser !== browser ||
-        this.#generation !== generation ||
-        !browser.isConnected()
-      ) {
-        await waitForPromise(context.close(), this.#closeTimeoutMs);
-        throw new Error("Managed CDP browser context became unavailable during creation");
-      }
-      const session = new ManagedCdpSession(context);
-      this.#sessions.set(sessionId, session);
-      return session;
-    })();
-    this.#sessionPromises.set(sessionId, promise);
-    try {
-      return await promise;
-    } finally {
-      if (this.#sessionPromises.get(sessionId) === promise) {
-        this.#sessionPromises.delete(sessionId);
-      }
+  private hasPendingForSession(sessionId: string): boolean {
+    for (const pending of this.#pending.values()) {
+      if (pending.sessionId === sessionId && !pending.controller.signal.aborted) return true;
     }
+    return false;
+  }
+
+  private clearReleasedState(sessionId: string): void {
+    const state = this.#releasedSessions.get(sessionId);
+    if (!state) return;
+    clearTimeout(state.timer);
+    this.#releasedSessions.delete(sessionId);
+  }
+
+  private clearAllReleasedStates(): void {
+    for (const state of this.#releasedSessions.values()) {
+      clearTimeout(state.timer);
+    }
+    this.#releasedSessions.clear();
+  }
+
+  private runSerializedSessionOp<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.#sessionOpChains.get(sessionId) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(fn);
+    const tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#sessionOpChains.set(sessionId, tail);
+    return next.finally(() => {
+      if (this.#sessionOpChains.get(sessionId) === tail) {
+        this.#sessionOpChains.delete(sessionId);
+      }
+    });
+  }
+
+  private async reactivateReleasedSession(sessionId: string): Promise<void> {
+    const hasChain = this.#sessionOpChains.has(sessionId);
+    this.clearReleasedState(sessionId);
+    if (!hasChain) return;
+    await this.runSerializedSessionOp(sessionId, async () => {
+      this.clearReleasedState(sessionId);
+    });
+  }
+
+  private async evictIdleSession(sessionId: string): Promise<void> {
+    await this.runSerializedSessionOp(sessionId, async () => {
+      const released = this.#releasedSessions.get(sessionId);
+      if (!released || this.#disposed || this.hasPendingForSession(sessionId)) return;
+      this.clearReleasedState(sessionId);
+      const session = this.#sessions.get(sessionId);
+      this.#sessions.delete(sessionId);
+      if (session) await waitForPromise(session.close(), this.#closeTimeoutMs);
+      if (this.#sessions.size === 0 && !this.#disposed) await this.closeBrowser();
+    });
+  }
+
+  private async evictDetachedReleasedSession(
+    sessionId: string,
+    session: ManagedCdpSession,
+  ): Promise<void> {
+    await this.runSerializedSessionOp(sessionId, async () => {
+      await waitForPromise(session.close(), this.#closeTimeoutMs);
+      if (this.#sessions.size === 0 && !this.#disposed) await this.closeBrowser();
+    });
+  }
+
+  private async ensureSession(sessionId: string, signal?: AbortSignal): Promise<ManagedCdpSession> {
+    this.clearReleasedState(sessionId);
+    return await this.runSerializedSessionOp(sessionId, async () => {
+      if (signal?.aborted) throw abortError();
+      if (this.#closingSessionIds.has(sessionId)) {
+        throw new Error(`Browser session '${sessionId}' is closing`);
+      }
+      const existing = this.#sessions.get(sessionId);
+      if (existing) {
+        // 同一 sessionId 再次活跃时取消空闲回收定时器并复用原 BrowserContext。
+        this.clearReleasedState(sessionId);
+        return existing;
+      }
+      const creating = this.#sessionPromises.get(sessionId);
+      if (creating) return await creating;
+
+      const startEpoch = this.#sessionEpochs.get(sessionId) ?? 0;
+      const promise = (async () => {
+        const browser = await this.ensureBrowser(signal);
+        const generation = this.#generation;
+        const context = await browser.newContext({
+          acceptDownloads: false,
+          viewport: { width: 1280, height: 720 },
+        });
+        if (
+          this.#disposed ||
+          signal?.aborted ||
+          this.#closingSessionIds.has(sessionId) ||
+          (this.#sessionEpochs.get(sessionId) ?? 0) !== startEpoch ||
+          this.#browser !== browser ||
+          this.#generation !== generation ||
+          !browser.isConnected()
+        ) {
+          await waitForPromise(context.close(), this.#closeTimeoutMs);
+          if (signal?.aborted) throw abortError();
+          throw new Error("Managed CDP browser context became unavailable during creation");
+        }
+        const session = new ManagedCdpSession(context);
+        this.#sessions.set(sessionId, session);
+        return session;
+      })();
+      this.#sessionPromises.set(sessionId, promise);
+      try {
+        return await promise;
+      } finally {
+        if (this.#sessionPromises.get(sessionId) === promise) {
+          this.#sessionPromises.delete(sessionId);
+        }
+      }
+    });
   }
 
   private async executeSessionCommand(
@@ -415,6 +582,7 @@ export function createManagedCdpBrowserRuntime(
   return {
     browserControlPort: port,
     close: async () => port.close(),
+    releaseSession: async (sessionId) => port.releaseSession(sessionId),
   };
 }
 

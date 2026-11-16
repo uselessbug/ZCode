@@ -338,7 +338,12 @@ function buildBrowserRequestContext(
   const record = requireSession(context, parentSessionId ?? input.sessionId);
   const workspaceIdentity = record.workspace.workspaceIdentity?.trim() || undefined;
   const remoteSessionId = record.workspace.remoteSessionId?.trim() || undefined;
-  const workspacePath = record.workspace.workspacePath;
+  // worktree 会话在 record.workspace.workspaceKey 保存主仓库归属，workspacePath 为执行 cwd；
+  // 本地会话（!workspaceIdentity）需以主仓库 workspaceKey 作为 workspaceKey 与发往 Host 的 workspacePath，
+  // 避免 Host 校验归属及后续清理时因 worktree cwd 错配被拒。
+  const workspaceKey =
+    workspaceIdentity ?? (record.workspace.workspaceKey?.trim() || record.workspace.workspacePath);
+  const workspacePath = !workspaceIdentity ? workspaceKey : record.workspace.workspacePath;
 
   return {
     requestId: randomUUID(),
@@ -351,9 +356,7 @@ function buildBrowserRequestContext(
     ...((input.turnId ?? input.traceContext?.turnId)
       ? { turnId: String(input.turnId ?? input.traceContext?.turnId) }
       : {}),
-    // workspacePath 可能在不同 remote workspace 中相同，隔离 key 必须优先使用
-    // workspaceIdentity，避免 browser backend/tab ownership 跨工作区串线。
-    workspaceKey: workspaceIdentity ?? workspacePath,
+    workspaceKey,
     workspacePath,
     ...(workspaceIdentity ? { workspaceIdentity } : {}),
     ...(remoteSessionId ? { remoteSessionId } : {}),

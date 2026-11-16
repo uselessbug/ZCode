@@ -69,6 +69,14 @@ export interface AutoArchiveInput {
 }
 
 /**
+ * 定时任务冻结目录快照内部可信标记（仅供 node.ts 装配的 automationRuntime 代理传递）。
+ * Symbol 键无法经 JSON/RPC 序列化伪造，普通外部调用方不得携带。
+ */
+export const TRUSTED_FROZEN_EXECUTION_SNAPSHOT: unique symbol = Symbol(
+  "zcode.trustedFrozenExecutionSnapshot",
+);
+
+/**
  * 独立云端 Web 的项目仓储策略。只在显式开启独立云端工作区时才允许无项目的会话
  * 与自动分配项目 root；默认关闭，保持真实远端 Source 与桌面远控的原契约。
  * 上游 3.17.2 把 project-storage 合同迁到 repository-contract.ts，此类型随之迁移，避免在 contract.ts 重复定义。
@@ -128,6 +136,8 @@ export interface ProjectRepositoryContract {
            * 事务中继承父行的 cwd、worktree 根与附加目录（docs/git/worktree.md §3.6）。
            */
           forkedFromTaskId?: string;
+          /** 仅定时任务冻结快照内部代理设置（见 TRUSTED_FROZEN_EXECUTION_SNAPSHOT）。 */
+          [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]?: true;
         }
       | { task: ProjectTaskRef; parentTaskId: string },
   ): ProjectDirectories & { taskId: string };

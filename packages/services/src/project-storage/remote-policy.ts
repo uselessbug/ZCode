@@ -19,8 +19,8 @@ export interface StandaloneNonProjectPolicy {
  * 远端限制必须依据持库宿主，不能让请求中的 hostId 或 addMissingRoot 绕过。
  *
  * 普通远端：root 必须恰好 1 个，且创建后不可变更。
- * 独立云端 Web（`allowStandaloneMultiRoot`）：允许增删 root，但至少要保留 1 个，
- * 否则 `project_roots` 为空会让会话失去 cwd 归属。
+ * 独立云端 Web（`allowStandaloneMultiRoot`）：对齐桌面生命周期，允许 0..n 个 root
+ * （0 目录项目在首次 prepareSession 时懒创建并登记 `.zcode/workspace/<projectId>`）。
  */
 export function assertRemoteProjectRoots(
   ownerHostId: string | undefined,
@@ -35,7 +35,8 @@ export function assertRemoteProjectRoots(
       throw new Error("project.remote-root-immutable");
     return;
   }
-  if (roots.length < 1) throw new Error("project.remote-single-root-required");
+  // allowStandaloneMultiRoot 下允许 0..n 个目录（新建 0 目录与编辑清空 roots 均合法）。
+  void roots;
 }
 
 /**
@@ -76,10 +77,20 @@ export function assertRemoteTaskDirectories(
   workspacePath: string,
   additionalDirectories: readonly string[] = [],
   options?: StandaloneNonProjectPolicy,
+  trusted?: {
+    frozenExecutionSnapshot?: boolean;
+    worktreePlacement?: { cwd: string; worktreeRoot: string } | null;
+  },
 ): void {
   if (!ownerHostId || ownerHostId === "local") return;
   if (!project) {
+    if (trusted?.worktreePlacement) throw new Error("project.worktree-requires-project");
     assertRemoteNonProjectDirectories(workspacePath, additionalDirectories, options);
+    return;
+  }
+  if (trusted?.frozenExecutionSnapshot) {
+    // 定时任务已冻结目录快照（经进程内私有 Symbol 校验）：项目归属由调用方校验，
+    // 即使项目 roots 后续被修改或清空，仍允许按创建时持久化的目录快照创建会话。
     return;
   }
   assertRemoteProjectRoots(
@@ -88,6 +99,28 @@ export function assertRemoteTaskDirectories(
     undefined,
     options,
   );
+  if (trusted?.worktreePlacement) {
+    // 独立云端 Web 受管 worktree：仅在显式开启独立工作区/多 root 时放行，
+    // 校验主 workspacePath 属于项目 roots，且映射后的附加目录位于 worktreeRoot 或项目 roots 内。
+    if (!options?.allowStandaloneMultiRoot || !options?.allowStandaloneNonProject) {
+      throw new Error("project.worktree-local-only");
+    }
+    const roots = new Set(project.roots.map((root) => root.rootPath));
+    if (!roots.has(workspacePath)) throw new Error("project.cwd-not-in-roots");
+    const worktreeRoot = trusted.worktreePlacement.worktreeRoot;
+    const isInsideWorktree = (directory: string) => {
+      const rel = relative(worktreeRoot, directory);
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    };
+    if (
+      additionalDirectories.some(
+        (directory) => !isInsideWorktree(directory) && !roots.has(directory),
+      )
+    ) {
+      throw new Error("project.cwd-not-in-roots");
+    }
+    return;
+  }
   if (options?.allowStandaloneMultiRoot) {
     // 独立云端 Web 多 root：会话 cwd 与附加目录都必须落在项目 roots 内。
     // 不在这里放宽为“任意路径”，否则多 root 会变成不限 root。

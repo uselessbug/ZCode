@@ -88,7 +88,7 @@ sequenceDiagram
 
 - 仅在 `web-remote-replayable` 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS=1` 时，由 HTTP 包装把 `restoreProject(id, "local")`、`measureProjectData(ids, "local")` 与 `deleteProjectData(id, "local")` 的第二个位置参数重写为当前服务器 canonical owner；对象内的 `hostId` 与返回结果沿用既有转换。
 - Toast 撤销移除与已移除项目列表恢复共用 `restoreProject` 路径；项目管理弹窗的数据估算与「同时删除它们的 ZCode 数据」共用 `measureProjectData` / `deleteProjectData` 路径。其他 Host 参数（如异域 `hostId`）原样传递，普通桌面、普通远端 owner 与未开启 `allowStandaloneProjectData` 的服务端仍抛 `project.data-local-only`。
-- 服务端 `project-data` 对每个可删目录（含 0 会话项目 root）独立解析当前服务器 canonical `workspaceIdentity` 并传给 CLI `v4/storage/sessionData/*`，以命中 `project-<sha256(identity).slice(0,16)>` 记忆目录；`purgeSessionData` 优先命中热运行 CLI 以保护 `busy` 运行中会话，仅在 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 且归属当前 Host canonical 身份时回落管理面进程，异域身份与非 runtime-unavailable 异常原样抛出、不回落。
+- 服务端 `project-data` 对每个可删目录（含 0 会话项目 root）同时覆盖独立 Web 本地路径哈希记忆目录（`<slug>-<hash>/memory`）与当前服务器 canonical `workspaceIdentity` 哈希记忆目录（`project-<sha256(identity).slice(0,16)>/memory`），避免本地路径会话记忆漏估漏删；`purgeSessionData` 优先命中热运行 CLI 以保护 `busy` 运行中会话，仅在 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 且归属当前 Host canonical 身份时回落管理面进程，异域身份与非 runtime-unavailable 异常原样抛出、不回落。
 - 回归直接执行源码别名包装与真实项目服务/SQLite，验证恢复参数转换、`measureProjectData`/`deleteProjectData` 成功路径、0 会话与 canonical 记忆路径解析、热运行 `busy` 会话保护、冷工作区安全回落及异域/未开启拒绝边界。
 
 ### 补充项：非项目工作模式与项目 root
@@ -105,16 +105,23 @@ sequenceDiagram
     Policy-->>Svc: 显式 allow 时放行；否则 remote-project-required
     Svc-->>UI: { projectId: null, workspacePath, additionalDirectories: [] }
     UI->>Svc: saveProject({ name })（0 目录新建）
-    Svc->>FS: <root>/projects/<sanitized>-<id-prefix>
-    Svc->>Policy: assertRemoteProjectRoots(owner, [root])
-    Svc-->>UI: 固定唯一 root 的项目
+    Svc->>Policy: assertRemoteProjectRoots(owner, [])
+    Svc-->>UI: 0 目录项目（磁盘不提前建目录）
+    UI->>Svc: prepareSession({ projectId })
+    Svc->>FS: <root>/.zcode/workspace/<projectId>
+    Svc-->>UI: 懒创建并登记工作目录
 ```
 
 - `assertRemoteTaskDirectories` 增加可选策略：仅当 `allowStandaloneNonProject` 为真、`additionalDirectories` 为空、`workspacePath` 非空且位于 `standaloneWorkspaceRoot` 之内时放行无项目会话；否则维持 `project.remote-project-required`。跨 Host 与 canonical owner 不变。
 - `ProjectRepository` / `createProjectService` 透传 `allowStandaloneCloudWorkspaces` 与 `standaloneWorkspaceRoot`；`node.ts` 仅在 standalone server 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"` 时开启，root 取 `ZCODE_DEFAULT_WORKSPACE_DIR || /workspace`。
 - `prepareSession` 无 `projectId`：普通本地模式仍用原 `workspaceDirectory`；独立云端开启时用 `<root>/.zcode/conversations`，按 `draftId` 分配稳定目录（相同 `draftId` 幂等复用）。remote owner 未开启策略时仍抛 `project.remote-project-required`。
-- `saveProject` 0 目录新建项目：remote owner 且开启策略时在 `<root>/projects` 下自动创建专用目录并固定为唯一 root（相同项目 ID 重试复用同一 root）；1 个目录正常保存；多于 1 个目录在 `allowStandaloneMultiRoot` 未开启时抛 `project.remote-single-root-required`，改动既有 root 抛 `project.remote-root-immutable`。独立 Web 的多 root 能力（`allowStandaloneMultiRoot`）与任务移动增补 root 见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
-- 前端：非项目草稿绑定稳定 `draftId`，切换时显式 `projectId: null` 并保留转移中的草稿；`ProjectEditor` 对真实远端仍限制为单 root（选择目录最多保留 1 个、既有项目 root 固定不可移除），独立 Web 允许增删多个 root，独立云端新建项目允许 0 目录并给出说明文案；`formatProjectError` 为三个错误码提供可读国际化文案，不向用户暴露原始错误码。
+- `saveProject` 0 目录项目（对齐官方桌面生命周期）：开启 `allowStandaloneMultiRoot` 的独立 Web 允许 `0..n` 个目录，0 目录新建时保留 `roots: []`（不提前在磁盘建目录，未填名称时使用干净默认名 `New project` / `defaultName`），编辑传入 `roots: []` 允许清空为 0 目录；首次 `prepareSession({ projectId })` 时通过 `initializeProjectRoot` 在 `<root>/.zcode/workspace/<projectId>` 懒创建并登记唯一 root。未开启 `allowStandaloneMultiRoot` 的普通远端仍要求恰好 1 个不可变 root（`project.remote-single-root-required` / `project.remote-root-immutable`）。独立 Web 的多 root 能力与任务移动增补 root 见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
+- 前端：非项目草稿绑定稳定 `draftId`，切换时显式 `projectId: null` 并保留转移中的草稿（无项目草稿目录保持 `<root>/.zcode/conversations/draft-<draftId>`）；`ProjectEditor` 对真实远端仍限制为单 root（选择目录最多保留 1 个、既有项目 root 固定不可移除），独立 Web 对齐官方桌面删除 `standaloneAutoRootHint` 提示，允许增删多个 root、0 目录新建项目以及编辑已有项目移除最后一个目录回到 0 目录状态（首次 `prepareSession` 懒创建 `<root>/.zcode/workspace/<projectId>`）；`formatProjectError` 为三个错误码提供可读国际化文案，不向用户暴露原始错误码。
+
+### 补充项：任务菜单文件入口
+
+- 独立 Web 侧栏任务菜单（列表视图与分组视图）将桌面本地文件管理器入口替换为复用官方 `openTaskFiles` 的「显示文件树」（定位任务 `cwd` 并打开右侧文件栏），顶栏任务菜单与手机远控隐藏该项。
+- 「前往 Provider 配置」在无本机文件打开能力（`!canOpenLocalFiles`）时统一隐藏，避免独立 Web 下点击无反馈。
 
 ## 验收场景
 
@@ -129,6 +136,6 @@ sequenceDiagram
 **Area B**
 
 6. 开启策略时无 `projectId` 的 `prepareSession({draftId})` 在 `<root>/.zcode/conversations` 下分配稳定目录，相同 `draftId` 幂等复用；`reserveCreatedTask` / `resolveDirectories` 允许 `projectId:null` 且 `additionalDirectories:[]`。
-7. 0 目录新建项目自动分配并固定唯一 root（相同项目 ID 重试幂等）；1 目录成功；未开启 `allowStandaloneMultiRoot` 时多于 1 目录抛 `project.remote-single-root-required`、改既有 root 抛 `project.remote-root-immutable`。独立 Web 多 root 与移动增补 root 的验收见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
+7. 0 目录新建项目保存为 `roots: []`（磁盘未提前建目录、默认名干净），编辑传入 `roots: []` 可清空为 0 目录；首次 `prepareSession({ projectId })` 在 `<root>/.zcode/workspace/<projectId>` 懒创建并登记工作目录；未开启 `allowStandaloneMultiRoot` 时多于 1 目录抛 `project.remote-single-root-required`、改既有 root 抛 `project.remote-root-immutable`。独立 Web 多 root 与移动增补 root 的验收见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
 8. 未开启策略的普通远端 owner 仍抛 `project.remote-project-required` 与 `project.remote-single-root-required`；跨 Host 仍被拒绝。
 9. 既有独立 Web host alias 与连接恢复补丁仍生效；仅替换 ZCode 镜像，AGM、Access checker、Caddy 与其他服务不变。

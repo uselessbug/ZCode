@@ -1,6 +1,8 @@
 # managed-worktree-tasks
 
-受管 worktree 的任务编排服务（RPC 通道 `managed-worktrees`），规格见 `docs/git/worktree.md` §2.1、§3.3–§3.6、§3.11、§8。仅本地桌面 Host；手机 attachment 不放行该通道。
+受管 worktree 的任务编排服务（RPC 通道 `managed-worktrees`），规格见 `docs/git/worktree.md` §2.1、§3.1、§3.3–§3.6、§3.11、§8。本地桌面 Host 与显式开启独立云端兼容（`serviceAuthorityMode === "standalone-server"` 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"`）的独立 Web Server 可用；未开启兼容的远控终端与手机 attachment 不放行该通道（`worktree.local-only`）。
+
+- 独立 Web 下的 worktree 任务与普通任务保持一致，不写 `remote:server:*` 的 `workspaceIdentity`，仅保留 `hostId: projectStorageHostId`（HTTP alias 投影为 `"local"`），worktree 创建在 `<standaloneWorkspaceRoot>/.zcode/worktrees/<bucket>/<name>`。
 
 - 唯一事实源：worktree 是否存在以 `git worktree list` + 受管布局为准；"使用它的任务"按 tasks-index `worktree_root` 精确匹配；创建记录与删除租约只在本服务内存中。
 - `startNewTask` / `forkToWorktree`：创建记录驱动创建视图；worktree 建好后预留任务行（workspace = 项目，cwd 与 `worktree_root` 写一次，附加目录按 §2.1 映射），再以 Host 可信身份向项目 CLI 发送带 `cwd` / `targetCwd` 的命令。fork 带入父任务 cwd 的未提交改动。

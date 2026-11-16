@@ -45,13 +45,14 @@ flowchart LR
    - `sessionContext === "cached"` 时拒绝创建新浏览器上下文或执行页面命令，显式返回 `ok: false`（`backend_unavailable`）。
    - 受管 CDP descriptor 不声明 `metadata.controlScopes === "1"`，因此 `openScope` / `releaseScope` 请求在桥层显式拒绝（`ok: false`、`backend_unavailable`，`openScope` 附带 `scope: { id: controlScopeId, state: "rejected" }`）。
 3. **伪命令转译与取消**：
-   - `turnEnded` -> 调用 `port.turnEnded({ sessionId: leaseId, turnId })`（不再透传进 `port.execute` 返回 `capability_unsupported`）。
-   - `closeSession` 中止当前浏览器租约下的请求并释放其上下文。下一次 discovery 可为同一历史会话建立新租约，旧租约的命令和清理请求不能操作新租约。
+   - `turnEnded` -> 调用 `port.turnEnded({ sessionId: sessionKey, turnId })`（不再透传进 `port.execute` 返回 `capability_unsupported`）。
+   - `closeSession`（`closeTabs !== true`）使旧租约立即失效（旧 `browserId` 后续 `execute`/`cancel`/`close` 均被拒绝或忽略），底层调用 `runtime.releaseSession(sessionKey)` 保留 Playwright `BrowserContext`、已打开页面与 Cookie 进入空闲驻留（受 `maxReleasedSessions` / `releasedSessionIdleTtlMs` 约束），下次同一 `sessionKey` 调用 `list`/`execute` 自动复用原上下文并获得新租约 `browserId`。
+   - `closeSession`（`closeTabs === true`）与宿主机生命周期方法 `closeTaskSessions({ workspacePath, workspaceIdentity?, sessionIds })` 使活跃租约失效，并调用底层 `port.closeSession({ sessionId: sessionKey })` 彻底销毁对应 `BrowserContext`。`closeTaskSessions` 仅查找内存中已记录的复合 `sessionKey`，不启动 Chromium 或调用 `list()`；调用底层 `runtime.list` 前先登记追踪键与代次（epoch），若首次 `list` 在途期间收到匹配的关闭请求，立即递增代次并中止在途请求，待 `list` 返回后销毁刚创建的上下文且不签发租约。手动归档（`archiveTask`）、自动归档（`taskAutoArchiveScheduler`）、任务删除（`deleteArchivedTask`/`deleteArchivedTasks` 及 `zcodeTaskIndexSyncer` 删除事实）、归档永久删除（`executeSessionDeletion`）及项目数据清理（`purgeSessionData` 中 `deleted` 会话，含已删 `owned` 子会话、不含 `kept`）成功后统一经 per-`sessionKey` 串行队列触发 `closeTaskSessions`，清理异常仅记 `warn` 不回滚已提交业务状态；`zcodeAgentService` 转发 `interaction/browserList` 与 `interaction/browserExecute` 时将工作区身份归一到所属 CLI runtime 主工作区，使受管 worktree 会话的浏览器上下文与 `closeTaskSessions` 归属一致。
    - `cancelRequest` -> 在桥内查找目标 `command.requestId` 对应的外部 `AbortController` 并触发 `abort()`，返回 `{ ok: true, value: { cancelled }, elapsedMs }`；同时尊重同 `sessionKey` 作用域校验。
 4. **会话隔离与重新接入**：
-   - 复合键：`sessionKey = JSON.stringify([workspaceKey, remoteSessionId ?? null, clientMode, sessionId])`，隔离工作区、远端会话和客户端模式。
+   - 复合键：`sessionKey = JSON.stringify([workspaceKey, remoteSessionId ?? null, clientMode, sessionId])`，隔离工作区、远端会话和客户端模式；底层 `runtime` 统一以稳定的 `sessionKey` 作为 `sessionId`，对外描述符与执行结果继续使用每次租约独立的随机 `browserId`（`lease.id`）。
    - Discovery 只有在真实后端可用后才返回描述符，并为当前会话建立租约。桥层将租约 ID 映射到真实 backend ID 和 generation，执行结果也返回同一租约身份。
-   - 关闭只释放对应租约；同一历史会话再次 discovery 后获得新租约，旧 ID 不可执行或关闭新资源。无需依赖官方 adapter 的 generation 在正常重启后递增。
+   - 普通关闭只释放租约并保留上下文进入空闲驻留；同一历史会话再次 discovery 后获得新租约并沿用原页面/Cookie，旧 `browserId` 不可执行或关闭新租约。`closeTabs: true` 与归档/删除触发的 `closeTaskSessions` 彻底销毁上下文，再次 discovery 为全新空白上下文。无需依赖官方 adapter 的 generation 在正常重启后递增。
 5. **结果校验**：
    - `execute()` 返回值经 `@zcode/shared` 的 `browserCommandResultSchema` 校验，避免 `any` 强转掩盖协议字段漂移。
 

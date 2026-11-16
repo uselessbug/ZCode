@@ -1,19 +1,89 @@
 // 独立 Web 多 root 项目与任务移动的可重复验收（对应 docs/standalone-web-multi-root-projects.md）。
 // 真实 ProjectRepository / SQLite / createProjectService；不启动浏览器、不发送模型请求、不访问网络。
 //
-// 运行：pnpm exec tsx packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-multi-root-projects.mjs
+// 运行：node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-multi-root-projects.mjs
 //
-// 本脚本只覆盖服务端合同（root 数量、root 变更、moveTask 缺 root 流程、跨 Host）。
+// 本脚本只覆盖服务端合同（root 数量、root 变更、moveTask 缺 root 流程、跨 Host、0 目录项目与懒创建）。
 // UI 层（项目编辑弹层增删 root、侧栏拖动确认框）见规格验收场景 8，需实机复核。
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, stat } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { TaskIndexRepo } from "../../../../../../../services/src/session/taskIndexRepo.ts";
-import { createProjectService } from "../../../../../../../services/src/project/index.ts";
-
+const repoRoot = fileURLToPath(new URL("../../../../../../../../", import.meta.url));
+const require = createRequire(import.meta.url);
+let esbuildPath;
+try {
+  esbuildPath = require.resolve("esbuild");
+} catch {
+  esbuildPath = join(
+    dirname(dirname(realpathSync(join(repoRoot, "node_modules/.bin/esbuild")))),
+    "lib/main.js",
+  );
+}
+const { build } = await import(pathToFileURL(esbuildPath).href);
 const root = await mkdtemp(join(tmpdir(), "zcode-standalone-multi-root-"));
+const shared = join(repoRoot, "packages/shared/src");
+const services = join(repoRoot, "packages/services/src");
+const outfile = join(root, "multi-root-bundle.cjs");
+await build({
+  stdin: {
+    contents: [
+      `export { TaskIndexRepo } from ${JSON.stringify(join(services, "session/taskIndexRepo.ts"))};`,
+      `export { createProjectService } from ${JSON.stringify(join(services, "project/index.ts"))};`,
+    ].join("\n"),
+    resolveDir: repoRoot,
+    loader: "ts",
+  },
+  outfile,
+  bundle: true,
+  platform: "node",
+  format: "cjs",
+  target: "node24",
+  external: ["electron"],
+  define: { "import.meta.url": JSON.stringify(pathToFileURL(outfile).href) },
+  logLevel: "silent",
+  plugins: [
+    {
+      name: "source-only-multi-root-fixture",
+      setup(builder) {
+        builder.onResolve({ filter: /^@zcode\// }, ({ path }) => {
+          const [, name, ...subpath] = path.split("/");
+          const packageRoot = join(repoRoot, "packages", name);
+          const manifest = require(join(packageRoot, "package.json"));
+          const key = subpath.length ? `./${subpath.join("/")}` : ".";
+          const entry = manifest.exports?.[key];
+          const target = typeof entry === "string" ? entry : (entry?.import ?? entry?.default);
+          if (!target) throw new Error(`Cannot resolve @zcode export: ${path}`);
+          return { path: join(packageRoot, target) };
+        });
+        builder.onResolve({ filter: /^#session-control\// }, ({ path }) => ({
+          path: join(
+            repoRoot,
+            "packages/session-control/src",
+            `${path.slice("#session-control/".length)}.ts`,
+          ),
+        }));
+        builder.onResolve({ filter: /^#src\// }, ({ path, importer }) => ({
+          path: join(
+            importer.startsWith(shared) ? shared : services,
+            path.slice(5).replace(/\.js$/, ".ts"),
+          ),
+        }));
+        builder.onResolve({ filter: /^[^./#@][^:]*$/ }, ({ path, importer }) => {
+          if (path === "electron") return { path, external: true };
+          const req = importer ? createRequire(importer) : require;
+          return { path: req.resolve(path) };
+        });
+      },
+    },
+  ],
+});
+const { TaskIndexRepo, createProjectService } = require(outfile);
+
 const hostId = "remote:server:e2e-standalone-multi-root";
 const otherHostId = "remote:server:e2e-standalone-other";
 const workspaceRoot = join(root, "workspace");
@@ -44,7 +114,11 @@ async function createService(dbPath, options) {
   const repository = await index.getProjectRepository(options);
   const service = createProjectService({
     repository: async () => repository,
-    workspaceDirectory: workspaceRoot,
+    workspaceDirectory: join(
+      options.standaloneWorkspaceRoot ?? workspaceRoot,
+      ".zcode",
+      "workspace",
+    ),
     ownerHostId: hostId,
     allowStandaloneCloudWorkspaces: options.allowStandaloneCloudWorkspaces,
     standaloneWorkspaceRoot: options.standaloneWorkspaceRoot,
@@ -187,24 +261,60 @@ const passes = [];
   passes.push("6 跨 Host 移动仍拒绝");
 }
 
-// 7. 独立 Web 不会产生 0 root 项目：0 目录新建自动分配；既有项目清空 roots 沿用原 root。
+// 7. 独立 Web 0 目录项目对齐官方桌面生命周期：
+//    - 0 目录新建保留 roots: []，未填名称时使用干净默认名 "New project"，磁盘不提前创建目录；
+//    - 首次 prepareSession({ projectId }) 懒创建并登记 <workspaceRoot>/.zcode/workspace/<projectId>；
+//    - 编辑传 roots: [] 允许清空为 0 目录；传 roots: undefined 保持沿用旧 roots；
+//    - 无项目草稿目录 <workspaceRoot>/.zcode/conversations/draft-<id> 保持原样。
 {
   const { service } = await createService(join(root, "zero-root.sqlite"), standaloneOptions);
-  const allocated = await service.saveProject({ name: "E2E_AUTO_ROOT" });
-  assert.equal(allocated.roots.length, 1, "0 目录新建应自动分配唯一 root");
-  assert.ok(
-    allocated.roots[0].rootPath.startsWith(join(workspaceRoot, "projects")),
-    "自动分配的 root 应位于工作区根下 projects 目录",
+  const unnamedZero = await service.saveProject({});
+  assert.equal(unnamedZero.roots.length, 0, "0 目录新建应保留空 roots");
+  assert.equal(unnamedZero.name, "New project", "未填名称时应使用干净默认名而非 slug-uuid");
+  assert.equal(
+    existsSync(join(workspaceRoot, "projects")),
+    false,
+    "0 目录新建不应再提前创建 /workspace/projects 目录",
   );
-  const manual = await service.saveProject({ name: "E2E_MANUAL", roots: [dirA, dirB] });
-  const kept = await service.saveProject({ id: manual.id, roots: [] });
+  const lazyWorkspaceDir = join(workspaceRoot, ".zcode", "workspace", unnamedZero.id);
+  assert.equal(existsSync(lazyWorkspaceDir), false, "prepareSession 前不应提前创建工作目录");
+
+  const preparedZero = await service.prepareSession({ projectId: unnamedZero.id });
+  assert.equal(
+    preparedZero.workspacePath,
+    lazyWorkspaceDir,
+    "首次 prepareSession 应懒创建 .zcode/workspace/<projectId>",
+  );
+  assert.equal((await stat(lazyWorkspaceDir)).isDirectory(), true);
+  const refreshedZero = (await service.readProjects()).find((entry) => entry.id === unnamedZero.id);
   assert.deepEqual(
-    kept.roots.map((entry) => entry.rootPath).sort(),
-    [dirA, dirB].sort(),
-    "清空 roots 时应沿用既有 root，不产生 0 root 项目",
+    refreshedZero?.roots.map((entry) => entry.rootPath),
+    [lazyWorkspaceDir],
+    "首次 prepareSession 后应登记唯一主目录",
   );
-  passes.push("7 独立 Web 不会产生 0 root 项目");
+
+  const manual = await service.saveProject({ name: "E2E_MANUAL", roots: [dirA, dirB] });
+  const cleared = await service.saveProject({ id: manual.id, roots: [] });
+  assert.deepEqual(cleared.roots, [], "编辑传入 roots: [] 应成功清空为 0 目录");
+
+  const keepTarget = await service.saveProject({ name: "E2E_KEEP_UNDEFINED", roots: [dirA, dirB] });
+  const renamedOnly = await service.saveProject({ id: keepTarget.id, name: "E2E_RENAMED_ONLY" });
+  assert.deepEqual(
+    renamedOnly.roots.map((entry) => entry.rootPath).sort(),
+    [dirA, dirB].sort(),
+    "编辑传 roots: undefined 应保持沿用既有 roots",
+  );
+
+  const draftId = "11111111-1111-4111-8111-111111111111";
+  const draftSession = await service.prepareSession({ draftId });
+  assert.equal(
+    draftSession.workspacePath,
+    join(workspaceRoot, ".zcode", "conversations", `draft-${draftId}`),
+    "无项目草稿目录 .zcode/conversations/draft-<id> 应保持不变",
+  );
+  passes.push("7 独立 Web 0 目录项目生命周期与 .zcode/workspace/<id> 懒创建");
 }
 
 for (const line of passes) console.log(`PASS ${line}`);
 console.log(`\n${passes.length} 组验收全部通过（临时目录 ${root}）`);
+await rm(root, { recursive: true, force: true });

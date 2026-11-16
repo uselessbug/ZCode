@@ -53,7 +53,6 @@ describe("createProtocolBrowserControlBroker", () => {
       deliveryKind: "web-remote-replayable",
       remoteSessionId: "remote-session-1",
       workspaceIdentity: "ssh://host/repo",
-      remoteSessionId: "remote-session-1",
       // 即使 record 中旧 workspaceKey 错了，也必须按统一公式重新计算。
       workspaceKey: "legacy-path-only-key",
       workspacePath: "/repo",
@@ -82,6 +81,36 @@ describe("createProtocolBrowserControlBroker", () => {
     });
     expect((params as { requestId: string }).requestId).toBeTruthy();
     expect(requestOptions).toMatchObject({ signal: abortController.signal });
+  });
+
+  it("worktree 会话使用主仓库 workspaceKey 与规范化 workspacePath，不把 worktree cwd 发往 Host", async () => {
+    const requestClient = vi.fn(async (method: string) =>
+      method === zcodeProtocolMethods.interactionBrowserList
+        ? { browsers: [IAB_DESCRIPTOR] }
+        : { ok: true, elapsedMs: 3 },
+    );
+    const context = createContext(requestClient, {
+      workspaceKey: "/workspace/repo",
+      workspacePath: "/workspace/.zcode/worktrees/wt-1",
+    });
+    const broker = createProtocolBrowserControlBroker(context);
+
+    await broker.list({ sessionId: "sess-1", turnId: "turn-wt" });
+    await broker.execute({
+      browserId: "iab-runtime-1",
+      browserGeneration: 1,
+      sessionId: "sess-1",
+      turnId: "turn-wt",
+      command: { method: "getState" },
+    });
+    await broker.closeSession?.({ sessionId: "sess-1", turnId: "turn-wt" });
+
+    for (const call of requestClient.mock.calls) {
+      expect(call[1]).toMatchObject({
+        workspaceKey: "/workspace/repo",
+        workspacePath: "/workspace/repo",
+      });
+    }
   });
 
   it("execute 贯穿 browserId、turnId、command、signal 与 trace", async () => {

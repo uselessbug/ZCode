@@ -342,7 +342,7 @@ export async function verifyFactoryRealBrowser(factoryModule, playwright, fixtur
     assert.equal(turnCancelled.error?.code, "cancelled");
     pass("factory.turnEnded", "turn-scoped in-flight aborted");
 
-    // ---- 8. closeSession 终态守卫 -----------------------------------------
+    // ---- 8. closeSession 释放保持上下文 vs closeTabs / closeTaskSessions 彻底销毁 ----
     const closeCtx = makeContext({
       sessionId: "session-close",
       workspaceKey: "workspace-A",
@@ -358,6 +358,27 @@ export async function verifyFactoryRealBrowser(factoryModule, playwright, fixtur
       },
     );
     assert.equal(tabClose.ok, true);
+    const navClose = await exec(
+      handle.executor,
+      closeCtx,
+      { method: "navigate", url: fixtureUrl, tabId: tabClose.tab?.tabId },
+      { browserId: cdpClose.id, browserGeneration: cdpClose.generation },
+    );
+    assert.equal(navClose.ok, true);
+    const cookieSet = await exec(
+      handle.executor,
+      closeCtx,
+      {
+        method: "evaluate",
+        expression: "document.cookie = 'zcode_keep=1; path=/'; document.cookie",
+        tabId: tabClose.tab?.tabId,
+      },
+      { browserId: cdpClose.id, browserGeneration: cdpClose.generation },
+    );
+    assert.equal(cookieSet.ok, true);
+    assert.match(String(cookieSet.value ?? ""), /zcode_keep=1/);
+
+    // 普通 closeSession（不带 closeTabs）：旧租约失效，但底层 BrowserContext 与页面/Cookie 保留。
     const closeResult = await exec(handle.executor, closeCtx, { method: "closeSession" });
     assert.equal(closeResult.ok, true, "closeSession must succeed");
 
@@ -373,18 +394,9 @@ export async function verifyFactoryRealBrowser(factoryModule, playwright, fixtur
     assert.equal(lateExec.ok, false, "late request after closeSession must be rejected");
     assert.equal(lateExec.error?.code, "backend_unavailable");
     assert.match(lateExec.error?.message ?? "", /unavailable/i);
+
     const reopened = await listCdp(handle.executor, closeCtx);
     assert.notEqual(reopened.id, cdpClose.id, "resumed session must get a new browser lease");
-    const resumedTab = await exec(
-      handle.executor,
-      closeCtx,
-      { method: "newTab" },
-      {
-        browserId: reopened.id,
-        browserGeneration: reopened.generation,
-      },
-    );
-    assert.equal(resumedTab.ok, true, "same historical session must be usable after discovery");
     await exec(
       handle.executor,
       closeCtx,
@@ -394,7 +406,7 @@ export async function verifyFactoryRealBrowser(factoryModule, playwright, fixtur
         browserGeneration: cdpClose.generation,
       },
     );
-    const afterStaleClose = await exec(
+    const afterReopenTabs = await exec(
       handle.executor,
       closeCtx,
       { method: "list" },
@@ -403,7 +415,126 @@ export async function verifyFactoryRealBrowser(factoryModule, playwright, fixtur
         browserGeneration: reopened.generation,
       },
     );
-    assert.equal(afterStaleClose.tabs?.length, 1, "stale cleanup must not close the new lease");
+    assert.equal(afterReopenTabs.tabs?.length, 1, "normal closeSession must preserve open tabs");
+    const cookiePreserved = await exec(
+      handle.executor,
+      closeCtx,
+      {
+        method: "evaluate",
+        expression: "document.cookie",
+        tabId: afterReopenTabs.tabs?.[0]?.tabId,
+      },
+      {
+        browserId: reopened.id,
+        browserGeneration: reopened.generation,
+      },
+    );
+    assert.match(
+      String(cookiePreserved.value ?? ""),
+      /zcode_keep=1/,
+      "normal closeSession must preserve cookies across leases",
+    );
+
+    // closeSession({ closeTabs: true }) 彻底销毁上下文，再 list 为全新空白上下文。
+    const closeTabsResult = await exec(
+      handle.executor,
+      closeCtx,
+      { method: "closeSession", closeTabs: true },
+      {
+        browserId: reopened.id,
+        browserGeneration: reopened.generation,
+      },
+    );
+    assert.equal(closeTabsResult.ok, true);
+    const afterCloseTabs = await listCdp(handle.executor, closeCtx);
+    assert.notEqual(afterCloseTabs.id, reopened.id);
+    const afterCloseTabsList = await exec(
+      handle.executor,
+      closeCtx,
+      { method: "list" },
+      {
+        browserId: afterCloseTabs.id,
+        browserGeneration: afterCloseTabs.generation,
+      },
+    );
+    assert.equal(
+      afterCloseTabsList.tabs?.length,
+      0,
+      "closeTabs=true must destroy BrowserContext and yield a blank context on next list",
+    );
+
+    // closeTaskSessions：同时覆盖“已普通释放入池”与“活跃租约”两种上下文，彻底关闭。
+    const taskTab = await exec(
+      handle.executor,
+      closeCtx,
+      { method: "newTab" },
+      {
+        browserId: afterCloseTabs.id,
+        browserGeneration: afterCloseTabs.generation,
+      },
+    );
+    assert.equal(taskTab.ok, true);
+    await exec(handle.executor, closeCtx, { method: "closeSession" });
+    await handle.executor.closeTaskSessions?.({
+      workspacePath: closeCtx.workspacePath,
+      sessionIds: [closeCtx.sessionId],
+    });
+    const afterTaskDestroy = await listCdp(handle.executor, closeCtx);
+    const afterTaskDestroyList = await exec(
+      handle.executor,
+      closeCtx,
+      { method: "list" },
+      {
+        browserId: afterTaskDestroy.id,
+        browserGeneration: afterTaskDestroy.generation,
+      },
+    );
+    assert.equal(
+      afterTaskDestroyList.tabs?.length,
+      0,
+      "closeTaskSessions must destroy released BrowserContext",
+    );
+
+    // 活跃态 closeTaskSessions：失效活跃租约并彻底销毁上下文。
+    await exec(
+      handle.executor,
+      closeCtx,
+      { method: "newTab" },
+      {
+        browserId: afterTaskDestroy.id,
+        browserGeneration: afterTaskDestroy.generation,
+      },
+    );
+    await handle.executor.closeTaskSessions?.({
+      workspacePath: closeCtx.workspacePath,
+      sessionIds: [closeCtx.sessionId],
+    });
+    const lateAfterDestroy = await exec(
+      handle.executor,
+      closeCtx,
+      { method: "list" },
+      {
+        browserId: afterTaskDestroy.id,
+        browserGeneration: afterTaskDestroy.generation,
+      },
+    );
+    assert.equal(lateAfterDestroy.ok, false);
+    assert.equal(lateAfterDestroy.error?.code, "backend_unavailable");
+    const afterActiveDestroy = await listCdp(handle.executor, closeCtx);
+    const afterActiveDestroyList = await exec(
+      handle.executor,
+      closeCtx,
+      { method: "list" },
+      {
+        browserId: afterActiveDestroy.id,
+        browserGeneration: afterActiveDestroy.generation,
+      },
+    );
+    assert.equal(
+      afterActiveDestroyList.tabs?.length,
+      0,
+      "closeTaskSessions on active lease must yield a blank context on next list",
+    );
 
     // 新 sessionKey 独立可用（不复活旧会话）。
     const freshCtx = makeContext({
@@ -421,7 +552,30 @@ export async function verifyFactoryRealBrowser(factoryModule, playwright, fixtur
       },
     );
     assert.equal(freshTab.ok, true, "a fresh sessionKey must remain usable");
-    pass("factory.closeSession-guard", "late requests rejected, fresh sessionKey usable");
+    pass(
+      "factory.closeSession-guard",
+      "release preserves context/cookie; closeTabs & closeTaskSessions destroy context; fresh sessionKey usable",
+    );
+
+    // 无浏览器上下文会话调用 closeTaskSessions 不得启动 Chromium。
+    const coldHandle = factoryModule.createServerBrowserControl({
+      executablePath: CHROMIUM,
+      loadPlaywright: async () => playwright,
+    });
+    try {
+      const beforeCold = countChromiumProcesses();
+      await coldHandle.executor.closeTaskSessions?.({
+        workspacePath: "/tmp/never-opened-workspace",
+        sessionIds: ["never-opened-session"],
+      });
+      assert.ok(
+        beforeCold < 0 || countChromiumProcesses() <= beforeCold,
+        "closeTaskSessions must not launch Chromium for untouched sessions",
+      );
+      pass("factory.closeTaskSessions-no-launch", "closeTaskSessions does not launch Chromium");
+    } finally {
+      await coldHandle.close().catch(() => {});
+    }
 
     // ---- 9. close() 清理 --------------------------------------------------
     await handle.close();
@@ -440,6 +594,138 @@ export async function verifyFactoryRealBrowser(factoryModule, playwright, fixtur
       );
     } else {
       pass("factory.close", `disposed + chromium reaped (baseline=${baseline})`);
+    }
+
+    // ---- 10. 首次 list 在途并发 closeTaskSessions 与新 list 交错竞态 --------
+    // 挂起旧 list -> closeTaskSessions -> 发起新 list 并 execute 打开页面 -> 放行旧 list：
+    // 旧 list 被取消，closeTaskSessions 仅销毁旧上下文，新租约的上下文与页面完好存活。
+    {
+      let enteredLoad = 0;
+      let releaseLoad;
+      const loadEntered = new Promise((r) => {
+        releaseLoad = r;
+      });
+      let releasePlaywright;
+      const playwrightGate = new Promise((r) => {
+        releasePlaywright = r;
+      });
+      const raceHandle = factoryModule.createServerBrowserControl({
+        executablePath: CHROMIUM,
+        loadPlaywright: async () => {
+          enteredLoad += 1;
+          if (enteredLoad === 1) {
+            releaseLoad();
+            await playwrightGate;
+          }
+          return playwright;
+        },
+      });
+      const raceCtx = makeContext({
+        sessionId: "session-race-list",
+        workspaceKey: "workspace-race",
+        workspacePath: "/tmp/verify-standalone-browser-race",
+      });
+      const beforeRace = countChromiumProcesses();
+      try {
+        // 10a. 同一事件循环无 await 间隔紧接调用 list() -> closeTaskSessions()：
+        // 同步登记保证首次发现尚未进入队列微任务槽位也能被立即取消且不签发租约。
+        const syncRaceCtx = makeContext({
+          sessionId: "session-sync-race-list",
+          workspaceKey: "workspace-race",
+          workspacePath: "/tmp/verify-standalone-browser-race",
+          requestId: "req-sync-race",
+        });
+        const syncListing = raceHandle.executor.list(syncRaceCtx);
+        await raceHandle.executor.closeTaskSessions?.({
+          workspacePath: syncRaceCtx.workspacePath,
+          sessionIds: [syncRaceCtx.sessionId],
+        });
+        await assert.rejects(
+          syncListing,
+          /cancelled/i,
+          "zero-await list -> closeTaskSessions must cancel first discovery",
+        );
+
+        const listFlight = raceHandle.executor.list(raceCtx);
+        await loadEntered;
+        assert.equal(enteredLoad, 1);
+        // 挂起旧 list -> 并发 closeTaskSessions -> 立即发起新 list
+        const closeFlight = raceHandle.executor.closeTaskSessions?.({
+          workspacePath: raceCtx.workspacePath,
+          sessionIds: [raceCtx.sessionId],
+        });
+        const newListCtx = makeContext({
+          ...raceCtx,
+          requestId: "req-new-after-close-race",
+        });
+        const newListFlight = raceHandle.executor.list(newListCtx);
+        // 放行旧 list：旧 list 必须取消，新 list 必须拿到全新可用租约并保持存活
+        releasePlaywright();
+        await assert.rejects(
+          listFlight,
+          /cancelled/i,
+          "in-flight list invalidated by closeTaskSessions must reject",
+        );
+        await closeFlight;
+        const newDescriptors = await newListFlight;
+        const newCdp = newDescriptors.find((d) => d.type === "cdp");
+        assert.ok(newCdp, "new list after closeTaskSessions must obtain a valid cdp lease");
+        const tabRace = await exec(
+          raceHandle.executor,
+          { ...newListCtx, requestId: randomUUID() },
+          { method: "newTab" },
+          { browserId: newCdp.id, browserGeneration: newCdp.generation },
+        );
+        assert.equal(tabRace.ok, true, `newTab failed: ${JSON.stringify(tabRace)}`);
+        const navRace = await exec(
+          raceHandle.executor,
+          { ...newListCtx, requestId: randomUUID() },
+          { method: "navigate", url: fixtureUrl, tabId: tabRace.tab?.tabId },
+          { browserId: newCdp.id, browserGeneration: newCdp.generation },
+        );
+        assert.equal(navRace.ok, true, `navigate failed: ${JSON.stringify(navRace)}`);
+        const evalRace = await exec(
+          raceHandle.executor,
+          { ...newListCtx, requestId: randomUUID() },
+          { method: "evaluate", expression: "document.title", tabId: tabRace.tab?.tabId },
+          { browserId: newCdp.id, browserGeneration: newCdp.generation },
+        );
+        assert.equal(
+          evalRace.value,
+          FIXTURE_TITLE,
+          "new lease page must stay alive after old list settles",
+        );
+        const listStillAlive = await exec(
+          raceHandle.executor,
+          { ...newListCtx, requestId: randomUUID() },
+          { method: "list" },
+          { browserId: newCdp.id, browserGeneration: newCdp.generation },
+        );
+        assert.equal(
+          listStillAlive.tabs?.length,
+          1,
+          "new lease tab must not be closed by late old list",
+        );
+
+        // 彻底关闭并确认进程回收
+        await raceHandle.executor.closeTaskSessions?.({
+          workspacePath: raceCtx.workspacePath,
+          sessionIds: [raceCtx.sessionId],
+        });
+        const reapedRace = await waitForChromiumReap(beforeRace < 0 ? 0 : beforeRace);
+        assert.equal(
+          reapedRace,
+          true,
+          "browser context after closeTaskSessions must be cleaned up",
+        );
+        pass(
+          "factory.closeTaskSessions-inflight-list-race",
+          "old list cancelled -> closeTaskSessions -> new list & page stay alive without late close",
+        );
+      } finally {
+        releasePlaywright?.();
+        await raceHandle.close().catch(() => {});
+      }
     }
   } finally {
     await handle.close().catch(() => {});

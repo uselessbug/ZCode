@@ -247,6 +247,8 @@ interface WebBootstrapResult {
   initialTaskId?: string;
   restoreSession?: boolean;
   allowOpenWorkspace?: boolean;
+  /** 仅 /api/server-info 声明 capabilities.managedWorktrees 时为 true；`?remote=` 跨机代理与失败回退均不开启。 */
+  managedWorktrees?: boolean;
 }
 
 type WebRemoteControlWorkspaceListUpdateListener = (
@@ -462,6 +464,8 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
     return { wsUrl };
   }
 
+  // 受管 worktree 频道只在 Host 经 /api/server-info 声明 capabilities.managedWorktrees 时开启；
+  // 响应失败、解析异常或旧 Server 缺省一律关闭（fail-closed），`?remote=` 跨机代理也不携带。
   try {
     const response = await fetch("/api/server-info", {
       cache: "no-store",
@@ -473,6 +477,7 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
     const workspace = Array.isArray(serverInfo.workspaces) ? serverInfo.workspaces[0] : undefined;
     return {
       wsUrl,
+      ...(serverInfo.capabilities?.managedWorktrees === true ? { managedWorktrees: true } : {}),
       ...(workspace?.path ? { initialWorkspaceAbsPath: workspace.path } : {}),
       ...(workspace?.workspaceIdentity
         ? { initialWorkspaceIdentity: workspace.workspaceIdentity }
@@ -2209,6 +2214,9 @@ async function bootstrapWebApp() {
                   restoreSession={bootstrap.restoreSession}
                   allowOpenWorkspace={bootstrap.allowOpenWorkspace}
                   preferDirectoryBrowser
+                  // 修复原因：独立 Web 与桌面共享同一 Host 持久化的 Assistant row，Root 默认关闭
+                  // code-comment 投影会暴露原始 directive；与桌面渲染端、手机远控保持一致显式开启。
+                  assistantCodeCommentCardsEnabled
                   supportsEmbeddedBrowser={false}
                   allowRemoteWorkspace={false}
                 />
@@ -2288,7 +2296,11 @@ async function bootstrapWebApp() {
     }, STANDALONE_RECONNECT_HINT_DELAY_MS);
   };
   connection = createStandaloneWebConnection({
-    connect: (options) => connectViaWebSocket(bootstrap.wsUrl, options),
+    connect: (options) =>
+      connectViaWebSocket(bootstrap.wsUrl, {
+        ...options,
+        managedWorktreeService: bootstrap.managedWorktrees === true,
+      }),
     async checkAccess(signal) {
       const response = await fetch("/api/server-info", {
         cache: "no-store",

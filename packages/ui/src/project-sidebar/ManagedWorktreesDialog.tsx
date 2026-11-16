@@ -240,7 +240,9 @@ function WorktreeRow({
     intl.formatMessage({ id: `git.managedWorktree.dialog.${id}` }, values);
   const platform = usePlatform();
   const { copyPath, revealInFileManager } = useFileContextActions({
-    canOpenLocalFileManager: true,
+    // 修复原因：独立 Web 也可进入受管 Worktree 弹窗，但浏览器无法调用本机文件管理器；
+    // 依据 platform.canOpenLocalFiles 能力位决定，与其他文件菜单一致。
+    canOpenLocalFileManager: Boolean(platform.canOpenLocalFiles),
   });
   const missing = worktree.state === "missing";
   const branch = worktree.branchName
@@ -333,13 +335,15 @@ function WorktreeRow({
           </Button>
         ) : (
           <>
-            <IconAction
-              label={getFileManagerLabel(intl)}
-              testId="managed-worktree-reveal"
-              onClick={() => void revealInFileManager({ path: worktree.path, kind: "directory" })}
-            >
-              <FolderOpen className="size-3.5" />
-            </IconAction>
+            {platform.canOpenLocalFiles ? (
+              <IconAction
+                label={getFileManagerLabel(intl)}
+                testId="managed-worktree-reveal"
+                onClick={() => void revealInFileManager({ path: worktree.path, kind: "directory" })}
+              >
+                <FolderOpen className="size-3.5" />
+              </IconAction>
+            ) : null}
             {editor ? (
               <IconAction
                 label={intl.formatMessage(

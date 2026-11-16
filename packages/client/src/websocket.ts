@@ -25,6 +25,11 @@ interface WebSocketConnectionOptions {
    * 默认 false 让 services.windowControllerService 保持 undefined，消费方回退到 zcodeTaskService。
    */
   exposeWindowController?: boolean;
+  /**
+   * 是否暴露 managedWorktreeService。仅独立 Web 本地连接（非 /ws/remote/<id> 跨机代理）
+   * 由入口显式开启；缺省 false，避免远程/手机误订阅未注册频道。
+   */
+  managedWorktreeService?: boolean;
 }
 
 function wrapBrowserWebSocket(ws: WebSocket): ISocket {
@@ -120,7 +125,13 @@ export function connectViaWebSocket(
       options?.onOpenSocket?.(ws);
       // 普通 Web 的 Host 不注册 window-controller；缺省不暴露该代理，避免消费方选中
       // 惰性构造的"看似存在"对象后首次调用才报 Unknown channel。
-      resolve(new RemoteServiceAccess(client, { exposeWindowController: options?.exposeWindowController ?? false }));
+      // 独立服务器本地连接已注册受管 worktree 频道；由入口显式开启，跨机代理保持关闭。
+      resolve(
+        new RemoteServiceAccess(client, {
+          exposeWindowController: options?.exposeWindowController ?? false,
+          managedWorktreeService: options?.managedWorktreeService ?? false,
+        }),
+      );
     });
   });
 }

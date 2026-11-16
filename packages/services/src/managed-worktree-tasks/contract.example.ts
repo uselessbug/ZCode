@@ -1,6 +1,6 @@
 import type { IManagedWorktreeService } from "./contract.js";
 
-// 示例：管理弹窗读取项目的受管 worktree，并在没有任务占用时删除第一个。
+// 示例：管理弹窗（桌面 Host 或显式开启的独立 Web）读取项目的受管 worktree，并在没有任务占用时删除第一个。
 export async function exampleCleanup(service: IManagedWorktreeService, projectId: string) {
   const { groups } = await service.listWorktrees({ projectId });
   const first = groups[0]?.worktrees.find((worktree) => worktree.tasks.length === 0);

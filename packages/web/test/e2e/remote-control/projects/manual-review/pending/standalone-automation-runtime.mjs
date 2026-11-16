@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- 独立 HTTP 定时任务执行链与冻结目录快照回归集中在单脚本。 */
 // 独立 HTTP 定时任务执行链回归：真实 SQLite + AutomationRepo + AutomationService +
 // SourceServerWorkspaceAliasRepo + automation-runtime + node.ts createServerHostServices。
 // 运行：node packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-automation-runtime.mjs
@@ -30,6 +31,9 @@ const ENV_KEYS = [
   "ZCODE_DATA_DIR",
   "ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS",
   "ZCODE_CREDENTIAL_SECRET",
+  "ZCODE_AGENT_SERVER_COMMAND",
+  "ZCODE_AGENT_SERVER_ARGS_JSON",
+  "ZCODE_DEFAULT_WORKSPACE_DIR",
 ];
 const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
@@ -37,6 +41,7 @@ let db;
 let mod;
 let hostServicesEnabled;
 let hostServicesDisabled;
+let frozenServices;
 
 try {
   const shared = join(repoRoot, "packages/shared/src");
@@ -68,8 +73,9 @@ try {
       contents: [
         `export * from ${JSON.stringify(join(services, "node.ts"))};`,
         `export { createProjectService } from ${JSON.stringify(join(services, "project/index.ts"))};`,
-        `export { IZCodeAgentService, IProjectService, IModelSelectionService } from ${JSON.stringify(join(services, "index.ts"))};`,
+        `export { IZCodeAgentService, IProjectService, IModelSelectionService, IProviderSettingsService, ICredentialService } from ${JSON.stringify(join(services, "index.ts"))};`,
         `export { projectStorage } from ${JSON.stringify(join(services, "project-storage/index.ts"))};`,
+        `export { TaskIndexRepo } from ${JSON.stringify(join(services, "session/taskIndexRepo.ts"))};`,
         `export { runTasksDatabaseMigrations } from ${JSON.stringify(join(services, "session/tasksDatabase/migrations.ts"))};`,
         `export { createServerCredentialCipher } from ${JSON.stringify(join(shared, "credential-security/module.ts"))};`,
         `export { buildServerRemoteWorkspaceIdentity, remoteHostIdFromWorkspaceIdentity } from ${JSON.stringify(join(shared, "index.ts"))};`,
@@ -786,7 +792,289 @@ try {
     message: "Automation immediate dispatcher is unavailable.",
   });
   console.log("PASS createServerHostServices：启停边界与同路径共存零篡改");
+
+  // ---- 测试 8：冻结目录快照放行（项目 roots 修改/清空后，定时触发与 runAutomationNow 仍按原快照 A+B 创建会话；外部越界仍拒） ----
+  const frozenHostId = remoteHostIdFromWorkspaceIdentity(
+    buildServerRemoteWorkspaceIdentity({ serverId: "srv-frozen", workspacePath: "/" }),
+  );
+  const frozenRootA = join(workspaceRoot, "frozen-a");
+  const frozenRootB = join(workspaceRoot, "frozen-b");
+  const frozenRootC = join(workspaceRoot, "frozen-c");
+  await Promise.all(
+    [frozenRootA, frozenRootB, frozenRootC].map((d) => mkdir(d, { recursive: true })),
+  );
+  const frozenLogFile = join(temporary, "frozen-worker.ndjson");
+  await writeFile(frozenLogFile, "");
+  const frozenWorkerPath = join(temporary, "frozen-cli-worker.mjs");
+  await writeFile(
+    frozenWorkerPath,
+    `
+import { appendFileSync } from "node:fs";
+const logFile = process.argv[2];
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  while (buf.includes("\\n")) {
+    const idx = buf.indexOf("\\n");
+    const line = buf.slice(0, idx).trim();
+    buf = buf.slice(idx + 1);
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if (msg.id === undefined) continue;
+    if (msg.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { protocolName: "ZCode Protocol", protocolVersion: 1 } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "runtime/capabilities") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");
+      continue;
+    }
+    if (msg.method === "provider/refreshRegistry") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { refreshed: true } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "provider/updateAccountConfig") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: {
+          receivedRevision: msg.params.revision ?? "rev-1",
+          providerCount: Array.isArray(msg.params.providers) ? msg.params.providers.length : 0,
+          status: "received",
+        },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "workspace/updateInteractionPreferences") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: {
+          workspace: msg.params.workspace,
+          askUserQuestionAutoResolutionEnabled: msg.params.askUserQuestionAutoResolutionEnabled ?? true,
+          snoozedInteractionCount: 0,
+        },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "workspace/updateModelIoPreferences") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: {
+          workspace: msg.params.workspace,
+          fullRetentionEnabled: msg.params.fullRetentionEnabled ?? false,
+          updatedSessionCount: 0,
+        },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "workspace/updateOffPeakToolPolicy" || msg.method === "workspace/updateDynamicWorkflowPolicy") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: { workspace: msg.params.workspace, enabled: false },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "v4/conversation/subscribe") {
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: { ack: { subscriptionId: "sub-1", mode: "snapshot", logEpoch: "epoch-1" } },
+      }) + "\\n");
+      continue;
+    }
+    if (msg.method === "v4/sessionsIndex/reconcile" || msg.method === "session/list") {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { sessions: [] } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "session/create") {
+      appendFileSync(logFile, JSON.stringify({ method: msg.method, params: msg.params }) + "\\n");
+      const now = Date.now();
+      const snapshot = {
+        protocol: { name: "ZCode Protocol", version: 1 },
+        session: {
+          sessionId: msg.params.sessionId,
+          workspace: msg.params.workspace,
+          sessionKind: "interactive",
+          title: "Frozen Cron Session",
+          createdAt: now,
+          updatedAt: now,
+          mode: msg.params.mode ?? "build",
+          status: "idle",
+        },
+        settings: {
+          model: {
+            current: msg.params.model ?? { providerId: "zai-standard-api", modelId: "GLM-5.3", options: { reasoningLevel: "high" } },
+            available: [],
+          },
+          thoughtLevel: {
+            enabled: true,
+            current: "high",
+            available: [{ value: "high", label: "High" }],
+          },
+          mode: { current: msg.params.mode ?? "build" },
+          permission: { mode: msg.params.mode ?? "build" },
+        },
+        projection: {
+          sessionId: msg.params.sessionId,
+          status: "idle",
+          mode: msg.params.mode ?? "build",
+          turnCount: 0,
+          totalTokenCount: 0,
+          contextUsed: 0,
+          contextWindow: 128000,
+          pendingPermissions: [],
+          activeToolCalls: [],
+          backgroundJobs: [],
+        },
+        runtime: { eventSeq: 0, stateRevision: 0, pendingRequestIds: [] },
+        messages: [],
+      };
+      process.stdout.write(JSON.stringify({ id: msg.id, result: snapshot }) + "\\n");
+      continue;
+    }
+    if (msg.method === "v4/command") {
+      appendFileSync(logFile, JSON.stringify({ method: msg.method, params: msg.params }) + "\\n");
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: { status: "accepted", commandId: msg.params.commandId, revisionAtDecision: 1 },
+      }) + "\\n");
+      continue;
+    }
+    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");
+  }
+});
+`,
+  );
+
+  process.env.ZCODE_DEFAULT_WORKSPACE_DIR = workspaceRoot;
+  process.env.ZCODE_AGENT_SERVER_COMMAND = process.execPath;
+  process.env.ZCODE_AGENT_SERVER_ARGS_JSON = JSON.stringify([frozenWorkerPath, frozenLogFile]);
+  const frozenHost = await mod.createServerHostServices({
+    sourceServerId: "srv-frozen",
+    zcodeBuiltinProviderConfigFilePath: join(repoRoot, "config/provider/zcode-builtin.test.json"),
+    credentialCipherProvider: cipher,
+    automationExecutionEnabled: true,
+  });
+  frozenServices = frozenHost.services;
+  const frozenProviderSettings = frozenServices.get(mod.IProviderSettingsService);
+  const createdProvider = await frozenProviderSettings.createPersonalProvider({
+    templateId: "zai-standard-api",
+    providerName: "Frozen Test Provider",
+    initialConfig: {
+      access: { type: "api-key", apiKey: "sk-test-frozen" },
+    },
+  });
+  const frozenModelSelectionView = await frozenServices.get(mod.IModelSelectionService).getView();
+  const frozenModelSelection = frozenModelSelectionView.preferredSelection ?? {
+    providerId: createdProvider.providerId,
+    modelId: "GLM-5.3",
+    options: { reasoningLevel: "high" },
+  };
+
+  const frozenProjectSvc = frozenServices.get(mod.IProjectService);
+  const frozenAgentSvc = frozenServices.get(mod.IZCodeAgentService);
+  const frozenProj = await frozenProjectSvc.saveProject({
+    name: "Frozen Automation Proj",
+    roots: [frozenRootA, frozenRootB],
+    primaryRoot: frozenRootA,
+  });
+  const frozenManualAuto = await frozenAgentSvc.createAutomation({
+    projectId: frozenProj.id,
+    title: "Frozen Manual",
+    cronExpr: "0 9 * * *",
+    prompt: "Run manual on frozen A+B",
+    modelSelection: frozenModelSelection,
+    workspacePath: frozenRootA,
+  });
+  assert.equal(frozenManualAuto.workspacePath, frozenRootA);
+  assert.deepEqual(frozenManualAuto.additionalDirectories, [frozenRootB]);
+
+  const frozenSchedAuto = await frozenAgentSvc.createAutomation({
+    projectId: frozenProj.id,
+    title: "Frozen Schedule",
+    cronExpr: "*/5 * * * *",
+    prompt: "Run schedule on frozen A+B",
+    modelSelection: frozenModelSelection,
+    workspacePath: frozenRootA,
+    recurring: false,
+    maxRuns: 1,
+  });
+
+  // 修改项目 roots 为 C，甚至再清空为 0 root
+  await frozenProjectSvc.saveProject({ id: frozenProj.id, roots: [frozenRootC] });
+  await frozenAgentSvc.runAutomationNow(autoTarget(frozenManualAuto));
+
+  await frozenProjectSvc.saveProject({ id: frozenProj.id, roots: [] });
+  // 将 frozenSchedAuto 的 next_run_at 拨回过去并唤醒调度器
+  const defaultTaskDb = new DatabaseSync(join(mod.getAppConfigDir(), "tasks-index.sqlite"));
+  try {
+    defaultTaskDb
+      .prepare("UPDATE automations SET next_run_at = ? WHERE automation_id = ?")
+      .run(Date.now() - 10_000, frozenSchedAuto.automationId);
+  } finally {
+    defaultTaskDb.close();
+  }
+  await frozenAgentSvc.setAutomationEnabled({
+    ...autoTarget(frozenSchedAuto),
+    enabled: true,
+  });
+
+  await waitUntil(async () => {
+    const verifyRepo = new AutomationRepo();
+    try {
+      const mRuns = await verifyRepo.listRuns(frozenManualAuto.automationId);
+      const sRuns = await verifyRepo.listRuns(frozenSchedAuto.automationId);
+      return (
+        mRuns.some((r) => r.dispatchStatus === "dispatched" && r.sessionId) &&
+        sRuns.some((r) => r.dispatchStatus === "dispatched" && r.sessionId)
+      );
+    } finally {
+      verifyRepo.close();
+    }
+  }, "frozen snapshot manual and scheduled runs");
+
+  // 确认两次创建的任务行都以冻结的 A+B 落库，且发送给 CLI 的 additionalDirectories 为 [B]
+  const verifyRepo = new AutomationRepo();
+  const mRun = (await verifyRepo.listRuns(frozenManualAuto.automationId))[0];
+  const sRun = (await verifyRepo.listRuns(frozenSchedAuto.automationId))[0];
+  verifyRepo.close();
+  const verifyIdx = new mod.TaskIndexRepo(undefined, frozenHostId);
+  const verifyProjRepo = await verifyIdx.getProjectRepository({
+    allowStandaloneCloudWorkspaces: true,
+    standaloneWorkspaceRoot: workspaceRoot,
+    allowStandaloneMultiRoot: true,
+  });
+  for (const sid of [mRun.sessionId, sRun.sessionId]) {
+    const dirs = verifyProjRepo.resolveSessionDirectories({
+      taskId: sid,
+      workspacePath: frozenRootA,
+      workspaceIdentity: frozenManualAuto.workspaceIdentity,
+    });
+    assert.equal(dirs.workspacePath, frozenRootA);
+    assert.deepEqual(dirs.additionalDirectories, [frozenRootB]);
+  }
+  // 普通外部 reserveCreatedTask 传越界目录 A+B 仍必须被拒绝
+  assert.throws(
+    () =>
+      verifyProjRepo.reserveCreatedTask({
+        task: {
+          taskId: "external-bypass-attempt",
+          workspacePath: frozenRootA,
+          workspaceIdentity: frozenManualAuto.workspaceIdentity,
+        },
+        projectId: frozenProj.id,
+        additionalDirectories: [frozenRootB],
+      }),
+    /project\.cwd-not-in-roots/,
+  );
+  verifyIdx.close();
+  await mod.disposeServiceResourcesAndWait(frozenServices);
+  frozenServices = undefined;
+  console.log(
+    "PASS 冻结目录快照放行：项目 roots 变更/清空后 runAutomationNow 与定时触发仍以 A+B 建会话，普通越界仍拒绝",
+  );
 } finally {
+  if (frozenServices && mod)
+    await mod.disposeServiceResourcesAndWait(frozenServices).catch(() => {});
   for (const h of [hostServicesDisabled, hostServicesEnabled])
     if (h && mod) await mod.disposeServiceResourcesAndWait(h.services).catch(() => {});
   db?.close();

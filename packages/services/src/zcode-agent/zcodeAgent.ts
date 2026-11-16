@@ -149,6 +149,7 @@ import type {
   V4SessionDataParams,
   V4SessionDataPurgeResult,
 } from "@zcode/shared/zcode-protocol-v4";
+import { TRUSTED_FROZEN_EXECUTION_SNAPSHOT } from "#src/project-storage/contract.js";
 import { createServiceDescriptor } from "../descriptors.js";
 
 export * from "./zcodeAgentPluginParams.js";
@@ -284,6 +285,8 @@ export interface ZCodeAgentCreateSessionParams extends ZCodeAgentWorkspaceTarget
   toolAllowlist?: string[];
   toolDenylist?: string[];
   importedHistory?: ZCodeSessionImportHistory;
+  /** 仅定时任务冻结快照内部代理设置（见 TRUSTED_FROZEN_EXECUTION_SNAPSHOT）。 */
+  [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]?: true;
 }
 
 export interface ZCodeAgentListSessionsParams extends ZCodeAgentWorkspaceTarget {
@@ -571,6 +574,8 @@ export interface ZCodeAgentConversationCommandParams extends ZCodeAgentWorkspace
   envelope: CommandEnvelope;
   /** 只有 Host 进程内的受管 worktree 服务设置（见 HOST_WORKTREE_COMMAND）。 */
   [HOST_WORKTREE_COMMAND]?: true;
+  /** 仅定时任务冻结快照内部代理设置（见 TRUSTED_FROZEN_EXECUTION_SNAPSHOT）。 */
+  [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]?: true;
   /** 仅 host 内部用于 Browser Use runtime 边界，不进入 v4 wire envelope。 */
   clientMode?: ZCodeTaskClientMode;
 }
@@ -726,8 +731,12 @@ export interface IZCodeAgentService {
     params: ZCodeAgentListSessionSubagentsParams,
   ): Promise<ZCodeSessionSubagentsResult>;
   getAppUsageStats(params: ZCodeAgentAppUsageParams): Promise<AppUsageSnapshot>;
-  previewSessionDeletion?(params: V4SessionDeletionParams): Promise<V4SessionDeletionPreview>;
-  executeSessionDeletion?(params: V4SessionDeletionExecuteParams): Promise<V4SessionDeletionResult>;
+  previewSessionDeletion?(
+    params: V4SessionDeletionParams & { sessionDirectory?: string },
+  ): Promise<V4SessionDeletionPreview>;
+  executeSessionDeletion?(
+    params: V4SessionDeletionExecuteParams & { sessionDirectory?: string },
+  ): Promise<V4SessionDeletionResult>;
   /** 项目数据删除前的测量：只读，用本机已有 runtime 或管理面进程，不为某个项目拉起 Agent。 */
   measureSessionData?(params: V4SessionDataParams): Promise<V4SessionDataMeasureResult>;
   /**

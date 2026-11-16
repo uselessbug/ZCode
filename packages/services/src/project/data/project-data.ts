@@ -13,10 +13,19 @@ import type {
 
 const idsSchema = z.array(z.string().min(1)).min(1);
 
+/** 受管 worktree 任务的记忆与检查点归属主 workspacePath，不将临时/已删 worktree 目录当独立记忆 root。 */
+function taskMemoryDirectory(task: {
+  workspacePath: string;
+  cwd: string;
+  worktreeRoot?: string;
+}): string {
+  return task.worktreeRoot ? task.workspacePath : task.cwd;
+}
+
 /**
- * 每个项目可删除的目录 = roots ∪ 会话 cwd，扣除仍被范围外的项目作为 root、或被范围外
- * 任务作为 cwd 使用的目录（共享目录的记忆与检查点保留）。同批多个项目共享的目录只分给第一个。
- * 必须在删除任务行之前调用：候选 cwd 来自项目现有的任务行。
+ * 每个项目可删除的目录 = roots ∪ 会话目录，扣除仍被范围外的项目作为 root、或被范围外
+ * 任务作为目录使用的路径（共享目录的记忆与检查点保留）。同批多个项目共享的目录只分给第一个。
+ * 必须在删除任务行之前调用：候选目录来自项目现有的任务行。
  */
 function deletableDirectories(
   repository: ProjectRepositoryContract,
@@ -43,7 +52,9 @@ function deletableDirectories(
       const project = projects.find((entry) => entry.id === id);
       const candidates = [
         ...(project?.roots.map((root) => root.rootPath) ?? []),
-        ...rows.readProjectTaskRefs(id).map((task) => task.cwd),
+        ...rows
+          .readProjectTaskRefs(id)
+          .map((task) => taskMemoryDirectory(task as typeof task & { worktreeRoot?: string })),
       ];
       const directories = [...new Set(candidates)].filter(
         (path) => !inUse.has(path) && !assigned.has(path),
@@ -80,16 +91,20 @@ export function createProjectDataCommands(options: {
     if (!resolver) {
       return uniquePaths.map((workspacePath) => ({ workspacePath }));
     }
-    // 对每个目录独立解析 canonical 身份（不把 worktree 任务的归属身份误套用到另一个 cwd）。
-    return Promise.all(
+    // 独立 Web 普通会话与 worktree 会话的记忆落在无 identity 的本地路径哈希目录
+    // （<slug>-<sha256(path)>），而 Desktop Source Server canonical 会话落在 project-<sha256(canonical)>；
+    // 两者在磁盘上互不重叠，估算与清理时必须同时覆盖两个命名空间。
+    const resolved = await Promise.all(
       uniquePaths.map(async (workspacePath) => {
-        const workspaceIdentity = (await resolver(workspacePath))?.trim();
-        return {
-          workspacePath,
-          ...(workspaceIdentity ? { workspaceIdentity } : {}),
-        };
+        const canonical = (await resolver(workspacePath))?.trim();
+        const entries: ProjectDataDirectory[] = [{ workspacePath }];
+        if (canonical && canonical !== workspacePath) {
+          entries.push({ workspacePath, workspaceIdentity: canonical });
+        }
+        return entries;
       }),
     );
+    return resolved.flat();
   };
   return {
     async measureProjectData(ids, hostId) {
@@ -155,8 +170,10 @@ export function createProjectDataCommands(options: {
       );
       const deleted = new Set(sessions.deleted.map((entry) => entry.sessionId));
       const deletedTasks = tasks.filter((task) => deleted.has(task.taskId));
-      // 保留下来的会话仍在用自己的 cwd：其记忆与检查点不能删。
-      const survivors = tasks.filter((task) => !deleted.has(task.taskId)).map((task) => task.cwd);
+      // 保留下来的会话仍在用其所属记忆/检查点目录（worktree 任务对应主 workspacePath）：不能删。
+      const survivors = tasks
+        .filter((task) => !deleted.has(task.taskId))
+        .map((task) => taskMemoryDirectory(task as typeof task & { worktreeRoot?: string }));
       // 修复原因：目录曾在删除任务行之后才计算，已删任务独有的 cwd（如 roots 变更前的旧目录）
       // 从候选里消失，记忆与检查点永久漏删。任务行此时都还在。
       const directories = deletableDirectories(repository, rows, [id], survivors).get(id) ?? [];

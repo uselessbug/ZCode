@@ -3,15 +3,16 @@ import { basename } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { pauseAutomationsForArchivedTask } from "#src/session/automationRepo.js";
 import { isRemoteWorkspaceIdentity, resolveWorkspaceKey } from "@zcode/shared";
-import type {
-  AutoArchiveInput,
-  ProjectDirectories,
-  ProjectRepositoryContract,
-  ProjectRepositoryOptions,
-  ProjectTaskRef,
-  ProjectTree,
-  SaveProjectInput,
-  VirtualProject,
+import {
+  TRUSTED_FROZEN_EXECUTION_SNAPSHOT,
+  type AutoArchiveInput,
+  type ProjectDirectories,
+  type ProjectRepositoryContract,
+  type ProjectRepositoryOptions,
+  type ProjectTaskRef,
+  type ProjectTree,
+  type SaveProjectInput,
+  type VirtualProject,
 } from "#src/project-storage/contract.js";
 import {
   ensureHost,
@@ -241,7 +242,7 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
       .run(Date.now(), Date.now(), id, this.ownerHostId ?? "local");
   }
 
-  readProjectTaskRefs(id: string): Array<ProjectTaskRef & { cwd: string }> {
+  readProjectTaskRefs(id: string): Array<ProjectTaskRef & { cwd: string; worktreeRoot?: string }> {
     return this.db
       .prepare("SELECT * FROM tasks WHERE project_id=? AND host_id=? ORDER BY task_id")
       .all(id, this.ownerHostId ?? "local")
@@ -251,14 +252,18 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
         ...(row.workspace_identity == null
           ? {}
           : { workspaceIdentity: String(row.workspace_identity) }),
-        cwd: String(row.root_path ?? row.workspace_path),
+        ...(typeof row.worktree_root === "string" ? { worktreeRoot: row.worktree_root } : {}),
+        // 受管 worktree 任务的记忆与检查点归属主 workspacePath，不把临时/已删 worktree 目录当独立记忆 root（§3.12）。
+        cwd: String(
+          row.worktree_root != null ? row.workspace_path : (row.root_path ?? row.workspace_path),
+        ),
       }));
   }
 
   readTaskDirectories(): Array<{ projectId: string | null; cwd: string }> {
     return this.db
       .prepare(
-        "SELECT DISTINCT project_id, coalesce(root_path, workspace_path) AS cwd FROM tasks WHERE host_id=? AND deleted=0",
+        "SELECT DISTINCT project_id, CASE WHEN worktree_root IS NOT NULL THEN workspace_path ELSE coalesce(root_path, workspace_path) END AS cwd FROM tasks WHERE host_id=? AND deleted=0",
       )
       .all(this.ownerHostId ?? "local")
       .map((row) => ({
@@ -558,24 +563,40 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
             })
           : null;
       if (!readTask(this.db, task)) {
+        const trustedFrozenSnapshot =
+          TRUSTED_FROZEN_EXECUTION_SNAPSHOT in input &&
+          input[TRUSTED_FROZEN_EXECUTION_SNAPSHOT] === true;
+        const project = input.projectId ? requireProject(this.db, input.projectId) : null;
         assertRemoteTaskDirectories(
           this.ownerHostId,
-          input.projectId ? requireProject(this.db, input.projectId) : null,
+          project,
           task.workspacePath,
           input.additionalDirectories,
           this.standalonePolicy,
+          {
+            frozenExecutionSnapshot: trustedFrozenSnapshot,
+            worktreePlacement: placement,
+          },
         );
-        if (input.projectId) {
-          const project = requireProject(this.db, input.projectId);
-          if (project.deleted && input.additionalDirectories === undefined)
+        if (project) {
+          if (
+            project.deleted &&
+            !trustedFrozenSnapshot &&
+            (placement !== null || input.additionalDirectories === undefined)
+          )
             throw new Error("project.deleted");
           if (project.hostId !== host) throw new Error("project.cross-host-move");
           if (
+            !trustedFrozenSnapshot &&
             input.additionalDirectories === undefined &&
             !project.roots.some((root) => root.rootPath === task.workspacePath)
           )
             throw new Error("project.cwd-not-in-roots");
         }
+        const effectiveAdditionalDirectories =
+          trustedFrozenSnapshot && input.additionalDirectories === undefined
+            ? []
+            : input.additionalDirectories;
         // 创建归属必须先于 CLI 首发；空事实不是假会话，列表只读取已有 CLI 事实的行。
         this.db
           .prepare(`INSERT INTO tasks(workspace_key,workspace_path,workspace_identity,task_id,created_at,updated_at,host_id,root_path,project_id,handoff_pending,execution_directories,worktree_root)
@@ -589,9 +610,9 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
             placement?.cwd ?? inherited?.rootPath ?? task.workspacePath,
             input.projectId,
             OWNERSHIP_DECIDED,
-            input.additionalDirectories === undefined
+            effectiveAdditionalDirectories === undefined
               ? (inherited?.executionDirectories ?? null)
-              : JSON.stringify(executionDirectoriesSchema.parse(input.additionalDirectories)),
+              : JSON.stringify(executionDirectoriesSchema.parse(effectiveAdditionalDirectories)),
             placement?.worktreeRoot ?? inherited?.worktreeRoot ?? null,
           );
       }

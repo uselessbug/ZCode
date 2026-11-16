@@ -408,9 +408,10 @@ export function ProjectEditor({
   const needsConnection = remote && Boolean(devices) && selectedDevice?.status !== "online";
   // 目录编辑入口：真实远端既有项目 root 固定不可改；本地 / 独立 Web 可增删。
   const canEditFolders = !fixedFolder && (!singleRootMode || !project);
-  // 独立 Web 项目至少要保留 1 个 root：后端对 roots: [] 会沿用旧 root，
-  // 若仍显示移除按钮，用户移除最后一个后保存会「没有任何变化」而困惑，故最后一个 root 不给移除入口。
-  const canRemoveRoot = canEditFolders && !(isStandaloneWeb && project && roots.length <= 1);
+  // 修复原因：与官方桌面一致，允许把最后一个目录移除后保存为 0 目录空态；
+  // 后端已按 roots: [] 清空目录，不再需要屏蔽独立 Web 的最后一个移除入口。
+  // 真实远端 remote 的 canEditFolders 为 false，仍不可移除。
+  const canRemoveRoot = canEditFolders;
   return (
     <Dialog
       open={!suspended}
@@ -683,12 +684,6 @@ export function ProjectEditor({
                     ) : null}
                   </div>
                 </fieldset>
-                {isStandaloneWeb && !project && !roots.length ? (
-                  // 独立云端 Web 允许只填名称创建项目：说明未选目录时服务器会自动分配专用目录。
-                  <p className="text-ui-sm text-foreground-subtle">
-                    {msg("standaloneAutoRootHint")}
-                  </p>
-                ) : null}
                 {legacyDeviceId === hostId ? (
                   <p className="text-ui-sm text-foreground-subtle">
                     {msg("legacyUpgradeRequired")}

@@ -79,7 +79,7 @@
 
 只有同时满足以下条件，才显示 worktree 复选框和"在新 worktree 中分叉"：
 
-- 本地桌面窗口。手机远控和 Web 远控不显示。
+- 本地桌面窗口，或开启本地 Host 兼容的独立云端 Web（`serviceAuthorityMode === "standalone-server"` 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"`，与桌面共享同一套服务器本地 Git 仓库受管 worktree 能力，任务与项目保持 `workspaceIdentity: undefined` 与 `hostId: projectStorageHostId`）。手机远控和未开启独立 Web 兼容的远控终端不显示。
 - 当前项目的主目录是 Git 仓库。非 Git 项目不显示。
 - 项目不是远程项目，草稿已归属某个项目。
 
@@ -405,7 +405,8 @@ interface ManagedWorktreeCreation {
     <仓库名>/                    linked worktree，`.git` 是一个文件
 ```
 
-- 数据根目录与 Host、CLI 一致：`ZCODE_DATA_BASE_DIR` 优先，否则 homedir。bucket 只有 4 位，用来控制 Windows 路径长度。
+- 数据根目录：桌面与 CLI 默认按 `ZCODE_DATA_BASE_DIR` / homedir 解析（bucket 为 4 位，用来控制 Windows 路径长度）；独立云端 Web（`standalone-server` 且开启 `allowStandaloneCloudWorkspaces`）将 `createGitWorktreeRepo` 的 `dataBaseDir` 设为 `standaloneWorkspaceRoot`（默认 `/workspace`），使受管 worktree 落在 `<standaloneWorkspaceRoot>/.zcode/worktrees/<bucket>/<name>`，与 `/workspace/<repo>` 同挂载卷且不撑大 `data/zcode` 自更新备份包。
+- 独立云端 Web 权限与数据归属：`packages/server/src/http.ts` 在 `clientMode !== "desktop-continuous"` 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS !== "1"` 时拒绝 `IManagedWorktreeService` 全部方法（`worktree.local-only`）；`ProjectRepository` / `remote-policy` 在开启独立 Web 多目录兼容且存在合法 `worktreePlacement` 时，校验 `task.workspacePath` 属于项目 roots 并放行位于 `worktreeRoot` 内的 `cwd` 与映射后的 `additionalDirectories`；彻底删除项目数据或归档永久删除时，受管 worktree 任务的记忆、检查点与工作区归属均归一到主 `workspacePath`。
 - 受管判定：路径符合两级布局；出现在源仓库的 `git worktree list --porcelain` 中；`.git` 是文件且 `git rev-parse --git-common-dir` 指向源仓库。不满足的条目不显示，也不允许删除。
 - 项目主目录可能是仓库的子目录（monorepo）。worktree 总是检出整个仓库，任务 cwd 取 `<worktree 根>/<主目录相对仓库 toplevel 的路径>`。起点中没有这个子目录时，创建失败（`start-ref-missing-subdir`）。
 

@@ -1848,7 +1848,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   const draftProjectId = useZCodeSessionStore(
     (state) => state.getWorkspaceState(workspaceAbsPath, workspaceIdentity).draftProjectId ?? null,
   );
-  // worktree 复选框只对本地桌面的 Git 项目草稿开放（docs/git/worktree.md §3.1）。
+  // worktree 复选框只对本地（桌面或独立 Web 本地连接，需 Host 提供 managedWorktreeService）的 Git 项目草稿开放（docs/git/worktree.md §3.1）。
   const worktreeEligible =
     activeWorkspacePurpose === "project" &&
     !isOfficeMode &&

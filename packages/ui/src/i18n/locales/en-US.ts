@@ -308,8 +308,6 @@ const enUS: Record<string, string> = {
   "project.remoteSingleRootRequired": "A remote project supports exactly one source folder.",
   "project.remoteProjectRequired": "This workspace requires selecting or creating a project first.",
   "project.remoteRootImmutable": "A saved project's source folder cannot be changed.",
-  "project.standaloneAutoRootHint":
-    "With no folder selected, a dedicated project folder is created under the server workspace's projects directory.",
   "project.unresolved": "Select a project",
   "project.removeEntry": "Remove from this device",
   "project.addFolder": "Add folder to project",

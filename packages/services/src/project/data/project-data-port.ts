@@ -54,22 +54,32 @@ export function createProjectDataPort(options: {
     }));
   return {
     async measure({ sessions, directories }) {
+      const uniquePaths = [...new Set(directories.map((dir) => dir.workspacePath))];
       const [agent, checkpoints] = await Promise.all([
         options.agent.measure({
           sessionIds: sessions.map((session) => session.sessionId),
           directories: toWireDirectories(directories),
         }),
-        Promise.all(
-          directories.map((dir) => directoryBytes(options.checkpointDirectory(dir.workspacePath))),
-        ),
+        Promise.all(uniquePaths.map((path) => directoryBytes(options.checkpointDirectory(path)))),
       ]);
-      const memory = new Map(agent.memory.map((entry) => [entry.workspacePath, entry.bytes]));
+      // 同一 path 可能同时存在无 identity 本地路径记忆与 canonical 记忆两个独立哈希目录，
+      // 必须按 workspacePath 累加两者的记忆字节数，而检查点只按唯一 path 统计一次。
+      const memoryByPath = new Map<string, number>();
+      for (const entry of agent.memory) {
+        memoryByPath.set(
+          entry.workspacePath,
+          (memoryByPath.get(entry.workspacePath) ?? 0) + entry.bytes,
+        );
+      }
+      const checkpointByPath = new Map(
+        uniquePaths.map((path, index) => [path, checkpoints[index]!] as const),
+      );
       return {
         sessions: agent.sessions,
-        directories: directories.map((dir, index) => ({
-          path: dir.workspacePath,
-          memoryBytes: memory.get(dir.workspacePath) ?? 0,
-          checkpointBytes: checkpoints[index]!,
+        directories: uniquePaths.map((path) => ({
+          path,
+          memoryBytes: memoryByPath.get(path) ?? 0,
+          checkpointBytes: checkpointByPath.get(path) ?? 0,
         })),
       };
     },
@@ -133,16 +143,22 @@ export function createProjectDataPort(options: {
           directories: toWireDirectories(directories),
         });
         bytes += purged.memory.reduce((sum, entry) => sum + entry.bytes, 0);
-        failed.push(...purged.failed.flatMap((entry) => entry.workspacePath ?? []));
+        for (const entry of purged.failed) {
+          if (entry.workspacePath && !failed.includes(entry.workspacePath)) {
+            failed.push(entry.workspacePath);
+          }
+        }
       } catch (error) {
         log.warn(undefined, "Memory purge failed", {
           directories: directories.length,
           error: String(error),
         });
-        failed.push(...directories.map((dir) => dir.workspacePath));
+        for (const dir of directories) {
+          if (!failed.includes(dir.workspacePath)) failed.push(dir.workspacePath);
+        }
       }
-      for (const dir of directories) {
-        const path = dir.workspacePath;
+      const uniquePaths = [...new Set(directories.map((dir) => dir.workspacePath))];
+      for (const path of uniquePaths) {
         const directory = options.checkpointDirectory(path);
         try {
           const size = await directoryBytes(directory);

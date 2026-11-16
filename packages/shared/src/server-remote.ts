@@ -40,6 +40,8 @@ export const serverRemoteInfoSchema = z.object({
     desktopContinuous: z.literal(true),
     websocketRpc: z.literal(true),
     virtualProjects: z.literal(true).optional(),
+    // 独立 Web 本地连接已注册受管 worktree 频道时才声明；缺省视为不支持，前端据此 fail-closed。
+    managedWorktrees: z.literal(true).optional(),
     // 旧 Server 缺少新增 dynamic event，必须先声明能力再订阅，避免异常打进对端读循环。
     processResourceTelemetry: z.boolean().optional(),
     remoteConversationTelemetry: z.boolean().optional(),
@@ -64,6 +66,7 @@ export const serverRemoteInfoOutputSchema = z
         desktopContinuous: z.literal(true),
         websocketRpc: z.literal(true),
         virtualProjects: z.literal(true).optional(),
+        managedWorktrees: z.literal(true).optional(),
         // 输入和严格输出保持同一能力合同，否则新 Server 会在监听前被自身 schema 拒绝。
         processResourceTelemetry: z.boolean().optional(),
         remoteConversationTelemetry: z.boolean().optional(),

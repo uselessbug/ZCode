@@ -11,6 +11,7 @@ import { createNodeWebSocket } from "@hono/node-ws";
 import type { WebSocket } from "ws";
 import {
   Emitter,
+  Event,
   VSBuffer,
   SocketProtocol,
   ChannelServer,
@@ -25,6 +26,7 @@ import {
   IZCodeAgentService,
   createZCodeAgentConnectionScope,
   IBotsService,
+  IManagedWorktreeService,
   IProviderProvisioningTargetService,
   IProjectService,
 } from "@zcode/services";
@@ -173,6 +175,34 @@ function setupChannelServer(
       },
     });
   }
+  // 受管 worktree 仅在受信 Desktop Host 或显式开启独立 Web 兼容的端上暴露；
+  // 未开启独立 Web 兼容的远控终端客户端一律拒绝 worktree.local-only。
+  if (
+    clientMode !== "desktop-continuous" &&
+    process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS !== "1" &&
+    services.getOptional(IManagedWorktreeService)
+  ) {
+    const rejectLocalOnly = async (): Promise<never> => {
+      throw new Error("worktree.local-only");
+    };
+    const disabledManagedWorktreeService: IManagedWorktreeService = {
+      startNewTask: rejectLocalOnly,
+      forkToWorktree: rejectLocalOnly,
+      retryCreation: rejectLocalOnly,
+      continueWithoutWorktree: rejectLocalOnly,
+      dismissCreation: rejectLocalOnly,
+      listCreations: rejectLocalOnly,
+      onDidChangeCreations: Event.None,
+      onDidSettleCreation: Event.None,
+      listWorktrees: rejectLocalOnly,
+      removeWorktree: rejectLocalOnly,
+      pruneWorktrees: rejectLocalOnly,
+      listStartRefs: rejectLocalOnly,
+      isWorktreeAvailable: rejectLocalOnly,
+      supportsWorktreeCwd: rejectLocalOnly,
+    };
+    overrides.set(IManagedWorktreeService.channelName, disabledManagedWorktreeService);
+  }
   if (
     clientMode === "web-remote-replayable" &&
     process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"
@@ -256,6 +286,9 @@ function createServerInfo(options: HttpServerOptions): ServerRemoteInfo {
       desktopContinuous: true,
       websocketRpc: true,
       ...(options.virtualProjects ? { virtualProjects: true } : {}),
+      ...(process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"
+        ? { managedWorktrees: true }
+        : {}),
       processResourceTelemetry: true,
       remoteConversationTelemetry: true,
     },

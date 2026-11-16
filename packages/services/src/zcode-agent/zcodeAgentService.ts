@@ -344,6 +344,7 @@ import type {
   ZCodeAgentSessionsIndexSubscribeParams,
   ZCodeAgentWorkspaceConfigSubscribeParams,
 } from "./zcodeAgent.js";
+import { TRUSTED_FROZEN_EXECUTION_SNAPSHOT } from "#src/project-storage/contract.js";
 import { HOST_WORKTREE_COMMAND } from "./zcodeAgent.js";
 import {
   backgroundBashOutputResultSchema,
@@ -436,6 +437,7 @@ import {
 } from "./zcodeProtocolClient.js";
 import { getDataBaseDir } from "../paths.js";
 import {
+  closeTaskBrowserSessionsBestEffort,
   collectBrowserAmbientContext,
   type BrowserAmbientContextExecutor,
 } from "./zcodeAgentBrowserAmbientContext.js";
@@ -1161,6 +1163,7 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
       projectId: string | null;
       creationCommand?: { clientId: string; commandId: string };
       additionalDirectories?: string[];
+      [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]?: true;
     },
   ) => Promise<{ sessionId: string; additionalDirectories: string[] }>;
   /** fork 提交后、ACK 返回前完成 Host 归属交接；duplicate 重放须幂等。 */
@@ -1644,6 +1647,9 @@ export function createZCodeAgentService(
         key =
           (typeof ref.workspaceIdentity === "string" && ref.workspaceIdentity.trim()) ||
           ref.workspacePath;
+    }
+    if (!key && typeof data.workspaceKey === "string" && data.workspaceKey.trim()) {
+      key = data.workspaceKey.trim();
     }
     if (!key && typeof data.workspacePath === "string") {
       key =
@@ -3413,8 +3419,19 @@ export function createZCodeAgentService(
             void client.respond(request.id, { browsers: [] });
             return;
           }
+          const browserWorkspaceIdentity =
+            workspace.workspaceIdentity ?? parsed.data.workspaceIdentity;
+          const browserRemoteSessionId = workspace.remoteSessionId ?? parsed.data.remoteSessionId;
           void executor
-            .list(parsed.data)
+            .list({
+              ...parsed.data,
+              // worktree 会话的 CLI directory 与主项目不同；统一归一到所属 CLI runtime 的主工作区，
+              // 确保浏览器上下文与 closeTaskSessions 按同一归属主仓库匹配。
+              workspaceKey: resolveWorkspaceKey(workspace),
+              workspacePath: workspace.workspacePath,
+              ...(browserWorkspaceIdentity ? { workspaceIdentity: browserWorkspaceIdentity } : {}),
+              ...(browserRemoteSessionId ? { remoteSessionId: browserRemoteSessionId } : {}),
+            })
             .then((browsers) => client.respond(request.id, { browsers }))
             .catch((error: unknown) => {
               void client.respondError(request.id, {
@@ -3453,6 +3470,9 @@ export function createZCodeAgentService(
             });
             return;
           }
+          const browserWorkspaceIdentity =
+            workspace.workspaceIdentity ?? parsed.data.workspaceIdentity;
+          const browserRemoteSessionId = workspace.remoteSessionId ?? parsed.data.remoteSessionId;
           void executor
             .execute({
               requestId: parsed.data.requestId,
@@ -3463,16 +3483,10 @@ export function createZCodeAgentService(
                 : {}),
               sessionId: parsed.data.sessionId,
               ...(parsed.data.turnId ? { turnId: parsed.data.turnId } : {}),
-              workspaceKey: parsed.data.workspaceKey ?? resolveWorkspaceKey(workspace),
-              workspacePath: parsed.data.workspacePath ?? workspace.workspacePath,
-              ...((parsed.data.workspaceIdentity ?? workspace.workspaceIdentity)
-                ? {
-                    workspaceIdentity: parsed.data.workspaceIdentity ?? workspace.workspaceIdentity,
-                  }
-                : {}),
-              ...(parsed.data.remoteSessionId
-                ? { remoteSessionId: parsed.data.remoteSessionId }
-                : {}),
+              workspaceKey: resolveWorkspaceKey(workspace),
+              workspacePath: workspace.workspacePath,
+              ...(browserWorkspaceIdentity ? { workspaceIdentity: browserWorkspaceIdentity } : {}),
+              ...(browserRemoteSessionId ? { remoteSessionId: browserRemoteSessionId } : {}),
               clientMode: parsed.data.clientMode ?? "desktop-continuous",
               sessionContext: parsed.data.sessionContext ?? "live",
               command: parsed.data.command,
@@ -4567,6 +4581,9 @@ export function createZCodeAgentService(
         projectId: params.projectId ?? null,
         creationCommand: { clientId: envelope.clientId, commandId: envelope.commandId },
         additionalDirectories: payload.additionalDirectories,
+        ...(params[TRUSTED_FROZEN_EXECUTION_SNAPSHOT]
+          ? { [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]: true as const }
+          : {}),
       });
       const sessionId = prepared?.sessionId ?? payload.sessionId;
       const additionalDirectories =
@@ -4728,6 +4745,9 @@ export function createZCodeAgentService(
         const prepared = await options.prepareSessionCreation({
           ...params,
           projectId: params.projectId ?? null,
+          ...(params[TRUSTED_FROZEN_EXECUTION_SNAPSHOT]
+            ? { [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]: true as const }
+            : {}),
         });
         params = {
           ...params,
@@ -4986,19 +5006,51 @@ export function createZCodeAgentService(
 
     async previewSessionDeletion(params) {
       const client = await resolveSessionDeletionClient(params.workspace);
+      const { sessionDirectory, ...wireParams } = params;
+      const requestParams = sessionDirectory
+        ? {
+            ...wireParams,
+            workspace: { ...wireParams.workspace, workspacePath: sessionDirectory },
+          }
+        : wireParams;
       return client.request(
         V4_METHODS.sessionDeletionPreview,
-        params,
+        requestParams,
         v4SessionDeletionPreviewSchema,
       );
     },
     async executeSessionDeletion(params) {
       const client = await resolveSessionDeletionClient(params.workspace);
-      return client.request(
+      const { sessionDirectory, ...wireParams } = params;
+      const requestParams = sessionDirectory
+        ? {
+            ...wireParams,
+            workspace: { ...wireParams.workspace, workspacePath: sessionDirectory },
+          }
+        : wireParams;
+      const result = await client.request(
         V4_METHODS.sessionDeletionExecute,
-        params,
+        requestParams,
         v4SessionDeletionResultSchema,
       );
+      if (result.status === "deleted" && result.sessionIds.length > 0) {
+        await closeTaskBrowserSessionsBestEffort(
+          options?.browserControlExecutor,
+          {
+            workspacePath: params.workspace.workspacePath,
+            ...(params.workspace.workspaceIdentity
+              ? { workspaceIdentity: params.workspace.workspaceIdentity }
+              : {}),
+            sessionIds: result.sessionIds,
+          },
+          (error) =>
+            logger.warn(undefined, "归档永久删除后回收浏览器会话失败", {
+              sessionIds: result.sessionIds,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+        );
+      }
+      return result;
     },
 
     async measureSessionData(params) {
@@ -5035,7 +5087,37 @@ export function createZCodeAgentService(
       // 复用 resolveSessionDeletionClient 同源门禁：优先命中热运行 CLI 保护 busy 会话，
       // 仅在 ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE 且归属当前 Host 时回落管理面进程，绝不吞掉其他异常。
       const client = await resolveSessionDeletionClient(workspace);
-      return client.request(V4_METHODS.sessionDataPurge, params, v4SessionDataPurgeResultSchema);
+      const result = await client.request(
+        V4_METHODS.sessionDataPurge,
+        params,
+        v4SessionDataPurgeResultSchema,
+      );
+      // 仅清理实际 deleted 会话树（含各自 owned 子会话），kept（运行中/被引用）与 failed 均保留。
+      const deletedSessionIds = [
+        ...new Set(
+          result.deleted.flatMap((entry) =>
+            entry.sessionIds?.length ? entry.sessionIds : [entry.sessionId],
+          ),
+        ),
+      ];
+      if (deletedSessionIds.length > 0) {
+        await closeTaskBrowserSessionsBestEffort(
+          options?.browserControlExecutor,
+          {
+            workspacePath: workspace.workspacePath,
+            ...(workspace.workspaceIdentity
+              ? { workspaceIdentity: workspace.workspaceIdentity }
+              : {}),
+            sessionIds: deletedSessionIds,
+          },
+          (error) =>
+            logger.warn(undefined, "项目数据清理后回收浏览器会话失败", {
+              sessionIds: deletedSessionIds,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+        );
+      }
+      return result;
     },
 
     async getTaskTokenUsage(params: ZCodeAgentTaskTokenUsageParams) {

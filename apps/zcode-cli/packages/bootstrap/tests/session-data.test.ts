@@ -26,7 +26,9 @@ function harness(
         new Map(ids.map((id) => [id, trees[id] ?? []] as const)) as never,
       listArtifactReferrers: async (ids) =>
         new Map(
-          ids.flatMap((id) => (options.referrers?.[id] ? [[id, options.referrers[id]] as const] : [])),
+          ids.flatMap((id) =>
+            options.referrers?.[id] ? [[id, options.referrers[id]] as const] : [],
+          ),
         ) as never,
       purgeSessions: async (ids) => {
         calls.push(`purge:${ids.join(",")}`);
@@ -35,7 +37,8 @@ function harness(
     files: {
       measureSession: async (id) => sizes[id] ?? 0,
       removeSession: async (id) => {
-        if (options.failFiles?.includes(id)) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+        if (options.failFiles?.includes(id))
+          throw Object.assign(new Error("busy"), { code: "EBUSY" });
         calls.push(`files:${id}`);
         return sizes[id] ?? 0;
       },
@@ -77,7 +80,7 @@ describe("session data", () => {
     const { host, calls } = harness({ loaded: ["sess_a_child"] });
     const result = await purgeSessionDataWith(host, { sessionIds: ["sess_a"], directories });
     expect(result).toEqual({
-      deleted: [{ sessionId: "sess_a", bytes: 15 }],
+      deleted: [{ sessionId: "sess_a", bytes: 15, sessionIds: ["sess_a", "sess_a_child"] }],
       kept: [],
       failed: [],
       memory: [{ workspacePath: "/work/a", bytes: 4 }],
@@ -100,7 +103,7 @@ describe("session data", () => {
       directories: [],
     });
     expect(result.kept).toEqual([{ sessionId: "sess_a", reason: "running" }]);
-    expect(result.deleted).toEqual([{ sessionId: "sess_b", bytes: 7 }]);
+    expect(result.deleted).toEqual([{ sessionId: "sess_b", bytes: 7, sessionIds: ["sess_b"] }]);
     expect(calls.some((call) => call.includes("sess_a"))).toBe(false);
   });
 
@@ -121,7 +124,7 @@ describe("session data", () => {
       directories: [],
     });
     expect(result.kept).toEqual([{ sessionId: "sess_a", reason: "referenced" }]);
-    expect(result.deleted).toEqual([{ sessionId: "sess_b", bytes: 7 }]);
+    expect(result.deleted).toEqual([{ sessionId: "sess_b", bytes: 7, sessionIds: ["sess_b"] }]);
     expect(calls.some((call) => call.includes("sess_a"))).toBe(false);
   });
 
@@ -156,7 +159,9 @@ describe("session data", () => {
   it("treats a session that no longer exists as deleted, still clearing leftover files", async () => {
     const { host, calls } = harness();
     const result = await purgeSessionDataWith(host, { sessionIds: ["sess_gone"], directories: [] });
-    expect(result.deleted).toEqual([{ sessionId: "sess_gone", bytes: 3 }]);
+    expect(result.deleted).toEqual([
+      { sessionId: "sess_gone", bytes: 3, sessionIds: ["sess_gone"] },
+    ]);
     expect(calls).toEqual(["files:sess_gone", "purge:sess_gone", "forget:sess_gone"]);
   });
 });

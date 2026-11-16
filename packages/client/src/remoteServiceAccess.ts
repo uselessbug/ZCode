@@ -74,7 +74,7 @@ export interface RemoteServiceAccessOptions {
   deviceSyncStateService?: boolean;
   /** 仅桌面 base 连接开启：扩展宿主门面与视图/授权频道。 */
   extensionsService?: boolean;
-  /** 仅桌面 base 连接开启：受管 worktree 任务服务。 */
+  /** 仅桌面 base 与独立 Web 本地连接开启：受管 worktree 任务服务；跨机代理/手机远控不开。 */
   managedWorktreeService?: boolean;
   windowProjectDirectory?: boolean;
   /**
@@ -232,7 +232,7 @@ export class RemoteServiceAccess implements IServiceAccessor {
     this.projectService = ProxyChannel.toService<IProjectService>(
       channelClient.getChannel(IProjectService.channelName),
     );
-    // 代理对象不能证明远端注册了频道；只在桌面 base 明确提供能力时创建，避免远程/手机误订阅。
+    // 代理对象不能证明远端注册了频道；只在桌面 base 或独立 Web 本地连接明确提供能力时创建，避免远程/手机误订阅。
     this.managedWorktreeService = options.managedWorktreeService
       ? ProxyChannel.toService<IManagedWorktreeService>(
           channelClient.getChannel(IManagedWorktreeService.channelName),

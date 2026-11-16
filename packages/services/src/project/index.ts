@@ -123,16 +123,6 @@ const saveProjectSchema = z
     "project.restore-roots-required",
   );
 
-/** 自动分配的项目目录名：只保留路径安全字符，非 ASCII 名称退化为 project，唯一性由 id 前缀保证。 */
-function sanitizeStandaloneDirectoryName(value: string): string {
-  const sanitized = value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return sanitized || "project";
-}
-
 export function createProjectService(options: {
   repository(): Promise<ProjectRepositoryContract>;
   workspaceDirectory: string;
@@ -236,31 +226,8 @@ export function createProjectService(options: {
             ),
           ]
         : undefined;
-      let roots = providedRoots;
-      const remoteOwner = Boolean(options.ownerHostId && options.ownerHostId !== "local");
-      if (remoteOwner && standaloneCloudWorkspaces() && (providedRoots?.length ?? 0) === 0) {
-        // 0 目录新建项目：在独立云端工作区根下自动分配专用目录并固定为唯一 root。
-        // 已有 root 的项目沿用既有 root（幂等重试），不能重新分配，否则触发 remote-root-immutable。
-        const existing = input.id
-          ? (await options.repository())
-              .readTree({ includeTasks: false })
-              .projects.find((item) => item.id === input.id)
-          : undefined;
-        const previousRoots = existing?.roots.map((root) => root.rootPath) ?? [];
-        if (previousRoots.length > 0) roots = previousRoots;
-        else {
-          const allocatedRoot = join(
-            standaloneWorkspaceRoot(),
-            "projects",
-            `${sanitizeStandaloneDirectoryName(
-              input.name ?? input.defaultName ?? "project",
-            )}-${input.id ? input.id.slice(0, 8) : randomUUID().slice(0, 8)}`,
-          );
-          await mkdir(allocatedRoot, { recursive: true });
-          roots = [allocatedRoot];
-        }
-      }
-      // 只校验调用方显式传入的目录；自动分配的目录刚由 mkdir 创建，沿用的 root 此前已存在。
+      // 独立云端 Web 与官方桌面共享 0..n 目录生命周期：0 目录新建或编辑清空为 roots: [] 时原样落库，
+      // 不提前在磁盘建目录，也不再生成 <slug>-<id> 占位目录；undefined 仍沿用旧 roots。
       await Promise.all(
         (providedRoots ?? []).map(async (path) => {
           if (!(await stat(path)).isDirectory()) throw new Error("project.directory-required");
@@ -268,7 +235,7 @@ export function createProjectService(options: {
       );
       const result = (await options.repository()).saveProject({
         ...input,
-        roots,
+        roots: providedRoots,
         ...(input.primaryRoot ? { primaryRoot: normalize(input.primaryRoot) } : {}),
       });
       await changed();
@@ -366,11 +333,9 @@ export function createProjectService(options: {
         if (remoteOwner && project.roots.length !== 1 && !standaloneMultiRoot())
           throw new Error("project.remote-single-root-required");
         if (!project.roots.length) {
-          // 多窗口为同一空项目生成同一个目录，不依赖进程间定时锁。
-          // 独立云端项目目录必须落在配置的工作区根下，不能建到进程内部 home。
-          const path = standaloneCloudWorkspaces()
-            ? join(standaloneWorkspaceRoot(), "projects", id)
-            : join(options.workspaceDirectory, id);
+          // 多窗口为同一空项目生成同一个目录，不依赖进程间定时锁；独立云端由装配层把
+          // workspaceDirectory 设为 <standaloneWorkspaceRoot>/.zcode/workspace，复用同一懒创建路径。
+          const path = join(options.workspaceDirectory, id);
           await mkdir(path, { recursive: true });
           // 空判断和 INSERT 必须共用写事务，防止另一 Host 的 roots 编辑被覆盖。
           project = repo.initializeProjectRoot(id, path);

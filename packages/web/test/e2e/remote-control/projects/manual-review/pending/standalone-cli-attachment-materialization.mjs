@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- 独立回归脚本覆盖附件具名落盘、预读、永久删除与浏览器租约全链路 */
 // 独立 CLI 附件物化与字节分流运行时回归（本地 esbuild 打包真实源码，在 mkdtemp 隔离目录中实测）。
 //
 // 被测真实源码：
@@ -19,10 +20,10 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { builtinModules, createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -243,7 +244,11 @@ try {
     `export { buildProviderRequestMessages } from ${JSON.stringify(join(cliPackages, "core/src/runtime/helpers/provider-request-messages.ts"))};`,
     `export { persistUserPrompt } from ${JSON.stringify(join(cliPackages, "core/src/runtime/methods/message-persistence.ts"))};`,
     `export { createNodeSessionDataFiles, createNodeToolArtifactStore, createSqliteSessionStore } from ${JSON.stringify(join(cliPackages, "adapters/src/storage/index.ts"))};`,
+    `export { createNodeFileSystemAdapter } from ${JSON.stringify(join(cliPackages, "adapters/src/fs/index.ts"))};`,
+    `export { createManagedCdpBrowserRuntime } from ${JSON.stringify(join(cliPackages, "adapters/src/browser/index.ts"))};`,
+    `export { createProtocolBrowserControlBroker } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol/browser-control-broker.ts"))};`,
     `export { purgeSessionDataWith } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol/session-data/index.ts"))};`,
+    `export { executeSessionDeletionWith, previewSessionDeletionWith } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol/session-data/permanent-deletion.ts"))};`,
     `export { createMessageId, createProjectId, createSessionId, SessionEventType } from ${JSON.stringify(join(cliPackages, "contracts/src/index.ts"))};`,
     `export { ConversationV4Gateway } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol-v4/v4-gateway.ts"))};`,
     `export { createZCodeApp } from ${JSON.stringify(join(cliPackages, "bootstrap/src/app/create-app.ts"))};`,
@@ -304,9 +309,11 @@ try {
   };
 
   const sessionId = await ensureSession("sess-attach-1", "attach-reg", "Attachment Regression");
+  const fileSystemPort = mod.createNodeFileSystemAdapter();
   const resolveWithStore = (attachments, targetSessionId = sessionId) =>
     mod.resolveTurnAttachments(attachments, {
       artifactStore,
+      fileSystemPort,
       sessionId: targetSessionId,
       traceContext,
       workingDirectory: tempRoot,
@@ -322,21 +329,35 @@ try {
     });
 
   // -------------------------------------------------------------------------
-  // 场景 1：1KiB 随机 .zip 与伪 .docx（PK 头二进制）
+  // 场景 1：1KiB 随机 .zip 与中文+空格真实 .docx（PK 头二进制）
   // -------------------------------------------------------------------------
   const zipBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), randomBytes(1020)]);
   const docxBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), randomBytes(508)]);
+  const docxName = "日本文学史 复习资料 (期末).docx";
   const zipArt = await uploadArtifact("bundle.zip", "application/zip", zipBytes);
   // 故意给伪 .docx 标成 text/plain，验证二进制扩展名排除不被 MIME 误导
-  const docxArt = await uploadArtifact("spec.docx", "text/plain", docxBytes);
+  const docxArt = await uploadArtifact(docxName, "text/plain", docxBytes);
 
   // -------------------------------------------------------------------------
-  // 场景 2：100KiB UTF-8 .log
+  // 场景 2：70KiB / 100KiB UTF-8 .log 与 >300KiB 超大文本（统一走桌面 readTextFileForModel）
   // -------------------------------------------------------------------------
-  const largeLogText = `${"2026-11-16T00:00:00Z INFO attachment test line\n".repeat(2200)}`;
+  const fullLogText = `${"2026-11-16T00:00:00Z INFO attachment test line\n".repeat(1550)}`; // ~69.8 KiB (>64KiB, <=25k tokens)
+  const fullLogBytes = Buffer.from(fullLogText, "utf8");
+  assert.ok(fullLogBytes.byteLength > 64 * 1024, "70KiB log fixture must exceed 64KiB");
+  const fullLogArt = await uploadArtifact("full-70k.log", "text/plain", fullLogBytes);
+
+  const largeLogText = `${"2026-11-16T00:00:00Z INFO attachment test line\n".repeat(2200)}`; // ~99 KiB (>64KiB, >25k tokens)
   const largeLogBytes = Buffer.from(largeLogText, "utf8");
   assert.ok(largeLogBytes.byteLength > 64 * 1024, "log fixture must exceed 64KiB");
   const logArt = await uploadArtifact("runtime.log", "text/plain", largeLogBytes);
+
+  const hugeLogText = Array.from(
+    { length: 2400 },
+    (_, i) => `2026-11-16T00:00:00Z INFO line=${i + 1} ${"x".repeat(120)}`,
+  ).join("\n");
+  const hugeLogBytes = Buffer.from(hugeLogText, "utf8");
+  assert.ok(hugeLogBytes.byteLength > 300 * 1024, "huge log fixture must exceed 300KiB");
+  const hugeLogArt = await uploadArtifact("huge.log", "text/plain", hugeLogBytes);
 
   // -------------------------------------------------------------------------
   // 场景 3：2KiB UTF-8 .vue / .json 与 0 字节 .txt
@@ -358,7 +379,7 @@ try {
   const emptyArt = await uploadArtifact("empty.txt", "text/plain", Buffer.alloc(0));
 
   // -------------------------------------------------------------------------
-  // 场景 4：含非法 UTF-8 字节与 NUL 字节的伪 .txt，以及无扩展名二进制/clipboard-text
+  // 场景 4：含非法 UTF-8 字节与 NUL 字节的伪 .txt，以及无扩展名二进制/clipboard-text/恶意路径
   // -------------------------------------------------------------------------
   const fakeTxtBytes = Buffer.from([0x41, 0x42, 0x00, 0xff, 0xfe, 0x80, 0x43]);
   const fakeTxtArt = await uploadArtifact("corrupt.txt", "text/plain", fakeTxtBytes);
@@ -373,6 +394,17 @@ try {
     contentType: "text/plain",
     retention: "session",
   });
+  const evilTraversalBytes = randomBytes(64);
+  const evilTraversalArt = await uploadArtifact(
+    "evil-passwd",
+    "application/octet-stream",
+    evilTraversalBytes,
+  );
+  const evilWinBytes = randomBytes(64);
+  const evilWinArt = await uploadArtifact("evil-win", "application/zip", evilWinBytes);
+  const evilLongBytes = randomBytes(64);
+  const evilLongArt = await uploadArtifact("evil-long", "application/octet-stream", evilLongBytes);
+  const evilLongName = `${"中文长文件名".repeat(50)}\x00\x1f\u0085.bin`;
 
   // 1) 通过真实 attachment-refs.ts 映射（验证不提前解码，不丢弃 >64KiB，不设 path）
   const refs = [
@@ -382,12 +414,24 @@ try {
       mime: "application/zip",
       bytes: zipBytes.byteLength,
     },
-    { ref: docxArt.uri, fileName: "spec.docx", mime: "text/plain", bytes: docxBytes.byteLength },
+    { ref: docxArt.uri, fileName: docxName, mime: "text/plain", bytes: docxBytes.byteLength },
+    {
+      ref: fullLogArt.uri,
+      fileName: "full-70k.log",
+      mime: "text/plain",
+      bytes: fullLogBytes.byteLength,
+    },
     {
       ref: logArt.uri,
       fileName: "runtime.log",
       mime: "text/plain",
       bytes: largeLogBytes.byteLength,
+    },
+    {
+      ref: hugeLogArt.uri,
+      fileName: "huge.log",
+      mime: "text/plain",
+      bytes: hugeLogBytes.byteLength,
     },
     { ref: vueArt.uri, fileName: "App.vue", mime: "application/octet-stream", bytes: 999_999 },
     {
@@ -411,10 +455,28 @@ try {
     },
     {
       ref: clipboardArt.uri,
-      fileName: "pasted.txt",
+      fileName: "pasted-text-20261116-120000.txt",
       mime: "text/plain",
       bytes: Buffer.byteLength(clipboardText),
       sourceKind: "clipboard-text",
+    },
+    {
+      ref: evilTraversalArt.uri,
+      fileName: "../../etc/passwd",
+      mime: "application/octet-stream",
+      bytes: evilTraversalBytes.byteLength,
+    },
+    {
+      ref: evilWinArt.uri,
+      fileName: "C:\\temp\\evil.zip",
+      mime: "application/zip",
+      bytes: evilWinBytes.byteLength,
+    },
+    {
+      ref: evilLongArt.uri,
+      fileName: evilLongName,
+      mime: "application/octet-stream",
+      bytes: evilLongBytes.byteLength,
     },
   ];
 
@@ -430,25 +492,38 @@ try {
   const traceContext = { traceId: "trace-standalone-reg" };
   const resolved = await resolveWithStore(turnAttachments);
 
-  // 断言场景 1（.zip & 伪 .docx）
   const [
     resZip,
     resDocx,
+    resFullLog,
     resLog,
+    resHugeLog,
     resVue,
     resJson,
     resEmpty,
     resFakeTxt,
     resNoExtBin,
     resClipboard,
+    resEvilTraversal,
+    resEvilWin,
+    resEvilLong,
   ] = resolved;
-  for (const [label, item, origBytes, origUri, ext] of [
-    ["zip", resZip, zipBytes, zipArt.uri, ".zip"],
-    ["docx", resDocx, docxBytes, docxArt.uri, ".docx"],
-    ["log", resLog, largeLogBytes, logArt.uri, ".log"],
-    ["fakeTxt", resFakeTxt, fakeTxtBytes, fakeTxtArt.uri, ".txt"],
-    ["noExtBin", resNoExtBin, noExtBinBytes, noExtBinArt.uri, ".bin"],
-    ["clipboard", resClipboard, Buffer.from(clipboardText, "utf8"), clipboardArt.uri, ".txt"],
+
+  // 二进制与伪文本走具名落盘 + local_ref
+  for (const [label, item, origBytes, origUri, expectedBase] of [
+    ["zip", resZip, zipBytes, zipArt.uri, "bundle.zip"],
+    ["docx", resDocx, docxBytes, docxArt.uri, docxName],
+    ["fakeTxt", resFakeTxt, fakeTxtBytes, fakeTxtArt.uri, "corrupt.txt"],
+    ["noExtBin", resNoExtBin, noExtBinBytes, noExtBinArt.uri, "Makefile"],
+    [
+      "clipboard",
+      resClipboard,
+      Buffer.from(clipboardText, "utf8"),
+      clipboardArt.uri,
+      "pasted-text-20261116-120000.txt",
+    ],
+    ["evilTraversal", resEvilTraversal, evilTraversalBytes, evilTraversalArt.uri, "passwd"],
+    ["evilWin", resEvilWin, evilWinBytes, evilWinArt.uri, "evil.zip"],
   ]) {
     assert.equal(item.metadata.storageKind, "local_ref", `${label} must be local_ref`);
     assert.equal(item.metadata.artifactUri, origUri, `${label} must keep upload artifactUri`);
@@ -460,34 +535,173 @@ try {
     assert.equal(item.metadata.sizeBytes, origBytes.byteLength, `${label} sizeBytes`);
     assert.equal(typeof item.metadata.pathReferenceText, "string", `${label} pathReferenceText`);
     const diskPath = item.source?.path;
-    assert.ok(diskPath && diskPath.endsWith(ext), `${label} disk path must end with ${ext}`);
+    assert.ok(diskPath, `${label} must have disk path`);
+    assert.equal(basename(diskPath), expectedBase, `${label} basename must match`);
+    assert.ok(
+      diskPath.startsWith(join(storageRoot, "artifacts", sessionId)),
+      `${label} must stay inside session artifacts root`,
+    );
     assert.ok(item.metadata.pathReferenceText.includes(diskPath), `${label} pathReferenceText`);
     assert.equal(sha256Hex(await readFile(diskPath)), sha256Hex(origBytes), `${label} SHA-256`);
   }
-  assert.ok(resLog.metadata.pathReferenceText.includes("larger than the inline text budget"));
+  assert.ok(resEvilLong.source?.path?.startsWith(join(storageRoot, "artifacts", sessionId)));
+  const evilLongBase = basename(resEvilLong.source.path);
+  assert.ok(Buffer.byteLength(evilLongBase, "utf8") <= 240, "truncated name <= 240 bytes");
+  assert.ok(evilLongBase.endsWith(".bin"), "truncated name keeps .bin extension");
+  assert.ok(
+    ![...evilLongBase].some((ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+    }),
+    "control chars must be sanitized",
+  );
+
   assert.ok(resZip.metadata.pathReferenceText.includes("not a known text attachment"));
   assert.ok(resDocx.metadata.pathReferenceText.includes("not a known text attachment"));
   assert.ok(resFakeTxt.metadata.pathReferenceText.includes("not a known text attachment"));
   assert.ok(!resFakeTxt.metadata.pathReferenceText.includes("\ufffd"), "must not inject U+FFFD");
   assert.ok(resClipboard.metadata.pathReferenceText.includes("pasted-text temporary attachment"));
 
-  // 断言场景 3（2KiB .vue / .json & 0 字节 .txt）
-  assert.equal(resVue.metadata.storageKind, "inline");
-  assert.equal(resVue.contentBlock.type, "text");
+  // 安全文本（70KiB / 100KiB .log / >300KiB huge.log / 2KiB .vue / .json / 0B .txt）全部走桌面同款 readTextFileForModel
+  for (const [label, item, origUri, expectedBase, origBytes] of [
+    ["log70k", resFullLog, fullLogArt.uri, "full-70k.log", fullLogBytes],
+    ["log100k", resLog, logArt.uri, "runtime.log", largeLogBytes],
+    ["hugeLog", resHugeLog, hugeLogArt.uri, "huge.log", hugeLogBytes],
+    ["vue", resVue, vueArt.uri, "App.vue", Buffer.from(vueText, "utf8")],
+    ["json", resJson, jsonArt.uri, "config.json", Buffer.from(jsonText, "utf8")],
+    ["empty", resEmpty, emptyArt.uri, "empty.txt", Buffer.alloc(0)],
+  ]) {
+    assert.equal(item.metadata.storageKind, "inline", `${label} must be inline`);
+    assert.equal(item.mime, "text/plain", `${label} mime must be text/plain`);
+    assert.equal(item.contentBlock.type, "text", `${label} contentBlock must be text`);
+    assert.equal(item.metadata.artifactUri, origUri, `${label} keeps upload artifactUri`);
+    assert.equal(item.metadata.originalUrl, origUri, `${label} keeps upload originalUrl`);
+    assert.ok(
+      item.url.startsWith("zcode-artifact://") && item.url !== origUri,
+      `${label} url must be materialized raw artifact URI`,
+    );
+    assert.ok(item.source?.path && basename(item.source.path) === expectedBase);
+    assert.equal(
+      sha256Hex(await readFile(item.source.path)),
+      sha256Hex(origBytes),
+      `${label} raw file SHA-256`,
+    );
+    assert.ok(item.metadata.preview, `${label} must have preview`);
+  }
+  assert.equal(resFullLog.contentBlock.text, fullLogText);
+  assert.equal(resFullLog.metadata.preview?.truncated, false);
+  assert.equal(resLog.metadata.storageKind, "inline");
+  assert.ok(resLog.source?.path?.endsWith("runtime.log"));
+  assert.ok(
+    typeof resLog.metadata.preview?.text === "string" && resLog.metadata.preview.text.length > 0,
+  );
+  assert.equal(resHugeLog.metadata.recoverability, "preview_only");
+  assert.equal(resHugeLog.metadata.preview?.truncated, true);
+  assert.equal(resHugeLog.metadata.preview?.truncatedByTokenCap, true);
+  assert.ok(resHugeLog.metadata.preview?.partialViewNotice?.includes("Truncated: PARTIAL view"));
+
   assert.equal(resVue.contentBlock.text, vueText);
-  assert.equal(resVue.metadata.artifactUri, vueArt.uri);
   assert.equal(resVue.metadata.preview?.truncated, false);
-
-  assert.equal(resJson.metadata.storageKind, "inline");
-  assert.equal(resJson.mime, "application/json");
-  assert.equal(resJson.contentBlock.type, "text");
   assert.equal(resJson.contentBlock.text, jsonText);
-
-  assert.equal(resEmpty.metadata.storageKind, "inline");
-  assert.equal(resEmpty.contentBlock.type, "text");
   assert.equal(resEmpty.contentBlock.text, "");
   assert.equal(resEmpty.metadata.sizeBytes, 0);
   assert.equal(resEmpty.metadata.preview?.text, "");
+
+  // 验证旧平铺与新子目录 artifact 的 readToolResultArtifact / statToolResultArtifact 均正常
+  const statOldFlat = await artifactStore.statToolResultArtifact({ uri: zipArt.uri });
+  assert.equal(statOldFlat.path, zipArt.path);
+  const readNewSubdir = await artifactStore.readToolResultArtifact({ uri: resJson.url });
+  assert.equal(readNewSubdir.content, jsonText);
+  const statNewSubdir = await artifactStore.statToolResultArtifact({ uri: resDocx.url });
+  assert.equal(statNewSubdir.bytes, docxBytes.byteLength);
+  assert.equal(basename(statNewSubdir.path), docxName);
+
+  // 验证具名子目录多文件报错、sessionDir 符号链接拒绝、".." 隔离与旧平铺精确边界匹配
+  const ambigDir = join(storageRoot, "artifacts", sessionId, "tool-result-ambig");
+  await mkdir(ambigDir, { recursive: true });
+  await writeFile(join(ambigDir, "one.txt"), "1");
+  await writeFile(join(ambigDir, "two.txt"), "2");
+  await assert.rejects(
+    () =>
+      artifactStore.readToolResultArtifact({
+        uri: `zcode-artifact://${sessionId}/tool-result-ambig`,
+      }),
+    /Ambiguous/,
+  );
+  const symOutside = join(tempRoot, "sym-outside");
+  await mkdir(symOutside, { recursive: true });
+  await writeFile(join(symOutside, "tool-result-leak.txt"), "LEAK");
+  await symlink(symOutside, join(storageRoot, "artifacts", "sym-sess"));
+  await assert.rejects(
+    () =>
+      artifactStore.readToolResultArtifact({ uri: "zcode-artifact://sym-sess/tool-result-leak" }),
+    /not found/,
+  );
+  // 预置 sessionDir 符号链接时，具名写入与平铺写入均拒绝，且外部目录 0 新增文件
+  await assert.rejects(
+    () =>
+      artifactStore.writeToolResultBinaryArtifact({
+        sessionId: "sym-sess",
+        toolCallId: "sym-named",
+        toolName: "prompt-attachment:file",
+        content: Buffer.from("nope"),
+        contentType: "text/plain",
+        fileName: "evil.txt",
+        retention: "session",
+      }),
+    /Unsafe tool artifact session directory/,
+  );
+  await assert.rejects(
+    () =>
+      artifactStore.writeToolResultArtifact({
+        sessionId: "sym-sess",
+        toolCallId: "sym-flat",
+        toolName: "BigTool",
+        content: "nope",
+        contentType: "text/plain",
+        retention: "session",
+      }),
+    /Unsafe tool artifact session directory/,
+  );
+  assert.deepEqual(await import("node:fs/promises").then((fs) => fs.readdir(symOutside)), [
+    "tool-result-leak.txt",
+  ]);
+
+  // .zcode-tmp-report.txt 合法文件名经同级 staging 发布后可完整 write -> read -> stat 往返
+  const tmpNameArt = await artifactStore.writeToolResultBinaryArtifact({
+    sessionId,
+    toolCallId: "tmp-name",
+    toolName: "prompt-attachment:file",
+    content: Buffer.from("TMP_NAME_OK", "utf8"),
+    contentType: "text/plain",
+    fileName: ".zcode-tmp-report.txt",
+    retention: "session",
+  });
+  assert.equal(basename(tmpNameArt.path), ".zcode-tmp-report.txt");
+  assert.equal(
+    (await artifactStore.readToolResultArtifact({ uri: tmpNameArt.uri })).content,
+    "TMP_NAME_OK",
+  );
+  assert.equal(
+    (await artifactStore.statToolResultArtifact({ uri: tmpNameArt.uri })).path,
+    tmpNameArt.path,
+  );
+  const dotDotArt = await artifactStore.writeToolResultBinaryArtifact({
+    sessionId: "..",
+    toolCallId: "dotdot",
+    toolName: "prompt-attachment:file",
+    content: Buffer.from("ok"),
+    contentType: "text/plain",
+    fileName: "ok.txt",
+    retention: "session",
+  });
+  assert.ok(dotDotArt.path.startsWith(join(storageRoot, "artifacts", "unknown")));
+  await writeFile(join(storageRoot, "artifacts", sessionId, "call-tool-result-10.txt"), "TEN");
+  await assert.rejects(
+    () =>
+      artifactStore.readToolResultArtifact({ uri: `zcode-artifact://${sessionId}/tool-result-1` }),
+    /not found/,
+  );
 
   // 3) 真实 SQLite 持久化 + 冷恢复 + listArtifactReferrers 验证
   const history = new mod.MessageHistoryImpl();
@@ -517,14 +731,14 @@ try {
     traceContext,
   );
 
-  // 模拟 fork 会话复制其中一个 FilePart，验证 listArtifactReferrers 识别双 URI
+  // 模拟 fork 会话复制其中一个 .json FilePart，验证 listArtifactReferrers 识别双 URI
   const forkSessionId = await ensureSession("sess-fork-1", "fork-reg", "Fork Regression");
   const savedMessages = await store.messages({ sessionID: sessionId });
-  const zipPart = savedMessages[0].parts.find(
-    (p) => p.type === "file" && p.filename === "bundle.zip",
+  const jsonPart = savedMessages[0].parts.find(
+    (p) => p.type === "file" && p.filename === "config.json",
   );
-  assert.ok(zipPart, "persisted zip FilePart must exist");
-  await copyFilePartToFork(zipPart, forkSessionId, "fork-msg-1", "fork-part-1");
+  assert.ok(jsonPart, "persisted json FilePart must exist");
+  await copyFilePartToFork(jsonPart, forkSessionId, "fork-msg-1", "fork-part-1");
   const referrers = await store.listArtifactReferrers([sessionId]);
   assert.deepEqual(
     referrers.get(sessionId),
@@ -558,8 +772,19 @@ try {
         : m.content.map((b) => (b.type === "text" ? b.text : "")).join("\n"),
     )
     .join("\n");
-  assert.ok(coldText.includes(vueText), "cold resume must keep .vue body");
-  assert.ok(coldText.includes(jsonText), "cold resume must keep .json body");
+  assert.ok(
+    coldText.includes("1\t<template>\n2\t  <div>vue-content"),
+    "cold resume must keep .vue Read body",
+  );
+  assert.ok(coldText.includes(`1\t${jsonText}`), "cold resume must keep .json Read body");
+  assert.ok(
+    coldText.includes("Called the Read tool"),
+    "text attachments must hit Read prompt_attachment reminder",
+  );
+  assert.ok(
+    coldText.includes(resJson.source.path),
+    ".json reminder must reference named disk path",
+  );
 
   // 场景 5：原 artifact 缺失/损坏 -> 明确标记读取失败而非空成功附件
   const missingResolved = await resolveWithStore([
@@ -773,18 +998,304 @@ try {
   const rereadUpload = await artifactStore.readToolResultArtifact({ uri: isolatedClipUpload.uri });
   assert.ok(rereadUpload.content.startsWith("data:text/plain"));
 
+  // 验证未被引用的根 + 自有子会话在 purgeSessionDataWith 时在 deleted[].sessionIds 返回完整 owned-tree ID
+  const ownedRootId = await ensureSession("sess_owned_root", "owned-root", "Owned Root");
+  const ownedChildId = mod.createSessionId("sess_owned_child");
+  await store.createSession({
+    id: ownedChildId,
+    projectID,
+    slug: "owned-child",
+    directory: tempRoot,
+    title: "Owned Child",
+    version: "1",
+    parentID: ownedRootId,
+    taskType: "subagent_child",
+  });
+  const ownedPurgeResult = await mod.purgeSessionDataWith(
+    {
+      store: {
+        listOwnedSessionTrees: store.listOwnedSessionTrees.bind(store),
+        listArtifactReferrers: store.listArtifactReferrers.bind(store),
+        purgeSessions: store.purgeSessions.bind(store),
+      },
+      files: sessionDataFiles,
+      residency: () => null,
+      release: async () => {},
+      forgetIndexed: () => {},
+    },
+    { sessionIds: [ownedRootId], directories: [] },
+  );
+  assert.equal(ownedPurgeResult.deleted.length, 1);
+  assert.equal(ownedPurgeResult.deleted[0].sessionId, ownedRootId);
+  assert.deepEqual(ownedPurgeResult.deleted[0].sessionIds, [ownedRootId, ownedChildId]);
+
+  // -------------------------------------------------------------------------
+  // 场景 7：同名不同内容的两个 报告.txt 上传，fork 仅引用其一，永久删除精确保留与删除
+  // -------------------------------------------------------------------------
+  const dupSrcSessionId = await ensureSession("sess_dup_src", "dup-src", "Duplicate Name Source");
+  const dupForkSessionId = await ensureSession("sess_dup_fork", "dup-fork", "Duplicate Name Fork");
+  const reportA = "REPORT_VERSION_A_KEEP\n";
+  const reportB = "REPORT_VERSION_B_DROP\n";
+  const uploadA = await uploadArtifact(
+    "report-a",
+    "text/plain",
+    Buffer.from(reportA, "utf8"),
+    dupSrcSessionId,
+  );
+  const uploadB = await uploadArtifact(
+    "report-b",
+    "text/plain",
+    Buffer.from(reportB, "utf8"),
+    dupSrcSessionId,
+  );
+  const [resDupA, resDupB] = await resolveWithStore(
+    mod.mapAttachmentRefsToTurnAttachments([
+      { ref: uploadA.uri, fileName: "报告.txt", mime: "text/plain", bytes: reportA.length },
+      { ref: uploadB.uri, fileName: "报告.txt", mime: "text/plain", bytes: reportB.length },
+    ]),
+    dupSrcSessionId,
+  );
+  assert.notEqual(resDupA.source.path, resDupB.source.path);
+  assert.equal(basename(resDupA.source.path), "报告.txt");
+  assert.equal(basename(resDupB.source.path), "报告.txt");
+  assert.equal(await readFile(resDupA.source.path, "utf8"), reportA);
+  assert.equal(await readFile(resDupB.source.path, "utf8"), reportB);
+
+  const dupHistory = new mod.MessageHistoryImpl();
+  dupHistory.init("system fixture");
+  dupHistory.addEntries(mod.buildRuntimeUserEntriesFromTurn("Compare reports", [resDupA, resDupB]));
+  await mod.persistUserPrompt.call(
+    { ...runtimeStub, sessionId: dupSrcSessionId, messageHistory: dupHistory },
+    mod.createMessageId("dup-msg-1"),
+    "Compare reports",
+    [resDupA, resDupB],
+    traceContext,
+  );
+  const dupSrcMessages = await store.messages({ sessionID: dupSrcSessionId });
+  const dupPartA = dupSrcMessages[0].parts.find((p) => p.type === "file" && p.url === resDupA.url);
+  assert.ok(dupPartA, "persisted FilePart A must exist");
+  await copyFilePartToFork(dupPartA, dupForkSessionId, "dup-fork-msg-1", "dup-fork-part-1");
+
+  const delHost = {
+    store: {
+      inspectSessionDeletion: store.inspectSessionDeletion.bind(store),
+      beginSessionDeletion: store.beginSessionDeletion.bind(store),
+      completeSessionDeletion: store.completeSessionDeletion.bind(store),
+    },
+    files: sessionDataFiles,
+    busy: () => false,
+    release: async () => {},
+    forget: () => {},
+  };
+  const delPreview = await mod.previewSessionDeletionWith(delHost, {
+    sessionId: dupSrcSessionId,
+    workspace: { workspacePath: tempRoot },
+  });
+  const retainedNames = delPreview.retainedArtifacts.map((item) => item.fileName);
+  assert.ok(retainedNames.includes("报告.txt"));
+  // resDupA 的原上传平铺文件 + 具名子目录文件共 2 个保留；resDupB 的原上传平铺文件 + 具名子目录文件共 2 个删除
+  assert.equal(delPreview.retainedArtifacts.length, 2);
+  assert.equal(delPreview.deletedFiles, 2);
+  const delExec = await mod.executeSessionDeletionWith(delHost, {
+    sessionId: dupSrcSessionId,
+    workspace: { workspacePath: tempRoot },
+    revision: delPreview.revision,
+    operationId: "op-dup-delete",
+  });
+  assert.equal(delExec.status, "deleted");
+  assert.ok(existsSync(resDupA.source.path), "retained 报告.txt must survive deletion");
+  assert.equal(await readFile(resDupA.source.path, "utf8"), reportA);
+  assert.ok(!existsSync(resDupB.source.path), "unretained 报告.txt must be deleted");
+  assert.ok(
+    !existsSync(dirname(resDupB.source.path)),
+    "unretained <artifactId> dir must be removed",
+  );
+
+  // -------------------------------------------------------------------------
+  // 场景 8：createManagedCdpBrowserRuntime releaseSession 租约保留、复用、LRU 与 TTL 回收
+  // -------------------------------------------------------------------------
+  const fakeContexts = [];
+  let fakeBrowserCloses = 0;
+  const createFakePlaywright = () => async () => ({
+    chromium: {
+      executablePath: () => process.execPath,
+      launch: async () => {
+        let connected = true;
+        const listeners = new Map();
+        const browser = {
+          close: async () => {
+            if (!connected) return;
+            fakeBrowserCloses += 1;
+            connected = false;
+            listeners.get("disconnected")?.();
+          },
+          isConnected: () => connected,
+          on: (ev, fn) => listeners.set(ev, fn),
+          newContext: async () => {
+            const state = { closed: false, pages: [] };
+            fakeContexts.push(state);
+            const ctx = {
+              browser: () => browser,
+              close: async () => {
+                state.closed = true;
+              },
+              pages: () => state.pages,
+              on: () => {},
+              newPage: async () => {
+                let url = "about:blank";
+                let pageClosed = false;
+                const page = {
+                  bringToFront: async () => {},
+                  close: async () => {
+                    pageClosed = true;
+                  },
+                  context: () => ctx,
+                  goto: async (nextUrl) => {
+                    url = nextUrl;
+                  },
+                  isClosed: () => pageClosed,
+                  on: () => {},
+                  setViewportSize: async () => {},
+                  title: async () => "",
+                  url: () => url,
+                  viewportSize: () => ({ width: 1280, height: 720 }),
+                };
+                state.pages.push(page);
+                return page;
+              },
+            };
+            return ctx;
+          },
+        };
+        return browser;
+      },
+    },
+  });
+
+  const browserRuntime = mod.createManagedCdpBrowserRuntime({
+    loadPlaywright: createFakePlaywright(),
+    maxReleasedSessions: 2,
+    releasedSessionIdleTtlMs: 80,
+  });
+  const [cdpDesc] = await browserRuntime.browserControlPort.list({ sessionId: "b-active" });
+  for (const sid of ["b-active", "b-r1", "b-r2", "b-r3"]) {
+    await browserRuntime.browserControlPort.execute({
+      browserId: cdpDesc.id,
+      browserGeneration: cdpDesc.generation,
+      sessionId: sid,
+      command: { method: "newTab" },
+    });
+  }
+  await browserRuntime.browserControlPort.execute({
+    browserId: cdpDesc.id,
+    browserGeneration: cdpDesc.generation,
+    sessionId: "b-r1",
+    command: { method: "navigate", url: "https://example.test/kept" },
+  });
+  await browserRuntime.releaseSession("b-r1");
+  assert.equal(fakeContexts[1].closed, false, "releaseSession must keep BrowserContext alive");
+  // 再次 list 复用原 context 与页面
+  await browserRuntime.browserControlPort.list({ sessionId: "b-r1" });
+  const r1Tabs = await browserRuntime.browserControlPort.execute({
+    browserId: cdpDesc.id,
+    browserGeneration: cdpDesc.generation,
+    sessionId: "b-r1",
+    command: { method: "list" },
+  });
+  assert.equal(r1Tabs.tabs?.[0]?.url, "https://example.test/kept");
+  assert.equal(fakeContexts.length, 4, "must reuse original BrowserContext");
+
+  // 触发 LRU：依次释放 b-r1、b-r2、b-r3（maxReleasedSessions=2 -> 仅驱逐 b-r1，绝不驱逐 b-active）
+  await browserRuntime.releaseSession("b-r1");
+  await browserRuntime.releaseSession("b-r2");
+  await browserRuntime.releaseSession("b-r3");
+  assert.equal(fakeContexts[0].closed, false, "active session must never be evicted");
+  assert.equal(fakeContexts[1].closed, true, "LRU released session must be evicted");
+  assert.equal(fakeContexts[2].closed, false);
+  assert.equal(fakeContexts[3].closed, false);
+
+  // closeSession 彻底销毁 b-r2
+  await browserRuntime.browserControlPort.closeSession({ sessionId: "b-r2" });
+  assert.equal(fakeContexts[2].closed, true, "closeSession must close context");
+
+  // 等待空闲 TTL 到期自动回收 b-r3
+  await new Promise((resolveTimer) => setTimeout(resolveTimer, 150));
+  assert.equal(fakeContexts[3].closed, true, "idle TTL must close released context");
+  assert.equal(fakeContexts[0].closed, false, "active session still untouched");
+
+  await browserRuntime.close();
+  assert.equal(fakeContexts[0].closed, true);
+  assert.equal(fakeBrowserCloses, 1);
+
+  // maxReleasedSessions=1 下并发 releaseSession(A) + 重复 releaseSession(B) 不死锁
+  fakeContexts.length = 0;
+  const concRuntime = mod.createManagedCdpBrowserRuntime({
+    loadPlaywright: createFakePlaywright(),
+    maxReleasedSessions: 1,
+    releasedSessionIdleTtlMs: 30_000,
+  });
+  const [concDesc] = await concRuntime.browserControlPort.list({ sessionId: "c-a" });
+  await concRuntime.browserControlPort.execute({
+    browserId: concDesc.id,
+    browserGeneration: concDesc.generation,
+    sessionId: "c-a",
+    command: { method: "newTab" },
+  });
+  await concRuntime.browserControlPort.execute({
+    browserId: concDesc.id,
+    browserGeneration: concDesc.generation,
+    sessionId: "c-b",
+    command: { method: "newTab" },
+  });
+  await concRuntime.releaseSession("c-b");
+  await Promise.race([
+    Promise.all([concRuntime.releaseSession("c-a"), concRuntime.releaseSession("c-b")]),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("concurrent releaseSession deadlocked")), 1_000),
+    ),
+  ]);
+  assert.equal(fakeContexts[0].closed, false);
+  assert.equal(fakeContexts[1].closed, true);
+  await concRuntime.close();
+
+  // -------------------------------------------------------------------------
+  // 场景 9：worktree 会话下 browser-control-broker 保持主仓库 workspaceKey 与规范化 workspacePath
+  // -------------------------------------------------------------------------
+  const brokerCalls = [];
+  const broker = mod.createProtocolBrowserControlBroker({
+    requestClient: async (method, params) => {
+      brokerCalls.push({ method, params });
+      return method.includes("List") ? { browsers: [] } : { ok: true, elapsedMs: 1 };
+    },
+    sessions: new Map([
+      [
+        "wt-sess",
+        {
+          deliveryKind: "desktop-continuous",
+          workspace: {
+            workspaceKey: "/workspace/repo",
+            workspacePath: "/workspace/.zcode/worktrees/wt-1",
+          },
+        },
+      ],
+    ]),
+  });
+  await broker.list({ sessionId: "wt-sess", turnId: "wt-turn" });
+  assert.equal(brokerCalls[0].params.workspaceKey, "/workspace/repo");
+  assert.equal(brokerCalls[0].params.workspacePath, "/workspace/repo");
+
   store.close();
   console.log(
     JSON.stringify({
       ok: true,
       scenarios: [
-        "1KiB zip + fake docx -> local_ref + raw bytes SHA-256 match + dual URIs + fork protection",
-        "100KiB UTF-8 log -> local_ref(text_too_large) + full bytes SHA-256 match",
-        "2KiB vue/json + 0B txt -> inline + cold hydrate exact match",
-        "corrupt UTF-8/NUL fake txt -> downgraded to binary_file + raw bytes SHA-256 match",
-        "missing/corrupt artifact -> attachment_read_failed placeholder",
-        "create-app decodePromptAttachmentDataUrl allows zip/json + v4-gateway media boundary preserved",
-        "clipboard-text fork protection -> listArtifactReferrers non-empty + purgeSessionDataWith kept:referenced + raw file intact",
+        "1KiB zip + named Chinese/space docx -> <artifactId>/<safeFileName> + local_ref + SHA-256 match + dual URIs",
+        "100KiB UTF-8 log + .json + .vue + 0B .txt -> unified readTextFileForModel (inline + source + preview + prompt_attachment)",
+        ">300KiB huge log -> unified readTextFileForModel partial view preview + dual URIs",
+        "corrupt UTF-8/NUL + malicious paths -> sanitized inside <artifactId>/ + binary_file local_ref",
+        "old flat & new subdir readToolResultArtifact / statToolResultArtifact compatibility",
+        "duplicate 报告.txt across artifacts -> fork protects referenced one, permanent deletion removes unretained one",
+        "createManagedCdpBrowserRuntime releaseSession keep/resume/closeSession/LRU/TTL verified",
       ],
     }),
   );

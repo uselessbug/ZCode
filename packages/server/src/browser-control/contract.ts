@@ -6,6 +6,10 @@ export interface ServerBrowserControlOptions {
   executablePath?: string;
   /** 关闭浏览器实例的有界等待时长（ms）。 */
   closeTimeoutMs?: number;
+  /** 允许缓存的已释放空闲会话上限，透传给 createManagedCdpBrowserRuntime。 */
+  maxReleasedSessions?: number;
+  /** 已释放空闲会话的回收 TTL（ms），透传给 createManagedCdpBrowserRuntime。 */
+  releasedSessionIdleTtlMs?: number;
   /** 环境变量来源，默认 process.env。 */
   env?: NodeJS.ProcessEnv;
   /** 可选 Playwright 加载器，用于源码与独立发行布局测试注入。 */
