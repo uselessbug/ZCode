@@ -12,7 +12,7 @@
   - 3 项冗余参数/字段清理与独立 HTTP Web 官方 `browser-use` 受管 CDP 适配：`ce24c4cf`、`ab4ab3ac`（阶段发布基线 `29c3c4dc`）
   - 项目恢复 `restoreProject` 位置参数转换、记忆冲突重载专用标识与独立 Browser MCP 镜像/文案清理：`f643ee64`
 - 升级前 `main` 基线：`f40a4597`（`docs(maintenance): record standalone MCP deployment acceptance`）
-- 当前状态（更新于 2026-11-16）：线上容器运行 `b9f0e517`（完整 SHA：`b9f0e517457179eef35cd8112923fbeda7659b5f`，GitHub Actions [`43795610757`](https://github.com/uselessbug/ZCode/actions/runs/43795610757) `success`，镜像 `sha-b9f0e517`），主题兼容修复已部署。容器 `healthy`、`restarts: 0`，HTTP / 鉴权 / WebSocket 与配置完整性探针通过；普通与 Nightly 模拟主题回归 19 组通过，实际手机主题反馈待验收。前一阶段 `f643ee64` 的项目恢复、记忆标识与 Browser MCP 清理均保留；详细证据见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)。
+- 当前状态（更新于 2026-11-16）：线上容器当前实际运行版本仍为 `b9f0e517`（完整 SHA：`b9f0e517457179eef35cd8112923fbeda7659b5f`，GitHub Actions [`43795610757`](https://github.com/uselessbug/ZCode/actions/runs/43795610757) `success`，镜像 `sha-b9f0e517`），主题兼容修复已部署。容器 `healthy`、`restarts: 0`，HTTP / 鉴权 / WebSocket 与配置完整性探针通过；普通与 Nightly 模拟主题回归 19 组通过，用户确认手机自动跟随恢复，切换时页面重载与重连横幅另行追踪。前一阶段 `f643ee64` 部署的 `restoreProject` 项目恢复已于 2026-11-16 经用户页面连续移除/恢复实操与服务端 4 次 RPC 日志确认通过，记忆标识与 Browser MCP 清理保持生效。本轮已完成 4 项源码修改与本地隔离回归（移除项目时估算与清理当前服务器项目数据、普通二进制文件分块上传与 >64K 文本附件落盘物化、独立 HTTP 服务端定时任务 `automation-runtime` 到期调度与立即运行执行链、非桌面 Web 停用营销轮询），待 CI 构建发布与线上部署验收。详细证据见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md) 与 [issues.md](./issues.md)。
 - 历史部署验收基线：2026-11-15 `29c3c4dc`（GitHub Actions 运行 [`43723274317`](https://github.com/uselessbug/ZCode/actions/runs/43723274317) `success`）完成 `ce24c4cf` 冗余清理生效及官方 `browser-use` 网页访问读取实测与用户确认；更早 `4e959bab` 部署完成运行日志 5446 行无关键错误核验及用户多端实机验收（模型保存/删除提示、归档任务永久删除、实体手机重连、手机工作区与 `compact-web` 设置页、任务分组、子代理设置与权限弹窗、新建技能/插件试用预填跳转、新建项目目录选择与任务工作区归属均确认正常；详见 [standalone-web-deployment-checklist.md](./standalone-web-deployment-checklist.md)）。
 
 ### 1.1 升级保护能力范围
@@ -50,6 +50,7 @@
 
 - [独立 Web 与移动端适配问题清单](./issues.md)
 - [独立 Web 部署与实机验证清单](./standalone-web-deployment-checklist.md)
+- [定时任务服务端执行链](../standalone-web-automation-runtime.md)
 - [系统安全存储与凭据迁移计划](../plans/2026-10-29-system-credential-storage.md)
 - [多 root 项目与任务移动](../standalone-web-multi-root-projects.md)
 - [设置页服务边界与手机布局](../standalone-web-settings.md)

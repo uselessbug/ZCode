@@ -2,16 +2,34 @@
 
 本文是独立 Web 与移动端适配问题的唯一维护入口，按用户可见症状记录当前状态。
 
-## 已部署，待手机验收（1 项）
+## 待定位（1 项）
 
-- **Firefox Nightly“系统”主题暗色切回浅色失效**：用户在 Android Firefox Nightly `162.0a1` 反馈暗→浅不跟随、刷新仍暗，Firefox 自身界面已浅；PC Firefox Beta `161.0b3` 正常。Nightly 新规则让单值 `color-scheme` meta 覆写系统媒体查询，旧首屏 `dark` 和运行时单值写入形成反馈。提交 `b9f0e517` 已将两个网页入口固定为 `light dark` 并停止运行时改写 meta，CSS 原生控件配色照常同步；CI 与部署完成，普通 / Nightly 模拟规则 19 组通过，旧版变异检出。手机实机待验收，见[部署验证记录](./standalone-web-deployment-checklist.md)与[主题规格](../web-remote-control/mobile-theme-control.md)。
+- **Android Firefox Nightly 自动切换主题时页面重载并出现重连横幅**：主题跟随已恢复；2026-11-16 用户补充确认，切换时伴随页面重载、Firefox 顶部加载条和 ZCode 重连横幅。源码主题回调只更新类名、CSS `color-scheme` 和 `theme-color`，没有刷新或导航调用；下一步用固定主题、其他网站与 Firefox 稳定版作对照，并采集文档生命周期和 WebSocket 事件，定位 Firefox 重载或页面恢复链路的触发原因。Mozilla [Bug 1807095](https://bugzilla.mozilla.org/show_bug.cgi?id=1807095) 有类似报告，当前设备是否同因未确认。
 
-## 已部署，待实际页面交互验收（1 项）
+## 待页面复现（1 项）
 
-1. **独立 Web 项目管理“撤销移除 / 恢复已移除项目”缺少 `restoreProject` Host 别名重写**
-   - **症状（代码审查发现，尚未经用户现场复现）**：在独立 Web「设置 -> 项目」移除项目后点击 Toast「撤销」，或在「已移除的项目」中点击恢复时，客户端以位置参数调用 `restoreProject(id, "local")`，服务端路由会因未知本地 Host 报 `project.host-offline`。
-   - **已确认根因**：`packages/server/src/http.ts` 的 `createStandaloneProjectAlias` 中 `positionalHostMethods` 原仅包含 `deleteProject`、`reorderProjects`、`resolveSessionDirectories`，此前遗漏了同样以第 2 个位置参数传入 `hostId` 的 `restoreProject(id, hostId)`，导致 `"local"` 未重写为当前服务器 `ownerHostId`。
-   - **状态**：已部署，待实际页面交互验收（提交 `f643ee64` 已随镜像 `sha-f643ee64` 部署上线；后端源码包装与真实 SQLite 回归通过，未扩大数据清理权限，完整 Electron WDIO 未运行且尚未经实际页面交互验收。验证证据见[部署与实机验证清单](./standalone-web-deployment-checklist.md)）。
+- **任务菜单「在文件管理器中打开／前往 Provider 配置」在独立 Web 下点击可能无反馈**：静态调用链确认 Web 平台返回不支持后仅记日志无提示，尚未经页面点击复现，本轮暂未处理。
+
+## 已实现，待 CI 构建与部署验收（4 项）
+
+当前线上运行容器仍为 `b9f0e517`。以下 4 项已完成源码修改与本地隔离回归，待 GitHub Actions 全量构建发布镜像后更新部署并做实机验收：
+
+1. **移除项目时无法估算与清理当前服务器项目数据**
+   - **症状**：2026-11-16 用户在独立 Web 执行项目移除与恢复时，移除确认弹窗预估项目数据触发 `project.measureProjectData FAIL Error: project.data-local-only`。
+   - **本地修改与验证**：补齐 `packages/server/src/http.ts` 对 `measureProjectData`、`deleteProjectData` 的位置参数 Host 别名转换；仅在 `standalone-server` 且开启独立 Web 兼容配置时放行当前服务器 `ownerHostId`（跨 Host 与普通远端仍报 `project.data-local-only`）；贯穿任务与 0 会话项目 root 的 canonical `workspaceIdentity` 以准确命中 `project-<16位哈希>` 记忆目录，并复用严格会话删除载体（优先命中热运行工作区 CLI 保护 `busy` 会话，仅在 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 且归属本服务器时回落管理面进程）。本地 `standalone-project-alias.mjs` 回归通过。
+2. **普通二进制文件无法上传及 >64K 文本附件静默截断**
+   - **症状**：独立 Web 上传普通二进制文件（如 `.zip`、`.docx`）失败或被当作文本处理，大于 64K 字符的文本附件在前端被静默截断。
+   - **本地修改与验证**：前端对无 `localPath` 的普通文件统一按真实字节走 V4 `begin/chunk/commit` 分块上传（上限 20 MiB，支持 0 字节文件，超限抛 `OversizedInlineFileAttachmentError` 提供 5 语言提示并补齐图片超限本地化，移除前端 64K 字符截断）；CLI 侧对 `<= 64 KiB` 且通过正面文本类型与严格 UTF-8 校验的小文本安全内联，对二进制文件与 `> 64 KiB` 大文本经 `writeToolResultBinaryArtifact` 落盘为会话级原始字节文件并生成 `local_ref` 真实路径引用，同时保留双 artifact URI 保障预览与 fork 引用保护（一并补齐 `clipboard-text` / `topic-history` 落盘双 URI fork 引用保护与 `create-app` 普通 MIME data URL 解码）。本地 `standalone-attachment-upload.mjs`（16 项）与 `standalone-cli-attachment-materialization.mjs`（7 组场景）回归通过。
+3. **独立 HTTP 服务端定时任务缺少到期调度与立即运行执行链**
+   - **症状**：独立 HTTP Server 原先仅有 `AutomationService` 读写接口，未挂载进程内到期调度器与 `runAutomationNow` 执行派发器，导致定时任务到期不触发、点击「立即运行」报错。
+   - **本地修改与验证**：新增受管模块 `packages/services/src/automation-runtime`，提取并由 Desktop 与独立 HTTP 共享 20s 到期轮询、5min misfire 跳过、按 `runId` 幂等结算、单飞 manual claim 与 60s 心跳续租、统一变更 `wake` 及先排空在途派发再关库的优雅关闭；修复 `standalone-server` 下新建及会话内 `CronCreate` 的服务器 `hostId` 与 canonical `workspaceIdentity` 固化，启动对齐采用无批量迁移副作用的只读 canonical 查询（保护同路径异域定义不被改写）；仅在 `entry-http.ts` 显式启用执行链。本地 `standalone-automation-runtime.mjs`（7 组场景）回归通过。设计见[定时任务服务端执行链](../standalone-web-automation-runtime.md)。
+4. **非桌面 Web 停用 Z.ai 营销／活动轮询（冗余清理）**
+   - **症状**：非桌面 Web 入口挂载了仅用于桌面端的 Z.ai 营销轮询，产生无用请求与重复 `ZodError` 日志。
+   - **本地修改与验证**：`MarketingTouchProvider` 在非桌面入口（`!desktop`）直接返回空上下文，不创建营销 runtime/poller、不挂载 `MutationObserver`、不发起 `marketing-touch.query` 请求，消除自托管 Web 下的无用轮询与重复 `ZodError` 日志。本地 `standalone-attachment-upload.mjs` 挂载对照通过。
+
+## 已验收的主题修复
+
+- **Firefox Nightly“系统”主题暗色切回浅色失效**：用户在 Android Firefox Nightly `162.0a1` 反馈暗→浅不跟随、刷新仍暗，Firefox 自身界面已浅；PC Firefox Beta `161.0b3` 正常。Nightly 新规则让单值 `color-scheme` meta 覆写系统媒体查询，旧首屏 `dark` 和运行时单值写入形成反馈。提交 `b9f0e517` 已将两个网页入口固定为 `light dark` 并停止运行时改写 meta，CSS 原生控件配色照常同步；CI 与部署完成，普通 / Nightly 模拟规则 19 组通过，旧版变异检出。2026-11-16 用户确认手机自动跟随已恢复；切换时的加载条单独追踪。见[部署验证记录](./standalone-web-deployment-checklist.md)与[主题规格](../web-remote-control/mobile-theme-control.md)。
 
 ## 待评估建议与暂缓项（2 项）
 
@@ -24,6 +42,10 @@
    - **状态**：暂缓（低优先级，待实际使用需求明确后再评估）。
 
 ## 已修复
+
+- **独立 Web 项目管理“撤销移除 / 恢复已移除项目”缺少 `restoreProject` Host 别名重写**
+  - **症状**：在独立 Web「设置 -> 项目管理」移除项目后点击 Toast「撤销」，或在「已移除的项目」中点击恢复时，客户端以位置参数调用 `restoreProject(id, "local")`，服务端此前遗漏第 2 个位置参数 `hostId` 别名转换，会报 `project.host-offline`。
+  - **状态**：已修复（提交 `f643ee64` 部署后，2026-11-16 用户在独立 Web 先从「已移除的项目」恢复旧版本移除的项目，随后连续操作两次「移除 → 恢复 → 移除」；服务端容器运行日志确认 4 次 RPC 全部成功且无 `project.host-offline`：`2026-11-16 15:10:38 project.restoreProject OK (11.9ms)`、`15:10:42 project.deleteProject OK (6.9ms)`、`15:10:45 project.restoreProject OK (7.2ms)`、`15:10:48 project.deleteProject OK (6.5ms)`。同次操作日志暴露出移除弹窗预估数据时报 `project.measureProjectData FAIL Error: project.data-local-only`，已作为独立问题在本轮完成本地源码修复，见上方“本地已修改”第 1 项）。
 
 - **独立 Web / HTTP Server 下官方 `browser-use` 插件 `agent.browsers.list()` 返回 `[]`**
   - **症状**：官方 `browser-use` 插件已启用且运行模块可加载，但调用 `agent.browsers.list()` 返回 `[]`。
@@ -107,6 +129,7 @@
 
 - [独立 Web 实施基线](./standalone-web-baseline.md)
 - [独立 Web 部署与实机验证清单](./standalone-web-deployment-checklist.md)
+- [定时任务服务端执行链](../standalone-web-automation-runtime.md)
 - [Browser Use 规格](../standalone-web-browser-use.md)
 - [连接恢复](../standalone-web-recovery.md)
 - [任务管理与非项目工作模式](../standalone-web-task-and-project-compat.md)
