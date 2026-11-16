@@ -171,8 +171,21 @@ parentPort?.on("message", (event: Electron.MessageEvent) => {
     return;
   }
   if (msg.type === "cron-dispatch-result") {
+    const settlement = msg.ok
+      ? {
+          runId: msg.runId,
+          ok: true as const,
+          taskId: msg.taskId,
+          sessionId: msg.sessionId,
+        }
+      : {
+          runId: msg.runId,
+          ok: false as const,
+          error: msg.error ?? "cron dispatch failed",
+          failureKind: msg.failureKind,
+        };
     void scheduler
-      .settleDispatchResult(msg)
+      .settleDispatchResult(settlement)
       .then(() => {
         // manual run 可能因同一 automation 已有派发在途而暂时无法认领。
         // 前一轮结算释放 single-flight 锁后主动 tick，避免再次等待 20 秒轮询。

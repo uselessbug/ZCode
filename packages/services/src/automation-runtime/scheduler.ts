@@ -271,7 +271,9 @@ export function createAutomationScheduler(
   const runTick = async (): Promise<void> => {
     if (disposed || !started || ticking) return;
     ticking = true;
-    const currentTick = (async () => {
+    let tickSettled = false;
+    let currentTick: Promise<void> | null = null;
+    currentTick = (async () => {
       try {
         do {
           tickRequested = false;
@@ -309,11 +311,12 @@ export function createAutomationScheduler(
           // wake 可能与当前 tick 重叠；记录 pending 并在本轮完成后立即补跑，避免干等下一轮轮询。
         } while (tickRequested && !disposed);
       } finally {
+        tickSettled = true;
         ticking = false;
-        if (tickPromise === currentTick) tickPromise = null;
+        if (currentTick !== null && tickPromise === currentTick) tickPromise = null;
       }
     })();
-    tickPromise = currentTick;
+    tickPromise = tickSettled ? null : currentTick;
     await currentTick;
   };
 

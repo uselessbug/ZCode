@@ -64,8 +64,8 @@ export interface AutomationLoggerPort {
 export interface AutomationModelSelectionPort {
   getView: (input?: { selection: ModelSelection | null }) => Promise<{
     selectionIssue?: unknown;
-    effectiveSelection?: ModelSelection;
-    preferredSelection?: ModelSelection;
+    effectiveSelection?: ModelSelection | null;
+    preferredSelection?: ModelSelection | null;
   }>;
 }
 
@@ -117,7 +117,7 @@ export interface AutomationTaskServicePort {
     traceId: TraceId;
     content: string;
     clientMode?: "desktop-continuous" | "web-remote-replayable";
-    automationId?: string;
+    automationId: string;
   }) => Promise<unknown>;
   setTaskUnread: (params: {
     taskId: string;
