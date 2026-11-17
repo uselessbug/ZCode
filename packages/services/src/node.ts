@@ -541,7 +541,10 @@ import { createZCodeTaskServiceAdapter } from "./zcode-agent/zcodeTaskServiceAda
 import { createZCodeSessionService } from "./zcode-session/zcodeSessionService.js";
 import { createZCodeTaskIndexSyncer } from "./zcode-agent/zcodeTaskIndexSyncer.js";
 import { TaskIndexRepo } from "./session/taskIndexRepo.js";
-import { AutomationRepo } from "#src/session/automationRepo.js";
+import {
+  AutomationRepo,
+  readWorkspaceAliasCanonicalKeyFromDatabase,
+} from "#src/session/automationRepo.js";
 import type { AppSettings } from "@zcode/shared";
 import { createBotsService } from "./bots/botsService.js";
 import { BotsRepo } from "#src/bots/repo.js";
@@ -746,6 +749,7 @@ import {
   ZCODE_VERSION,
   ZCODE_ENV,
   buildRuntimeZCodeApiUrl,
+  isRemoteWorkspaceIdentity,
 } from "@zcode/shared";
 
 // 这些 conversation-share 实现依赖 Node 文件系统；仅通过 @zcode/services/node 暴露，
@@ -1431,6 +1435,8 @@ export function createLocalServices(options: {
   browserControlExecutor?: BrowserControlExecutor;
   /** Windows desktop-local Host 的 CUA turn 状态投影；其它 authority 会在装配层拒绝。 */
   cuaOperationStateReporter?: CuaOperationStateReporter;
+  /** standalone-server 默认 5 分钟空闲回收插件控制面进程；测试可注入短超时。 */
+  pluginManagementIdleTimeoutMs?: number;
 }): ServiceCollection {
   const isDesktopAttachedRemote = options?.serviceAuthorityMode === "desktop-attached-remote";
   // host / remote server 以前直接沿用当前进程环境启动后续服务。
@@ -2490,8 +2496,11 @@ export function createLocalServices(options: {
   });
   const prepareProjectExecution = async (projectId: string) => {
     const prepared = await projectService.prepareSession({ projectId });
-    if (options?.serviceAuthorityMode === "standalone-server") {
-      // standalone 下固化当前服务器 canonical workspaceIdentity 与可信 hostId，
+    if (
+      options?.serviceAuthorityMode === "standalone-server" &&
+      !options?.allowStandaloneCloudWorkspaces
+    ) {
+      // 纯远端 Source Server 模式下固化当前服务器 canonical workspaceIdentity 与可信 hostId，
       // 避免新建定时任务落盘缺失 identity 或退回 local。
       const resolved = await sourceServerWorkspaceService.resolveWorkspace({
         workspacePath: prepared.workspacePath,
@@ -2510,21 +2519,77 @@ export function createLocalServices(options: {
   };
   const resolveAutomationExecutionContext =
     options?.serviceAuthorityMode === "standalone-server"
-      ? async (target: { workspacePath: string; workspaceIdentity?: string }) => {
-          const resolved = await sourceServerWorkspaceService.resolveWorkspace({
-            workspacePath: target.workspacePath,
-          });
+      ? async (target: {
+          workspacePath: string;
+          workspaceIdentity?: string;
+          targetTaskId?: string;
+        }) => {
           const hostId = options?.projectStorageHostId ?? "local";
           const identity = target.workspaceIdentity?.trim();
+          const stableIdentity =
+            hostId !== "local"
+              ? buildRemoteHostWorkspaceIdentity(hostId, target.workspacePath)
+              : undefined;
+          let cachedAliasCanonicalKey: string | null | undefined;
+          const readAliasCanonicalKey = async () => {
+            if (cachedAliasCanonicalKey === undefined) {
+              const orgDb = await taskIndexRepo.getOrganizationDatabase();
+              cachedAliasCanonicalKey = readWorkspaceAliasCanonicalKeyFromDatabase(
+                orgDb,
+                target.workspacePath,
+              );
+            }
+            return cachedAliasCanonicalKey;
+          };
+          // 先使用纯无副作用的只读逻辑完成归属校验：任何异域请求必须在触发
+          // sourceServerWorkspaceService.resolveWorkspace 前立即拒绝，确保零写入、零合并。
           if (identity) {
-            const stableIdentity =
-              hostId !== "local"
-                ? buildRemoteHostWorkspaceIdentity(hostId, target.workspacePath)
-                : undefined;
-            if (identity !== resolved.canonicalWorkspaceKey && identity !== stableIdentity) {
+            if (isRemoteWorkspaceIdentity(identity)) {
+              const aliasCanonicalKey =
+                identity === stableIdentity ? null : await readAliasCanonicalKey();
+              if (identity !== stableIdentity && identity !== aliasCanonicalKey) {
+                throw new Error("Automation workspace does not belong to this server");
+              }
+            } else if (identity !== target.workspacePath) {
               throw new Error("Automation workspace does not belong to this server");
             }
           }
+          if (options?.allowStandaloneCloudWorkspaces) {
+            const targetTaskId = target.targetTaskId?.trim();
+            if (targetTaskId && identity && isRemoteWorkspaceIdentity(identity)) {
+              const existingCanonicalTask = await taskIndexRepo.getTaskMeta({
+                workspacePath: target.workspacePath,
+                workspaceIdentity: identity,
+                taskId: targetTaskId,
+              });
+              if (existingCanonicalTask) {
+                return {
+                  hostId,
+                  workspaceIdentity: identity,
+                };
+              }
+            }
+            return {
+              hostId,
+              workspaceIdentity: undefined,
+            };
+          }
+          const aliasCanonicalKey = await readAliasCanonicalKey();
+          if (aliasCanonicalKey) {
+            if (stableIdentity) {
+              options?.onStandaloneWorkspaceIdentityResolved?.({
+                stableIdentity,
+                canonicalIdentity: aliasCanonicalKey,
+              });
+            }
+            return {
+              hostId,
+              workspaceIdentity: aliasCanonicalKey,
+            };
+          }
+          const resolved = await sourceServerWorkspaceService.resolveWorkspace({
+            workspacePath: target.workspacePath,
+          });
           return {
             hostId,
             workspaceIdentity: resolved.canonicalWorkspaceKey,
@@ -2621,8 +2686,11 @@ export function createLocalServices(options: {
         }
       : {}),
     useSharedTaskRuntime: async (target) => {
-      if (options?.projectStorageHostId && options.projectStorageHostId !== "local") return false;
-      return !(await taskIndexRepo.getProjectRepository()).hasProjectWorkspace(target);
+      if (!(isLocalProjectHost || isStandaloneManagedWorktreeHost)) return false;
+      if (target.workspaceIdentity?.trim()) return false;
+      return !(
+        await taskIndexRepo.getProjectRepository(projectRepositoryOptions)
+      ).hasProjectWorkspace(target);
     },
     prepareProjectExecution,
     // fork 归属在 ACK 返回前交接；普通创建在 CLI 首发前预留。两者都透传独立云端仓储策略。
@@ -2694,6 +2762,11 @@ export function createLocalServices(options: {
     // ZCodeAgentProcessManager，导致 host 永远不向 main 上报 Agent spawn/exit，进程监控器
     // 因而看不到实际运行的 Agent，也无法验证只读到可写升级是否复用同一进程。
     processLifecycleReporter: options?.processLifecycleReporter,
+    ...(options?.pluginManagementIdleTimeoutMs !== undefined
+      ? { pluginManagementIdleTimeoutMs: options.pluginManagementIdleTimeoutMs }
+      : options?.serviceAuthorityMode === "standalone-server"
+        ? { pluginManagementIdleTimeoutMs: 5 * 60_000 }
+        : {}),
     spawnFallbackCwd: options?.zcodeAgentSpawnFallbackCwd,
     // browser-use：host→main 执行桥透传给 agent service 的 onRequest browserExecute 路由。
     browserControlExecutor: options?.browserControlExecutor,
@@ -3684,6 +3757,7 @@ export function createLocalServices(options: {
         ? {
             standaloneAuthority: {
               projectStorageHostId: options.projectStorageHostId,
+              localWorkspaceAliasEnabled: Boolean(options.allowStandaloneCloudWorkspaces),
               // 使用无批量迁移副作用的只读 alias 查询 + 本服务器确定性 identity，
               // 避免同目录并存本地历史定义与异域 SSH 定义时误触发全路径批量迁移。
               resolveWorkspace: async (workspacePath) => {
@@ -3940,6 +4014,7 @@ export async function createServerHostServices(options: {
   browserControlExecutor?: BrowserControlExecutor;
   /** 默认 false；仅独立 HTTP 入口开启，避免 Desktop-attached remote 误起第二调度器。 */
   automationExecutionEnabled?: boolean;
+  pluginManagementIdleTimeoutMs?: number;
 }) {
   // 无桌面环境不能等到首次登录或 Provisioning 才发现系统库缺失。
   const credentialCipherProvider =
@@ -3995,6 +4070,9 @@ export async function createServerHostServices(options: {
     allowStandaloneMultiRoot: standaloneWebCompat,
     browserControlExecutor: options.browserControlExecutor,
     automationExecutionEnabled: options.automationExecutionEnabled === true,
+    ...(options.pluginManagementIdleTimeoutMs !== undefined
+      ? { pluginManagementIdleTimeoutMs: options.pluginManagementIdleTimeoutMs }
+      : {}),
     onStandaloneWorkspaceIdentityResolved: (mapping) => {
       workspaceIdentityMapper.register(mapping);
     },

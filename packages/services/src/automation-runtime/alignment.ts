@@ -11,8 +11,12 @@ export interface StandaloneWorkspaceResolution {
 }
 
 export interface StandaloneAutomationAlignmentOptions {
-  repo: Pick<AutomationRepoPort, "list" | "alignStandaloneWorkspaceIdentity">;
+  repo: Pick<
+    AutomationRepoPort,
+    "list" | "alignStandaloneWorkspaceIdentity" | "hasCanonicalReferencedSession"
+  >;
   projectStorageHostId: string;
+  localWorkspaceAliasEnabled?: boolean;
   /** 必须为只读/无批量迁移副作用的 canonical 身份查询，不得扫描改写同路径异域记录。 */
   resolveWorkspace: (workspacePath: string) => Promise<StandaloneWorkspaceResolution>;
   logger: Pick<AutomationLoggerPort, "info" | "warn">;
@@ -27,6 +31,7 @@ export async function alignStandaloneAutomations(
   options: StandaloneAutomationAlignmentOptions,
 ): Promise<void> {
   if (!options.repo.alignStandaloneWorkspaceIdentity) return;
+  const localWorkspaceAliasEnabled = Boolean(options.localWorkspaceAliasEnabled);
   const automations = await options.repo.list();
   for (const automation of automations) {
     // 1. 先按 hostId 排除非本服务器的异域定义（允许缺失或 "local" 的本机历史记录继续检查）。
@@ -56,6 +61,65 @@ export async function alignStandaloneAutomations(
       }
     }
 
+    if (localWorkspaceAliasEnabled) {
+      const hasCanonicalSession =
+        (await options.repo.hasCanonicalReferencedSession?.(automation.automationId)) ?? false;
+      if (hasCanonicalSession) {
+        let canonicalWorkspaceKey: string;
+        try {
+          canonicalWorkspaceKey = (await options.resolveWorkspace(automation.workspacePath))
+            .canonicalWorkspaceKey;
+        } catch (error) {
+          options.logger.warn(
+            `解析定时任务工作区身份失败，保持原记录待派发时拒绝 automation=${automation.automationId}`,
+            error,
+          );
+          continue;
+        }
+
+        const alreadyAligned =
+          automation.workspaceKey === canonicalWorkspaceKey &&
+          automation.workspaceIdentity === canonicalWorkspaceKey &&
+          automation.hostId === options.projectStorageHostId;
+        if (alreadyAligned) continue;
+
+        const aligned = await options.repo.alignStandaloneWorkspaceIdentity({
+          automationId: automation.automationId,
+          expectedOldWorkspaceKey: automation.workspaceKey,
+          canonicalWorkspaceKey,
+          targetWorkspaceIdentity: canonicalWorkspaceKey,
+          hostId: options.projectStorageHostId,
+        });
+        if (aligned) {
+          options.logger.info(
+            `已对齐并保留关联 canonical 会话的定时任务身份 automation=${automation.automationId} key=${canonicalWorkspaceKey}`,
+          );
+        }
+        continue;
+      }
+
+      const targetWorkspaceKey = automation.workspacePath;
+      const alreadyAligned =
+        automation.workspaceKey === targetWorkspaceKey &&
+        !automation.workspaceIdentity?.trim() &&
+        automation.hostId === options.projectStorageHostId;
+      if (alreadyAligned) continue;
+
+      const aligned = await options.repo.alignStandaloneWorkspaceIdentity({
+        automationId: automation.automationId,
+        expectedOldWorkspaceKey: automation.workspaceKey,
+        canonicalWorkspaceKey: targetWorkspaceKey,
+        targetWorkspaceIdentity: null,
+        hostId: options.projectStorageHostId,
+      });
+      if (aligned) {
+        options.logger.info(
+          `已对齐存量定时任务为本地 path-only 身份 automation=${automation.automationId} key=${targetWorkspaceKey}`,
+        );
+      }
+      continue;
+    }
+
     let canonicalWorkspaceKey: string;
     try {
       canonicalWorkspaceKey = (await options.resolveWorkspace(automation.workspacePath))
@@ -78,6 +142,7 @@ export async function alignStandaloneAutomations(
       automationId: automation.automationId,
       expectedOldWorkspaceKey: automation.workspaceKey,
       canonicalWorkspaceKey,
+      targetWorkspaceIdentity: canonicalWorkspaceKey,
       hostId: options.projectStorageHostId,
     });
     if (aligned) {
@@ -89,7 +154,7 @@ export async function alignStandaloneAutomations(
 }
 
 /**
- * standalone 运行期派发防线：只允许当前 Host canonical 身份与可信 hostId 派发，
+ * standalone 运行期派发防线：只允许当前 Host 权威身份与可信 hostId 派发，
  * 异域或未对齐记录明确按 permanent failure 拒绝，绝不调用 resolveWorkspace、绝不回落 "local"。
  */
 export async function assertStandaloneAutomationOwnership(params: {
@@ -98,9 +163,10 @@ export async function assertStandaloneAutomationOwnership(params: {
     "automationId" | "hostId" | "workspacePath" | "workspaceIdentity"
   >;
   projectStorageHostId: string;
+  localWorkspaceAliasEnabled?: boolean;
   resolveWorkspace: (workspacePath: string) => Promise<StandaloneWorkspaceResolution>;
 }): Promise<void> {
-  const { request, projectStorageHostId } = params;
+  const { request, projectStorageHostId, localWorkspaceAliasEnabled } = params;
   if (!request.hostId || request.hostId === "local" || request.hostId !== projectStorageHostId) {
     throw new AutomationPermanentDispatchError(
       `Automation host mismatch: ${request.hostId ?? "missing"} !== ${projectStorageHostId}`,
@@ -108,6 +174,9 @@ export async function assertStandaloneAutomationOwnership(params: {
   }
   const identity = request.workspaceIdentity?.trim();
   if (!identity) {
+    if (localWorkspaceAliasEnabled) {
+      return;
+    }
     throw new AutomationPermanentDispatchError(
       `Automation workspaceIdentity missing: ${request.automationId}`,
     );

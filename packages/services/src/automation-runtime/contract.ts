@@ -220,10 +220,12 @@ export interface AutomationRepoPort {
   releaseClaim: (automationId: string) => Promise<void>;
   releaseManualClaim: (automationId: string, workspaceKey: string) => Promise<void>;
   touchManualClaim: (automationId: string, workspaceKey: string) => Promise<void>;
+  hasCanonicalReferencedSession?: (automationId: string) => Promise<boolean>;
   alignStandaloneWorkspaceIdentity?: (params: {
     automationId: string;
     expectedOldWorkspaceKey: string;
     canonicalWorkspaceKey: string;
+    targetWorkspaceIdentity?: string | null;
     hostId: string;
   }) => Promise<boolean>;
 }

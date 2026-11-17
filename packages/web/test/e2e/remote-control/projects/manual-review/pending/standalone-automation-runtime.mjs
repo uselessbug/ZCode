@@ -5,12 +5,14 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import vm from "node:vm";
+import ts from "typescript";
 
 const repoRoot = fileURLToPath(new URL("../../../../../../../../", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -39,9 +41,11 @@ const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
 let db;
 let mod;
-let hostServicesEnabled;
 let hostServicesDisabled;
+let hostServicesEnabled;
+let hostServicesPureRemote;
 let frozenServices;
+let pluginIdleServices;
 
 try {
   const shared = join(repoRoot, "packages/shared/src");
@@ -72,13 +76,15 @@ try {
     stdin: {
       contents: [
         `export * from ${JSON.stringify(join(services, "node.ts"))};`,
+        `export { assertStandaloneAutomationOwnership } from ${JSON.stringify(join(services, "automation-runtime/index.ts"))};`,
         `export { createProjectService } from ${JSON.stringify(join(services, "project/index.ts"))};`,
-        `export { IZCodeAgentService, IProjectService, IModelSelectionService, IProviderSettingsService, ICredentialService } from ${JSON.stringify(join(services, "index.ts"))};`,
+        `export { IZCodeAgentService, IZCodeTaskService, IProjectService, IModelSelectionService, IProviderSettingsService, ICredentialService } from ${JSON.stringify(join(services, "index.ts"))};`,
         `export { projectStorage } from ${JSON.stringify(join(services, "project-storage/index.ts"))};`,
         `export { TaskIndexRepo } from ${JSON.stringify(join(services, "session/taskIndexRepo.ts"))};`,
         `export { runTasksDatabaseMigrations } from ${JSON.stringify(join(services, "session/tasksDatabase/migrations.ts"))};`,
         `export { createServerCredentialCipher } from ${JSON.stringify(join(shared, "credential-security/module.ts"))};`,
         `export { buildServerRemoteWorkspaceIdentity, remoteHostIdFromWorkspaceIdentity } from ${JSON.stringify(join(shared, "index.ts"))};`,
+        `export { ensureTaskNavigationWorkspace } from ${JSON.stringify(join(repoRoot, "packages/ui/src/app-shell/taskNavigationWorkspace.ts"))};`,
       ].join("\n"),
       resolveDir: repoRoot,
       loader: "ts",
@@ -350,6 +356,7 @@ try {
   ];
 
   const prompts = [];
+  const resumeCalls = [];
   const unreadCalls = [];
   const terminalListeners = new Map();
   let promptGate = null;
@@ -357,7 +364,9 @@ try {
 
   const taskService = {
     createTask: async (params) => ({ taskId: `task-created-${++seq}`, ...params }),
-    resumeTask: async () => {},
+    resumeTask: async (params) => {
+      resumeCalls.push(params);
+    },
     setAutomationSessionConfig: async () => {},
     setConfigOption: async () => {},
     sendPrompt: async (params) => {
@@ -493,6 +502,380 @@ try {
     assert.equal((await repo.getRun(`${auto.automationId}:seed-run`))?.workspaceKey, expectedKey);
   }
   console.log("PASS 存量缺失/显式本地路径启动对齐，异域 remote:ssh/server 同路径零篡改且拒绝派发");
+
+  // ---- 测试 2b：standalone localWorkspaceAliasEnabled=true 启动对齐（含存量 remote:server:<self>:<path> 迁回 path-only 与同路径异域 SSH 零篡改）与派发防线 ----
+  const localAliasDir = join(workspaceRoot, "local-alias-dir");
+  const localAliasSshDir = join(workspaceRoot, "local-alias-ssh-dir");
+  await Promise.all([
+    mkdir(localAliasDir, { recursive: true }),
+    mkdir(localAliasSshDir, { recursive: true }),
+  ]);
+  const localAliasDbPath = join(temporary, "runtime-local-alias.sqlite");
+  const localAliasDb = new DatabaseSync(localAliasDbPath);
+  localAliasDb.exec("PRAGMA foreign_keys=ON");
+  await mod.runTasksDatabaseMigrations(localAliasDb, { dbPath: localAliasDbPath });
+  const localAliasRepo = new AutomationRepo(localAliasDbPath);
+  await localAliasRepo.ensureReady();
+  const seedAliasCase = async (title, dir, identity, hostId) => {
+    const created = await localAliasRepo.create(
+      {
+        title,
+        prompt: title,
+        cronExpr: "*/5 * * * *",
+        recurring: false,
+        maxRuns: 1,
+        workspacePath: dir,
+        ...(identity ? { workspaceIdentity: identity } : {}),
+        ...(hostId ? { hostId } : {}),
+      },
+      { nextRunAt: Date.now() - 30_000 },
+    );
+    await localAliasRepo.ensureRunClaimed({
+      runId: `${created.automationId}:seed-run`,
+      automationId: created.automationId,
+      workspaceKey: identity && identity !== dir ? identity : dir,
+      scheduledAt: Date.now() - 90_000,
+      trigger: "schedule",
+    });
+    return created;
+  };
+  const aliasLegacy = await seedAliasCase("Alias Legacy", localAliasDir);
+  const aliasExplicit = await seedAliasCase(
+    "Alias Explicit",
+    localAliasDir,
+    localAliasDir,
+    "local",
+  );
+  const aliasPrevCanonical = await seedAliasCase(
+    "Alias Prev Canonical",
+    localAliasDir,
+    serverIdentity(localAliasDir),
+    ownerHostId,
+  );
+  // P1-1: 在 tasks 表播种 canonical 会话（覆盖 target_task_id 绑定与历史 automation_runs.session_id 两种情况）
+  // 以及一条 path-only tasks 会话（workspace_identity = NULL），验证只保留关联 canonical 会话的定义。
+  const seedTaskRow = (targetDb, params) => {
+    const now = Date.now();
+    targetDb
+      .prepare(
+        `INSERT INTO tasks (
+          workspace_key, workspace_path, workspace_identity, task_id,
+          title, mode, created_at, updated_at, meta_json
+        ) VALUES (?, ?, ?, ?, ?, 'build', ?, ?, '{}')`,
+      )
+      .run(
+        params.workspaceIdentity ?? params.workspacePath,
+        params.workspacePath,
+        params.workspaceIdentity ?? null,
+        params.taskId,
+        params.taskId,
+        now,
+        now,
+      );
+  };
+  const localAliasCanonId = serverIdentity(localAliasDir);
+  const canonTargetTaskId = "sess-canon-target-1";
+  const canonHistoryTaskId = "sess-canon-history-1";
+  const pathOnlyTargetTaskId = "sess-path-only-target-1";
+  seedTaskRow(localAliasDb, {
+    workspacePath: localAliasDir,
+    workspaceIdentity: localAliasCanonId,
+    taskId: canonTargetTaskId,
+  });
+  seedTaskRow(localAliasDb, {
+    workspacePath: localAliasDir,
+    workspaceIdentity: localAliasCanonId,
+    taskId: canonHistoryTaskId,
+  });
+  seedTaskRow(localAliasDb, {
+    workspacePath: localAliasDir,
+    workspaceIdentity: null,
+    taskId: pathOnlyTargetTaskId,
+  });
+  const aliasCanonTarget = await localAliasRepo.create(
+    {
+      title: "Alias Canon Target",
+      prompt: "Canon target prompt",
+      cronExpr: "*/5 * * * *",
+      recurring: false,
+      maxRuns: 1,
+      workspacePath: localAliasDir,
+      workspaceIdentity: localAliasCanonId,
+      hostId: ownerHostId,
+      targetTaskId: canonTargetTaskId,
+    },
+    { nextRunAt: Date.now() - 30_000 },
+  );
+  await localAliasRepo.ensureRunClaimed({
+    runId: `${aliasCanonTarget.automationId}:seed-run`,
+    automationId: aliasCanonTarget.automationId,
+    workspaceKey: localAliasCanonId,
+    scheduledAt: Date.now() - 90_000,
+    trigger: "schedule",
+  });
+  const aliasCanonHistory = await localAliasRepo.create(
+    {
+      title: "Alias Canon History",
+      prompt: "Canon history prompt",
+      cronExpr: "*/5 * * * *",
+      recurring: true,
+      workspacePath: localAliasDir,
+      workspaceIdentity: localAliasCanonId,
+      hostId: ownerHostId,
+    },
+    { nextRunAt: Date.now() - 30_000 },
+  );
+  await localAliasRepo.ensureRunClaimed({
+    runId: `${aliasCanonHistory.automationId}:history-run`,
+    automationId: aliasCanonHistory.automationId,
+    workspaceKey: localAliasCanonId,
+    scheduledAt: Date.now() - 90_000,
+    trigger: "schedule",
+  });
+  await localAliasRepo.markRunDispatch({
+    runId: `${aliasCanonHistory.automationId}:history-run`,
+    dispatchStatus: "dispatched",
+    sessionId: canonHistoryTaskId,
+  });
+  const aliasPathOnlyTarget = await localAliasRepo.create(
+    {
+      title: "Alias PathOnly Target",
+      prompt: "PathOnly target prompt",
+      cronExpr: "*/5 * * * *",
+      recurring: false,
+      maxRuns: 1,
+      workspacePath: localAliasDir,
+      workspaceIdentity: localAliasCanonId,
+      hostId: ownerHostId,
+      targetTaskId: pathOnlyTargetTaskId,
+    },
+    { nextRunAt: Date.now() - 30_000 },
+  );
+  const aliasForeignSshId = sshId(localAliasDir);
+  const aliasForeignSsh = await seedAliasCase(
+    "Alias Foreign SSH",
+    localAliasDir,
+    aliasForeignSshId,
+    "remote:ssh:ssh-host:22:alice",
+  );
+  const aliasForeignOtherId = srvOtherId(localAliasSshDir);
+  const aliasForeignOther = await seedAliasCase(
+    "Alias Foreign Other",
+    localAliasSshDir,
+    aliasForeignOtherId,
+    "remote:server:other-server",
+  );
+  const localAliasRuntime = createAutomationRuntime({
+    repo: localAliasRepo,
+    cron: {
+      computeNextRunAt: mod.computeAutomationNextRunAt,
+      isOneShotAutomation: mod.isOneShotAutomation,
+    },
+    resolveTargetServices: () => ({ taskService, modelSelectionService }),
+    logger: {
+      info: () => {},
+      warn: () => {},
+      error: (msg, err) => console.error("[test-local-alias-runtime]", msg, err),
+    },
+    pollIntervalMs: 60_000,
+    standaloneAuthority: {
+      projectStorageHostId: ownerHostId,
+      localWorkspaceAliasEnabled: true,
+      resolveWorkspace: async (workspacePath) => ({
+        canonicalWorkspaceKey: serverIdentity(workspacePath),
+      }),
+    },
+  });
+  await localAliasRuntime.start();
+  await waitUntil(async () => {
+    const ok = await Promise.all(
+      [
+        aliasLegacy,
+        aliasExplicit,
+        aliasPrevCanonical,
+        aliasCanonTarget,
+        aliasCanonHistory,
+        aliasPathOnlyTarget,
+      ].map((a) => localAliasRepo.get(a.automationId)),
+    );
+    const bad = await Promise.all(
+      [aliasForeignSsh, aliasForeignOther].map((a) => localAliasRepo.get(a.automationId)),
+    );
+    return ok.every((r) => r?.runCount === 1) && bad.every((r) => r?.lifecycleStatus === "failed");
+  }, "localWorkspaceAliasEnabled startup alignment + dispatch");
+  for (const a of [aliasLegacy, aliasExplicit, aliasPrevCanonical, aliasPathOnlyTarget]) {
+    const row = await localAliasRepo.get(a.automationId);
+    assert.equal(row?.workspaceKey, localAliasDir);
+    assert.equal(row?.workspaceIdentity, undefined);
+    assert.equal(row?.hostId, ownerHostId);
+    assert.equal(row?.runCount, 1);
+    assert.ok(
+      (await localAliasRepo.listRuns(a.automationId)).every(
+        (r) => r.workspaceKey === localAliasDir,
+      ),
+    );
+  }
+  for (const a of [aliasCanonTarget, aliasCanonHistory]) {
+    const row = await localAliasRepo.get(a.automationId);
+    assert.equal(
+      row?.workspaceKey,
+      localAliasCanonId,
+      `关联 canonical 会话的任务 ${a.title} 必须保留 canonical workspaceKey`,
+    );
+    assert.equal(
+      row?.workspaceIdentity,
+      localAliasCanonId,
+      `关联 canonical 会话的任务 ${a.title} 必须保留 canonical workspaceIdentity`,
+    );
+    assert.equal(row?.hostId, ownerHostId);
+    assert.equal(row?.runCount, 1);
+    assert.ok(
+      (await localAliasRepo.listRuns(a.automationId)).every(
+        (r) => r.workspaceKey === localAliasCanonId,
+      ),
+      `关联 canonical 会话的任务 ${a.title} 的 runs 必须保留 canonical workspaceKey`,
+    );
+  }
+  const canonResume = resumeCalls.find(
+    (c) => c.automationId === aliasCanonTarget.automationId && c.taskId === canonTargetTaskId,
+  );
+  assert.equal(
+    canonResume?.workspaceIdentity,
+    localAliasCanonId,
+    "绑定 canonical 会话的任务续跑必须携带原 canonical workspaceIdentity",
+  );
+  const pathOnlyResume = resumeCalls.find(
+    (c) => c.automationId === aliasPathOnlyTarget.automationId && c.taskId === pathOnlyTargetTaskId,
+  );
+  assert.equal(
+    pathOnlyResume?.workspaceIdentity,
+    undefined,
+    "绑定 path-only 会话的任务续跑必须保持 path-only",
+  );
+  assert.equal(
+    (await localAliasRepo.get(aliasForeignSsh.automationId))?.workspaceIdentity,
+    aliasForeignSshId,
+  );
+  assert.equal(
+    (await localAliasRepo.get(aliasForeignSsh.automationId))?.workspaceKey,
+    aliasForeignSshId,
+  );
+  assert.equal(
+    (await localAliasRepo.getRun(`${aliasForeignSsh.automationId}:seed-run`))?.workspaceKey,
+    aliasForeignSshId,
+  );
+  assert.equal(
+    (await localAliasRepo.get(aliasForeignOther.automationId))?.workspaceIdentity,
+    aliasForeignOtherId,
+  );
+  // 回归：对因历史 canonical session_id 保留本机 canonical 身份的循环任务，删光全部历史运行记录后，
+  // 后续 runNow 与下一轮到期 tick 必须继续正常派发成功，不能被永久置为 failed。
+  for (const runRow of await localAliasRepo.listRuns(aliasCanonHistory.automationId)) {
+    await localAliasRepo.deleteRun(runRow.runId, runRow.workspaceKey);
+  }
+  assert.equal((await localAliasRepo.listRuns(aliasCanonHistory.automationId)).length, 0);
+  assert.equal(
+    await localAliasRepo.hasCanonicalReferencedSession(aliasCanonHistory.automationId),
+    false,
+  );
+  const canonHistoryManual = await localAliasRepo.runNow(aliasCanonHistory.automationId, {
+    now: Date.now(),
+  });
+  assert.ok(canonHistoryManual);
+  await localAliasRuntime.dispatchManualRun(canonHistoryManual);
+  const afterDeletedHistManual = await localAliasRepo.get(aliasCanonHistory.automationId);
+  assert.equal(afterDeletedHistManual?.runCount, 2);
+  assert.equal(afterDeletedHistManual?.lifecycleStatus, "active");
+  const manualHistRun = await localAliasRepo.getRun(canonHistoryManual.run.runId);
+  assert.equal(manualHistRun?.dispatchStatus, "dispatched");
+  emitTerminal({
+    taskId: manualHistRun.sessionId,
+    inputId: canonHistoryManual.run.runId,
+    outcome: "succeeded",
+  });
+  await waitUntil(
+    async () =>
+      localAliasDb
+        .prepare("SELECT running FROM automations WHERE automation_id = ?")
+        .get(aliasCanonHistory.automationId)?.running === 0 &&
+      (await localAliasRepo.getRun(canonHistoryManual.run.runId))?.outcome === "succeeded",
+    "manual dispatch settled after deleting historical runs",
+  );
+  for (const runRow of await localAliasRepo.listRuns(aliasCanonHistory.automationId)) {
+    await localAliasRepo.deleteRun(runRow.runId, runRow.workspaceKey);
+  }
+  assert.equal((await localAliasRepo.listRuns(aliasCanonHistory.automationId)).length, 0);
+  assert.equal(
+    await localAliasRepo.hasCanonicalReferencedSession(aliasCanonHistory.automationId),
+    false,
+  );
+  localAliasDb
+    .prepare("UPDATE automations SET next_run_at = ? WHERE automation_id = ?")
+    .run(Date.now() - 10_000, aliasCanonHistory.automationId);
+  localAliasRuntime.wake();
+  await waitUntil(
+    async () => (await localAliasRepo.get(aliasCanonHistory.automationId))?.runCount === 3,
+    "scheduled tick dispatches after deleting all historical runs",
+  );
+  const afterDeletedHistTick = await localAliasRepo.get(aliasCanonHistory.automationId);
+  assert.equal(afterDeletedHistTick?.lifecycleStatus, "active");
+  assert.equal(afterDeletedHistTick?.workspaceKey, localAliasCanonId);
+  assert.equal(afterDeletedHistTick?.workspaceIdentity, localAliasCanonId);
+
+  // 校验 assertStandaloneAutomationOwnership（localWorkspaceAliasEnabled: true）：
+  // 合法本服务器 canonical 身份放行；裸路径残留、异域 server/ssh 或 "local" hostId 永久拒绝。
+  await mod.assertStandaloneAutomationOwnership({
+    request: {
+      automationId: "owned-canonical-check",
+      hostId: ownerHostId,
+      workspacePath: localAliasDir,
+      workspaceIdentity: serverIdentity(localAliasDir),
+    },
+    projectStorageHostId: ownerHostId,
+    localWorkspaceAliasEnabled: true,
+    resolveWorkspace: async (wp) => ({ canonicalWorkspaceKey: serverIdentity(wp) }),
+  });
+  for (const badReq of [
+    {
+      automationId: "bare-path-identity-check",
+      hostId: ownerHostId,
+      workspacePath: localAliasDir,
+      workspaceIdentity: localAliasDir,
+    },
+    {
+      automationId: "foreign-ssh-identity-check",
+      hostId: ownerHostId,
+      workspacePath: localAliasDir,
+      workspaceIdentity: aliasForeignSshId,
+    },
+    {
+      automationId: "foreign-server-identity-check",
+      hostId: ownerHostId,
+      workspacePath: localAliasDir,
+      workspaceIdentity: srvOtherId(localAliasDir),
+    },
+    {
+      automationId: "local-host-check",
+      hostId: "local",
+      workspacePath: localAliasDir,
+    },
+  ]) {
+    await assert.rejects(
+      mod.assertStandaloneAutomationOwnership({
+        request: badReq,
+        projectStorageHostId: ownerHostId,
+        localWorkspaceAliasEnabled: true,
+        resolveWorkspace: async (wp) => ({ canonicalWorkspaceKey: serverIdentity(wp) }),
+      }),
+      mod.AutomationPermanentDispatchError,
+    );
+  }
+  await localAliasRuntime.dispose();
+  localAliasRepo.close();
+  localAliasDb.close();
+  console.log(
+    "PASS standalone localWorkspaceAliasEnabled=true：无会话迁回 path-only、保留既有 canonical 会话且删光历史 run 后仍可继续派发、异域零篡改",
+  );
 
   // ---- 测试 3：周期任务推进 nextRunAt + 重复回执不重复累加计数 ----
   const recurringDue = await createProjDue("Recurring Due", -10_000);
@@ -722,10 +1105,14 @@ try {
   await mod.disposeServiceResourcesAndWait(hostServicesDisabled.services);
   hostServicesDisabled = undefined;
 
-  // 在 node.ts 真实装配前于默认库播种同路径共存的本地历史定义与异域 SSH 定义，验证真实启动对齐零篡改
+  // 在 node.ts 真实装配前于默认库播种同路径共存的本地历史定义、先前 canonical 同服务器定义与异域 SSH 定义，验证真实启动对齐零篡改
   const srvCoexistRepo = new AutomationRepo();
   await srvCoexistRepo.ensureReady();
   const srvCoexistSshId = `remote:ssh:ssh-host:22:alice:${explicitLocalDir}`;
+  const srvEnabledIdentity = buildServerRemoteWorkspaceIdentity({
+    serverId: "srv-enabled",
+    workspacePath: explicitLocalDir,
+  });
   const seedSrv = (t, id, hostId) =>
     srvCoexistRepo.create(
       {
@@ -740,6 +1127,18 @@ try {
       { nextRunAt: Date.now() + 3_600_000 },
     );
   const srvLocalHist = await seedSrv("Srv Coexist Local", explicitLocalDir, "local");
+  const srvPrevCanonical = await seedSrv(
+    "Srv Coexist Prev Canonical",
+    srvEnabledIdentity,
+    "remote:server:srv-enabled",
+  );
+  await srvCoexistRepo.ensureRunClaimed({
+    runId: `${srvPrevCanonical.automationId}:seed`,
+    automationId: srvPrevCanonical.automationId,
+    workspaceKey: srvEnabledIdentity,
+    scheduledAt: Date.now(),
+    trigger: "schedule",
+  });
   const srvForeignSsh = await seedSrv(
     "Srv Coexist SSH",
     srvCoexistSshId,
@@ -755,15 +1154,20 @@ try {
   srvCoexistRepo.close();
 
   hostServicesEnabled = await createHost("srv-enabled", true);
-  const srvEnabledIdentity = buildServerRemoteWorkspaceIdentity({
-    serverId: "srv-enabled",
-    workspacePath: explicitLocalDir,
-  });
   const srvVerifyRepo = new AutomationRepo();
   const alignedSrvLocal = await srvVerifyRepo.get(srvLocalHist.automationId);
+  const alignedSrvPrevCanonical = await srvVerifyRepo.get(srvPrevCanonical.automationId);
   const untouchedSrvSsh = await srvVerifyRepo.get(srvForeignSsh.automationId);
-  assert.equal(alignedSrvLocal?.workspaceIdentity, srvEnabledIdentity);
+  assert.equal(alignedSrvLocal?.workspaceIdentity, undefined);
+  assert.equal(alignedSrvLocal?.workspaceKey, explicitLocalDir);
   assert.equal(alignedSrvLocal?.hostId, "remote:server:srv-enabled");
+  assert.equal(alignedSrvPrevCanonical?.workspaceIdentity, undefined);
+  assert.equal(alignedSrvPrevCanonical?.workspaceKey, explicitLocalDir);
+  assert.equal(alignedSrvPrevCanonical?.hostId, "remote:server:srv-enabled");
+  assert.equal(
+    (await srvVerifyRepo.getRun(`${srvPrevCanonical.automationId}:seed`))?.workspaceKey,
+    explicitLocalDir,
+  );
   assert.equal(untouchedSrvSsh?.workspaceIdentity, srvCoexistSshId);
   assert.equal(untouchedSrvSsh?.workspaceKey, srvCoexistSshId);
   assert.equal(untouchedSrvSsh?.hostId, "remote:ssh:ssh-host:22:alice");
@@ -785,13 +1189,198 @@ try {
     workspacePath: projectDir,
   });
   assert.equal(createdOnEnabled.hostId, "remote:server:srv-enabled");
-  assert.ok(createdOnEnabled.workspaceIdentity?.startsWith("remote:server:srv-enabled:"));
+  assert.equal(createdOnEnabled.workspaceIdentity, undefined);
+  assert.equal(createdOnEnabled.workspaceKey, projectDir);
+
+  const nonProjDir = join(workspaceRoot, "non-proj-local-alias");
+  await mkdir(nonProjDir, { recursive: true });
+  const nonProjServerIdentity = buildServerRemoteWorkspaceIdentity({
+    serverId: "srv-enabled",
+    workspacePath: nonProjDir,
+  });
+  // P1-2: 当路径已在 workspace_alias 登记本服务器 canonical_key，且同路径并存异域 remote:ssh:* 定义与 run 时，
+  // 异域 createAutomation 请求在拒绝前绝不能触发 resolveWorkspace 合并或改写异域记录。
+  const p12AliasRepo = new mod.SourceServerWorkspaceAliasRepo({
+    backupRoot: join(temporary, "p12-alias-backups"),
+  });
+  await p12AliasRepo.resolveCanonicalWorkspaceKey({
+    workspacePath: nonProjDir,
+    legacyRouteHint: nonProjServerIdentity,
+  });
+  const p12ForeignSshId = `remote:ssh:ssh-host:22:alice:${nonProjDir}`;
+  const p12SeedRepo = new AutomationRepo();
+  await p12SeedRepo.ensureReady();
+  const p12ForeignSshAuto = await p12SeedRepo.create(
+    {
+      title: "P1-2 Coexist Foreign SSH",
+      cronExpr: "0 9 * * *",
+      prompt: "Keep foreign untouched",
+      workspacePath: nonProjDir,
+      workspaceIdentity: p12ForeignSshId,
+      hostId: "remote:ssh:ssh-host:22:alice",
+      recurring: true,
+    },
+    { nextRunAt: Date.now() + 3_600_000 },
+  );
+  await p12SeedRepo.ensureRunClaimed({
+    runId: `${p12ForeignSshAuto.automationId}:p12-seed`,
+    automationId: p12ForeignSshAuto.automationId,
+    workspaceKey: p12ForeignSshId,
+    scheduledAt: Date.now(),
+    trigger: "schedule",
+  });
+  const p12BeforeAuto = await p12SeedRepo.get(p12ForeignSshAuto.automationId);
+  const p12BeforeRun = await p12SeedRepo.getRun(`${p12ForeignSshAuto.automationId}:p12-seed`);
+  p12SeedRepo.close();
+
+  const createdNonProjWithSelfId = await agentEnabled.createAutomation({
+    title: "NonProj SelfId Normalized",
+    cronExpr: "0 9 * * *",
+    prompt: "Check non-proj",
+    workspacePath: nonProjDir,
+    workspaceIdentity: nonProjServerIdentity,
+  });
+  assert.equal(createdNonProjWithSelfId.hostId, "remote:server:srv-enabled");
+  assert.equal(createdNonProjWithSelfId.workspaceIdentity, undefined);
+  assert.equal(createdNonProjWithSelfId.workspaceKey, nonProjDir);
+  for (const rejectedIdentity of [
+    `remote:server:other-host:${nonProjDir}`,
+    `remote:ssh:other-box:22:bob:${nonProjDir}`,
+    "/other/non-remote/path",
+  ]) {
+    await assert.rejects(
+      agentEnabled.createAutomation({
+        title: "NonProj Foreign Rejected",
+        cronExpr: "0 9 * * *",
+        prompt: "Bad",
+        workspacePath: nonProjDir,
+        workspaceIdentity: rejectedIdentity,
+      }),
+      /does not belong to this server/,
+    );
+  }
+  const p12VerifyRepo = new AutomationRepo();
+  assert.deepEqual(
+    await p12VerifyRepo.get(p12ForeignSshAuto.automationId),
+    p12BeforeAuto,
+    "P1-2: 拒绝异域请求后，同路径异域 remote:ssh:* automations 行必须 100% 未被改写",
+  );
+  assert.deepEqual(
+    await p12VerifyRepo.getRun(`${p12ForeignSshAuto.automationId}:p12-seed`),
+    p12BeforeRun,
+    "P1-2: 拒绝异域请求后，同路径异域 remote:ssh:* automation_runs 行必须 100% 未被改写",
+  );
+  p12VerifyRepo.close();
   await mod.disposeServiceResourcesAndWait(hostServicesEnabled.services);
   hostServicesEnabled = undefined;
   await assert.rejects(agentEnabled.runAutomationNow(autoTarget(createdOnEnabled)), {
     message: "Automation immediate dispatcher is unavailable.",
   });
-  console.log("PASS createServerHostServices：启停边界与同路径共存零篡改");
+
+  // ---- 测试 7b：纯远端模式（未开启 ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS）保持 canonicalWorkspaceKey 固化与对齐 ----
+  delete process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS;
+  const pureRemoteDir = join(workspaceRoot, "pure-remote-proj");
+  await mkdir(pureRemoteDir, { recursive: true });
+  const pureRemoteSeedRepo = new AutomationRepo();
+  await pureRemoteSeedRepo.ensureReady();
+  const pureRemoteHist = await pureRemoteSeedRepo.create(
+    {
+      title: "Pure Remote Local Hist",
+      cronExpr: "0 9 * * *",
+      prompt: "Hist",
+      workspacePath: pureRemoteDir,
+      workspaceIdentity: pureRemoteDir,
+      hostId: "local",
+      recurring: true,
+    },
+    { nextRunAt: Date.now() + 3_600_000 },
+  );
+  pureRemoteSeedRepo.close();
+
+  hostServicesPureRemote = await createHost("srv-pure-remote", true);
+  const pureRemoteExpectedIdentity = buildServerRemoteWorkspaceIdentity({
+    serverId: "srv-pure-remote",
+    workspacePath: pureRemoteDir,
+  });
+  const pureRemoteVerifyRepo = new AutomationRepo();
+  const alignedPureRemote = await pureRemoteVerifyRepo.get(pureRemoteHist.automationId);
+  assert.equal(alignedPureRemote?.workspaceIdentity, pureRemoteExpectedIdentity);
+  assert.equal(alignedPureRemote?.workspaceKey, pureRemoteExpectedIdentity);
+  assert.equal(alignedPureRemote?.hostId, "remote:server:srv-pure-remote");
+  pureRemoteVerifyRepo.close();
+
+  const projPureRemote = await hostServicesPureRemote.services
+    .get(mod.IProjectService)
+    .saveProject({ name: "Pure Remote Proj", roots: [pureRemoteDir] });
+  const agentPureRemote = hostServicesPureRemote.services.get(mod.IZCodeAgentService);
+  const createdOnPureRemote = await agentPureRemote.createAutomation({
+    projectId: projPureRemote.id,
+    title: "Pure Remote Cron",
+    cronExpr: "0 9 * * *",
+    prompt: "Check pure remote",
+    workspacePath: pureRemoteDir,
+  });
+  assert.equal(createdOnPureRemote.hostId, "remote:server:srv-pure-remote");
+  assert.equal(createdOnPureRemote.workspaceIdentity, pureRemoteExpectedIdentity);
+  assert.equal(createdOnPureRemote.workspaceKey, pureRemoteExpectedIdentity);
+
+  // P1-2 (纯远端模式): workspace_alias 已存在且同路径并存异域 remote:ssh:* 记录时，
+  // 拒绝异域 createAutomation 请求绝不能触发 resolveWorkspace 合并或改写异域记录。
+  const pureRemoteForeignSshId = `remote:ssh:ssh-host:22:alice:${pureRemoteDir}`;
+  const pureRemoteCoexistRepo = new AutomationRepo();
+  await pureRemoteCoexistRepo.ensureReady();
+  const pureRemoteForeignAuto = await pureRemoteCoexistRepo.create(
+    {
+      title: "Pure Remote Foreign SSH",
+      cronExpr: "0 9 * * *",
+      prompt: "Keep pure remote foreign untouched",
+      workspacePath: pureRemoteDir,
+      workspaceIdentity: pureRemoteForeignSshId,
+      hostId: "remote:ssh:ssh-host:22:alice",
+      recurring: true,
+    },
+    { nextRunAt: Date.now() + 3_600_000 },
+  );
+  await pureRemoteCoexistRepo.ensureRunClaimed({
+    runId: `${pureRemoteForeignAuto.automationId}:seed`,
+    automationId: pureRemoteForeignAuto.automationId,
+    workspaceKey: pureRemoteForeignSshId,
+    scheduledAt: Date.now(),
+    trigger: "schedule",
+  });
+  const pureRemoteForeignBeforeAuto = await pureRemoteCoexistRepo.get(
+    pureRemoteForeignAuto.automationId,
+  );
+  const pureRemoteForeignBeforeRun = await pureRemoteCoexistRepo.getRun(
+    `${pureRemoteForeignAuto.automationId}:seed`,
+  );
+  pureRemoteCoexistRepo.close();
+  await assert.rejects(
+    agentPureRemote.createAutomation({
+      title: "Pure Remote Foreign Rejected",
+      cronExpr: "0 9 * * *",
+      prompt: "Bad pure remote",
+      workspacePath: pureRemoteDir,
+      workspaceIdentity: `remote:server:other:${pureRemoteDir}`,
+    }),
+    /does not belong to this server/,
+  );
+  const pureRemoteCoexistVerify = new AutomationRepo();
+  assert.deepEqual(
+    await pureRemoteCoexistVerify.get(pureRemoteForeignAuto.automationId),
+    pureRemoteForeignBeforeAuto,
+  );
+  assert.deepEqual(
+    await pureRemoteCoexistVerify.getRun(`${pureRemoteForeignAuto.automationId}:seed`),
+    pureRemoteForeignBeforeRun,
+  );
+  pureRemoteCoexistVerify.close();
+  await mod.disposeServiceResourcesAndWait(hostServicesPureRemote.services);
+  hostServicesPureRemote = undefined;
+  process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS = "1";
+  console.log(
+    "PASS createServerHostServices：本地工作台 path-only 归属、纯远端 canonical 归属、启停边界与同路径共存零篡改",
+  );
 
   // ---- 测试 8：冻结目录快照放行（项目 roots 修改/清空后，定时触发与 runAutomationNow 仍按原快照 A+B 创建会话；外部越界仍拒） ----
   const frozenHostId = remoteHostIdFromWorkspaceIdentity(
@@ -822,12 +1411,23 @@ process.stdin.on("data", (chunk) => {
     if (!line) continue;
     const msg = JSON.parse(line);
     if (msg.id === undefined) continue;
+    if (!msg.method) {
+      if (typeof msg.id === "string" && msg.id.startsWith("cli-cron-create-")) {
+        appendFileSync(logFile, JSON.stringify({ method: "automation/create:reply", sessionId: msg.id.slice("cli-cron-create-".length), pid: process.pid, result: msg.result, error: msg.error }) + "\\n");
+      }
+      continue;
+    }
     if (msg.method === "initialize") {
       process.stdout.write(JSON.stringify({ id: msg.id, result: { protocolName: "ZCode Protocol", protocolVersion: 1 } }) + "\\n");
       continue;
     }
     if (msg.method === "runtime/capabilities") {
-      process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { sessionWorkspaceRouting: true } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "plugins/list") {
+      appendFileSync(logFile, JSON.stringify({ method: msg.method, pid: process.pid, cwd: process.cwd(), params: msg.params }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { plugins: [], diagnostics: [] } }) + "\\n");
       continue;
     }
     if (msg.method === "provider/refreshRegistry") {
@@ -875,18 +1475,109 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     if (msg.method === "v4/conversation/subscribe") {
+      globalThis.__subSeq = (globalThis.__subSeq ?? 0) + 1;
+      const subId = "sub-" + globalThis.__subSeq;
+      const topic = msg.params?.topic ?? "";
       process.stdout.write(JSON.stringify({
         id: msg.id,
-        result: { ack: { subscriptionId: "sub-1", mode: "snapshot", logEpoch: "epoch-1" } },
+        result: { ack: { subscriptionId: subId, mode: "snapshot", logEpoch: "epoch-1" } },
       }) + "\\n");
+      if (topic.startsWith("sessions-index/")) {
+        const workspaceId = topic.slice("sessions-index/".length);
+        globalThis.__sessionsIndexSubs ??= new Map();
+        globalThis.__sessionsIndexSubs.set(workspaceId, { topic, subscriptionId: subId, seq: 1 });
+        const sessions = [];
+        for (const s of (globalThis.__sessionsById ?? new Map()).values()) {
+          if (s.workspaceId === workspaceId) sessions.push(s);
+        }
+        process.stdout.write(JSON.stringify({
+          method: "v4/conversation/frame",
+          params: {
+            wireVersion: 3,
+            kind: "complete",
+            deliveryKind: "initial",
+            logicalFrameId: "lf-" + subId + "-1",
+            logicalFrameOrdinal: 1,
+            topic,
+            subscriptionId: subId,
+            frame: {
+              topic,
+              subscriptionId: subId,
+              fromSeq: 0,
+              toSeq: 1,
+              sentAt: Date.now(),
+              payload: {
+                kind: "snapshot",
+                snapshot: {
+                  protocolVersion: 1,
+                  workspaceId,
+                  logEpoch: "epoch-1",
+                  sessions,
+                },
+              },
+            },
+          },
+        }) + "\\n");
+      }
       continue;
     }
-    if (msg.method === "v4/sessionsIndex/reconcile" || msg.method === "session/list") {
+    if (msg.method === "v4/sessionsIndex/reconcile") {
+      const requested = Array.isArray(msg.params?.sessionIds) ? msg.params.sessionIds : [];
+      const sessions = requested.map((sessionId) => {
+        const s = globalThis.__sessionsById?.get(sessionId);
+        return s
+          ? {
+              sessionId,
+              exists: true,
+              deleted: false,
+              title: s.title,
+              titleSource: "default",
+              createdAt: s.createdAt,
+              updatedAt: s.lastActivityAt,
+            }
+          : { sessionId, exists: false, deleted: false };
+      });
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { sessions } }) + "\\n");
+      continue;
+    }
+    if (msg.method === "session/list") {
       process.stdout.write(JSON.stringify({ id: msg.id, result: { sessions: [] } }) + "\\n");
       continue;
     }
-    if (msg.method === "session/create") {
-      appendFileSync(logFile, JSON.stringify({ method: msg.method, params: msg.params }) + "\\n");
+    if (msg.method === "session/create" || msg.method === "session/resume") {
+      if (msg.method === "session/create") {
+        globalThis.__createdWorkspaceBySessionId ??= new Map();
+        globalThis.__createdWorkspaceBySessionId.set(msg.params.sessionId, msg.params.workspace ?? null);
+        const nowTs = Date.now();
+        const wsId = msg.params.workspace?.workspaceKey ?? msg.params.workspace?.workspacePath ?? process.cwd();
+        globalThis.__sessionsById ??= new Map();
+        globalThis.__sessionsById.set(msg.params.sessionId, {
+          sessionId: msg.params.sessionId,
+          workspaceId: wsId,
+          title: "Frozen Cron Session",
+          titleSource: "default",
+          phase: "completedSuccess",
+          sessionEnded: false,
+          hasBackgroundWork: false,
+          lastActivityAt: nowTs,
+          createdAt: nowTs,
+        });
+      } else {
+        const expectedIdentity =
+          globalThis.__createdWorkspaceBySessionId?.get(msg.params.sessionId)?.workspaceIdentity ?? null;
+        const actualIdentity = msg.params.workspace?.workspaceIdentity ?? null;
+        if (
+          globalThis.__createdWorkspaceBySessionId?.has(msg.params.sessionId) &&
+          expectedIdentity !== actualIdentity
+        ) {
+          process.stdout.write(JSON.stringify({
+            id: msg.id,
+            error: { code: -32603, message: "project.session-lineage-invalid" },
+          }) + "\\n");
+          continue;
+        }
+      }
+      appendFileSync(logFile, JSON.stringify({ method: msg.method, pid: process.pid, cwd: process.cwd(), params: msg.params }) + "\\n");
       const now = Date.now();
       const snapshot = {
         protocol: { name: "ZCode Protocol", version: 1 },
@@ -931,8 +1622,67 @@ process.stdin.on("data", (chunk) => {
       process.stdout.write(JSON.stringify({ id: msg.id, result: snapshot }) + "\\n");
       continue;
     }
+    if (msg.method === "session/send") {
+      appendFileSync(logFile, JSON.stringify({ method: msg.method, pid: process.pid, params: msg.params }) + "\\n");
+      if (msg.params?.content === "__CRON_CREATE__") {
+        const cronReqId = "cli-cron-create-" + msg.params.sessionId;
+        const savedWs = globalThis.__createdWorkspaceBySessionId?.get(msg.params.sessionId);
+        const wp = savedWs?.workspacePath ?? msg.params.workspace?.workspacePath ?? process.cwd();
+        const wi = savedWs?.workspaceIdentity ?? msg.params.workspace?.workspaceIdentity;
+        process.stdout.write(JSON.stringify({
+          id: cronReqId,
+          method: "automation/create",
+          params: {
+            workspace: {
+              workspacePath: wp,
+              workspaceKey: savedWs?.workspaceKey ?? wi ?? wp,
+              ...(wi ? { workspaceIdentity: wi } : {}),
+            },
+            title: "CLI CronCreate " + (wi ? "Canonical" : "PathOnly"),
+            cronExpr: "0 9 * * *",
+            prompt: "Run from CLI CronCreate",
+            targetTaskId: msg.params.sessionId,
+            recurring: true,
+          },
+        }) + "\\n");
+      }
+      process.stdout.write(JSON.stringify({
+        id: msg.id,
+        result: { sessionId: msg.params.sessionId, accepted: true, stateRevision: 1 },
+      }) + "\\n");
+      const sessSummary = globalThis.__sessionsById?.get(msg.params.sessionId);
+      const sub = sessSummary ? globalThis.__sessionsIndexSubs?.get(sessSummary.workspaceId) : null;
+      if (sessSummary && sub) {
+        sessSummary.lastActivityAt = Date.now();
+        const nextSeq = ++sub.seq;
+        process.stdout.write(JSON.stringify({
+          method: "v4/conversation/frame",
+          params: {
+            wireVersion: 3,
+            kind: "complete",
+            deliveryKind: "online",
+            logicalFrameId: "lf-" + sub.subscriptionId + "-" + nextSeq,
+            logicalFrameOrdinal: nextSeq,
+            topic: sub.topic,
+            subscriptionId: sub.subscriptionId,
+            frame: {
+              topic: sub.topic,
+              subscriptionId: sub.subscriptionId,
+              fromSeq: nextSeq - 1,
+              toSeq: nextSeq,
+              sentAt: Date.now(),
+              payload: {
+                kind: "deltas",
+                deltas: [{ op: "session.upserted", session: sessSummary }],
+              },
+            },
+          },
+        }) + "\\n");
+      }
+      continue;
+    }
     if (msg.method === "v4/command") {
-      appendFileSync(logFile, JSON.stringify({ method: msg.method, params: msg.params }) + "\\n");
+      appendFileSync(logFile, JSON.stringify({ method: msg.method, pid: process.pid, params: msg.params }) + "\\n");
       process.stdout.write(JSON.stringify({
         id: msg.id,
         result: { status: "accepted", commandId: msg.params.commandId, revisionAtDecision: 1 },
@@ -986,6 +1736,9 @@ process.stdin.on("data", (chunk) => {
     workspacePath: frozenRootA,
   });
   assert.equal(frozenManualAuto.workspacePath, frozenRootA);
+  assert.equal(frozenManualAuto.workspaceIdentity, undefined);
+  assert.equal(frozenManualAuto.workspaceKey, frozenRootA);
+  assert.equal(frozenManualAuto.hostId, frozenHostId);
   assert.deepEqual(frozenManualAuto.additionalDirectories, [frozenRootB]);
 
   const frozenSchedAuto = await frozenAgentSvc.createAutomation({
@@ -998,6 +1751,8 @@ process.stdin.on("data", (chunk) => {
     recurring: false,
     maxRuns: 1,
   });
+  assert.equal(frozenSchedAuto.workspaceIdentity, undefined);
+  assert.equal(frozenSchedAuto.workspaceKey, frozenRootA);
 
   // 修改项目 roots 为 C，甚至再清空为 0 root
   await frozenProjectSvc.saveProject({ id: frozenProj.id, roots: [frozenRootC] });
@@ -1052,6 +1807,19 @@ process.stdin.on("data", (chunk) => {
     assert.equal(dirs.workspacePath, frozenRootA);
     assert.deepEqual(dirs.additionalDirectories, [frozenRootB]);
   }
+  const verifyTaskDb = new DatabaseSync(join(mod.getAppConfigDir(), "tasks-index.sqlite"));
+  try {
+    for (const sid of [mRun.sessionId, sRun.sessionId]) {
+      const taskRow = verifyTaskDb
+        .prepare("SELECT workspace_key, workspace_identity, host_id FROM tasks WHERE task_id = ?")
+        .get(sid);
+      assert.equal(taskRow?.workspace_key, frozenRootA);
+      assert.equal(taskRow?.workspace_identity, null);
+      assert.equal(taskRow?.host_id, frozenHostId);
+    }
+  } finally {
+    verifyTaskDb.close();
+  }
   // 普通外部 reserveCreatedTask 传越界目录 A+B 仍必须被拒绝
   assert.throws(
     () =>
@@ -1067,15 +1835,352 @@ process.stdin.on("data", (chunk) => {
     /project\.cwd-not-in-roots/,
   );
   verifyIdx.close();
+
+  // 独立 Web 三路导航真实契约断言：结合 http.ts createStandaloneProjectAlias 与 ui ensureTaskNavigationWorkspace
+  // 验证项目 roots 已清空为 [] 后，侧栏任务项、运行历史“前往会话”与立即运行 Toast“查看”均可正常打开本地标签页。
+  const httpSource = await readFile(join(repoRoot, "packages/server/src/http.ts"), "utf8");
+  const httpAst = ts.createSourceFile("http.ts", httpSource, ts.ScriptTarget.Latest, true);
+  const httpAliasNodes = httpAst.statements.filter(
+    (node) =>
+      ts.isFunctionDeclaration(node) &&
+      (node.name?.text === "projectHost" || node.name?.text === "createStandaloneProjectAlias"),
+  );
+  assert.equal(httpAliasNodes.length, 2, "必须抽取真实 http.ts createStandaloneProjectAlias");
+  const { outputText: httpAliasJs } = ts.transpileModule(
+    httpAliasNodes.map((node) => node.getText(httpAst)).join("\n"),
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
+  );
+  const createStandaloneProjectAlias = vm.runInNewContext(
+    `${httpAliasJs}\ncreateStandaloneProjectAlias`,
+  );
+  const aliasedFrozenProjSvc = createStandaloneProjectAlias(frozenProjectSvc, frozenHostId);
+  await waitUntil(async () => {
+    const t = await aliasedFrozenProjSvc.readTree({ hostId: "local" });
+    return (
+      t.tasks.some((item) => item.taskId === mRun.sessionId) &&
+      t.tasks.some((item) => item.taskId === sRun.sessionId)
+    );
+  }, "readTree syncs frozen automation tasks");
+  const aliasedTree = await aliasedFrozenProjSvc.readTree({ hostId: "local" });
+  for (const sid of [mRun.sessionId, sRun.sessionId]) {
+    const treeTask = aliasedTree.tasks.find((t) => t.taskId === sid);
+    assert.ok(treeTask, `readTree 必须返回冻结目录任务 ${sid}`);
+    assert.equal(treeTask.workspacePath, frozenRootA);
+    assert.equal(treeTask.workspaceIdentity, undefined);
+    assert.equal(treeTask.hostId, "local");
+  }
+  const assertNavAccepted = (target, label) => {
+    const addedTabs = [];
+    const navOpen = mod.ensureTaskNavigationWorkspace({
+      workspacePath: target.workspacePath,
+      workspaceIdentity: target.workspaceIdentity,
+      activateTabByPath: (wp, opts) => wp === frozenRootA && !opts?.workspaceIdentity,
+      addLocalWorkspaceTab: (wp) => addedTabs.push(wp),
+    });
+    assert.deepEqual(navOpen, { accepted: true, openedLocalTab: false }, `${label}（已打开）`);
+    assert.equal(addedTabs.length, 0);
+
+    const navClosed = mod.ensureTaskNavigationWorkspace({
+      workspacePath: target.workspacePath,
+      workspaceIdentity: target.workspaceIdentity,
+      activateTabByPath: () => false,
+      addLocalWorkspaceTab: (wp) => addedTabs.push(wp),
+    });
+    assert.deepEqual(
+      navClosed,
+      { accepted: true, openedLocalTab: true },
+      `${label}（未打开/0目录）`,
+    );
+    assert.deepEqual(addedTabs, [frozenRootA]);
+  };
+  assertNavAccepted(
+    aliasedTree.tasks.find((t) => t.taskId === sRun.sessionId),
+    "侧栏定时触发任务",
+  );
+  assertNavAccepted(
+    aliasedTree.tasks.find((t) => t.taskId === mRun.sessionId),
+    "侧栏 runNow 任务",
+  );
+  assertNavAccepted(frozenSchedAuto, "运行历史前往会话（定时触发）");
+  assertNavAccepted(frozenManualAuto, "运行历史前往会话 / Toast 查看（runNow）");
+  const sshNavAdded = [];
+  const foreignNav = mod.ensureTaskNavigationWorkspace({
+    workspacePath: frozenRootA,
+    workspaceIdentity: `remote:ssh:ssh-host:22:alice:${frozenRootA}`,
+    activateTabByPath: () => false,
+    addLocalWorkspaceTab: (wp) => sshNavAdded.push(wp),
+  });
+  assert.deepEqual(foreignNav, { accepted: false, reason: "remote_attachment_missing" });
+  assert.equal(sshNavAdded.length, 0);
+  console.log(
+    "PASS 冻结目录快照放行 + 独立 Web 三路导航契约（侧栏/运行历史/Toast 全路径 accepted:true，异域 SSH 仍 fail-closed）",
+  );
+
+  // ---- 测试 9：会话内 CronCreate path-only 落盘 + useSharedTaskRuntime 非项目/draft-* 共享进程池 vs 项目独占进程 ----
+  const readFrozenWorkerLogs = async () =>
+    (await readFile(frozenLogFile, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+
+  // 恢复 frozenProj 的 rootA 以便在 frozenRootA 上新建普通会话并触发 CLI CronCreate
+  await frozenProjectSvc.saveProject({ id: frozenProj.id, roots: [frozenRootA] });
+  const frozenTaskSvc = frozenServices.get(mod.IZCodeTaskService);
+  const cronSession = await frozenTaskSvc.createTask({
+    projectId: frozenProj.id,
+    workspacePath: frozenRootA,
+    modelSelection: frozenModelSelection,
+  });
+  await frozenAgentSvc.sendPrompt({
+    workspacePath: frozenRootA,
+    sessionId: cronSession.taskId,
+    content: "__CRON_CREATE__",
+    inputId: "input-cron-create-1",
+  });
+  await waitUntil(async () => {
+    const logs = await readFrozenWorkerLogs();
+    return logs.some(
+      (entry) =>
+        entry.method === "automation/create:reply" && entry.sessionId === cronSession.taskId,
+    );
+  }, "CLI CronCreate path-only reverse RPC reply");
+  const cronReplyLog = (await readFrozenWorkerLogs()).find(
+    (entry) => entry.method === "automation/create:reply" && entry.sessionId === cronSession.taskId,
+  );
+  assert.equal(cronReplyLog?.error, undefined);
+  const cliCreatedId = cronReplyLog?.result?.automation?.automationId;
+  assert.ok(cliCreatedId, "CLI CronCreate must return automationId");
+  const cliVerifyRepo = new AutomationRepo();
+  const cliCreatedRow = await cliVerifyRepo.get(cliCreatedId);
+  assert.equal(cliCreatedRow?.hostId, frozenHostId);
+  assert.equal(cliCreatedRow?.workspaceIdentity, undefined);
+  assert.equal(cliCreatedRow?.workspaceKey, frozenRootA);
+  assert.equal(cliCreatedRow?.targetTaskId, cronSession.taskId);
+
+  // P1-1 (real host CronCreate): 在经 canonical 坐标创建的会话内触发 CronCreate，
+  // 必须保留 canonical 坐标、回填 tasks.cron_automation_id，且后续 runAutomationNow 续跑不触发 lineage 错误。
+  const frozenCanonIdentity = buildServerRemoteWorkspaceIdentity({
+    serverId: "srv-frozen",
+    workspacePath: frozenRootA,
+  });
+  const cronCanonSession = await frozenTaskSvc.createTask({
+    projectId: frozenProj.id,
+    workspacePath: frozenRootA,
+    workspaceIdentity: frozenCanonIdentity,
+    modelSelection: frozenModelSelection,
+  });
+  await frozenAgentSvc.sendPrompt({
+    workspacePath: frozenRootA,
+    workspaceIdentity: frozenCanonIdentity,
+    sessionId: cronCanonSession.taskId,
+    content: "__CRON_CREATE__",
+    inputId: "input-cron-create-canon-1",
+  });
+  await waitUntil(async () => {
+    const logs = await readFrozenWorkerLogs();
+    return logs.some(
+      (entry) =>
+        entry.method === "automation/create:reply" && entry.sessionId === cronCanonSession.taskId,
+    );
+  }, "CLI CronCreate canonical reverse RPC reply");
+  const cronCanonReplyLog = (await readFrozenWorkerLogs()).find(
+    (entry) =>
+      entry.method === "automation/create:reply" && entry.sessionId === cronCanonSession.taskId,
+  );
+  assert.equal(cronCanonReplyLog?.error, undefined);
+  const cliCanonCreatedId = cronCanonReplyLog?.result?.automation?.automationId;
+  assert.ok(cliCanonCreatedId, "Canonical CLI CronCreate must return automationId");
+  const cliCanonCreatedRow = await cliVerifyRepo.get(cliCanonCreatedId);
+  cliVerifyRepo.close();
+  assert.equal(cliCanonCreatedRow?.hostId, frozenHostId);
+  assert.equal(cliCanonCreatedRow?.workspaceIdentity, frozenCanonIdentity);
+  assert.equal(cliCanonCreatedRow?.workspaceKey, frozenCanonIdentity);
+  assert.equal(cliCanonCreatedRow?.targetTaskId, cronCanonSession.taskId);
+  const canonTaskDb = new DatabaseSync(join(mod.getAppConfigDir(), "tasks-index.sqlite"));
+  try {
+    const canonTaskRow = canonTaskDb
+      .prepare("SELECT cron_automation_id FROM tasks WHERE workspace_key = ? AND task_id = ?")
+      .get(frozenCanonIdentity, cronCanonSession.taskId);
+    assert.equal(
+      canonTaskRow?.cron_automation_id,
+      cliCanonCreatedId,
+      "zcodeAgentService CronCreate 必须用一致的 canonical 坐标更新 tasks.cron_automation_id",
+    );
+    const pathOnlyTaskRow = canonTaskDb
+      .prepare("SELECT cron_automation_id FROM tasks WHERE workspace_key = ? AND task_id = ?")
+      .get(frozenRootA, cronSession.taskId);
+    assert.equal(pathOnlyTaskRow?.cron_automation_id, cliCreatedId);
+  } finally {
+    canonTaskDb.close();
+  }
+  await frozenAgentSvc.runAutomationNow(autoTarget(cliCanonCreatedRow));
+  await frozenAgentSvc.runAutomationNow(autoTarget(cliCreatedRow));
+  await waitUntil(async () => {
+    const logs = await readFrozenWorkerLogs();
+    return (
+      logs.some(
+        (entry) =>
+          entry.method === "session/resume" && entry.params?.sessionId === cronCanonSession.taskId,
+      ) &&
+      logs.some(
+        (entry) =>
+          entry.method === "session/resume" && entry.params?.sessionId === cronSession.taskId,
+      )
+    );
+  }, "both canonical and path-only bound automations resume with matching coordinates");
+  const resumeLogs = (await readFrozenWorkerLogs()).filter((e) => e.method === "session/resume");
+  assert.equal(
+    resumeLogs.find((e) => e.params?.sessionId === cronCanonSession.taskId)?.params?.workspace
+      ?.workspaceIdentity,
+    frozenCanonIdentity,
+  );
+  assert.equal(
+    resumeLogs.find((e) => e.params?.sessionId === cronSession.taskId)?.params?.workspace
+      ?.workspaceIdentity,
+    undefined,
+  );
+
+  // 两个不同的 draft-* 非项目目录共享同一个 SHARED_TASK_RUNTIME_KEY 物理进程 PID；
+  // 而 0 目录项目首次 prepareSession 落库后的 .zcode/workspace/<projectId> 与普通项目各自独占独立 PID
+  const draft1 = await frozenProjectSvc.prepareSession({});
+  const draft2 = await frozenProjectSvc.prepareSession({});
+  assert.notEqual(draft1.workspacePath, draft2.workspacePath);
+  const draft1Task = await frozenTaskSvc.createTask({
+    projectId: null,
+    workspacePath: draft1.workspacePath,
+    modelSelection: frozenModelSelection,
+  });
+  const draft2Task = await frozenTaskSvc.createTask({
+    projectId: null,
+    workspacePath: draft2.workspacePath,
+    modelSelection: frozenModelSelection,
+  });
+  const zeroProj = await frozenProjectSvc.saveProject({
+    name: "Zero Root Shared Check",
+    roots: [],
+  });
+  const zeroPrepared = await frozenProjectSvc.prepareSession({ projectId: zeroProj.id });
+  const zeroTask = await frozenTaskSvc.createTask({
+    projectId: zeroProj.id,
+    workspacePath: zeroPrepared.workspacePath,
+    modelSelection: frozenModelSelection,
+  });
+  const sessionCreateLogs = (await readFrozenWorkerLogs()).filter(
+    (entry) => entry.method === "session/create",
+  );
+  const pidForSession = (sid) =>
+    sessionCreateLogs.find((entry) => entry.params?.sessionId === sid)?.pid;
+  const pidProj = pidForSession(cronSession.taskId);
+  const pidDraft1 = pidForSession(draft1Task.taskId);
+  const pidDraft2 = pidForSession(draft2Task.taskId);
+  const pidZero = pidForSession(zeroTask.taskId);
+  assert.ok(pidProj && pidDraft1 && pidDraft2 && pidZero, "all session/create calls must log pid");
+  assert.equal(pidDraft1, pidDraft2, "two draft-* workspaces must share one physical CLI PID");
+  assert.notEqual(pidProj, pidDraft1, "project workspace must use dedicated CLI PID");
+  assert.notEqual(pidZero, pidDraft1, "0-root project workspace must use dedicated CLI PID");
+  assert.notEqual(pidZero, pidProj, "distinct projects must use distinct CLI PIDs");
+
+  // 释放 draft1 preparation 不得杀死 draft2 正在使用的共享进程
+  await frozenAgentSvc.disposeWorkspace({
+    workspacePath: draft1.workspacePath,
+    releasePreparation: true,
+  });
+  const draft2Task2 = await frozenTaskSvc.createTask({
+    projectId: null,
+    workspacePath: draft2.workspacePath,
+    modelSelection: frozenModelSelection,
+  });
+  const afterDisposeLogs = (await readFrozenWorkerLogs()).filter(
+    (entry) => entry.method === "session/create" && entry.params?.sessionId === draft2Task2.taskId,
+  );
+  assert.equal(
+    afterDisposeLogs[0]?.pid,
+    pidDraft1,
+    "disposeWorkspace({ releasePreparation: true }) must keep shared process alive for draft2",
+  );
+
   await mod.disposeServiceResourcesAndWait(frozenServices);
   frozenServices = undefined;
   console.log(
-    "PASS 冻结目录快照放行：项目 roots 变更/清空后 runAutomationNow 与定时触发仍以 A+B 建会话，普通越界仍拒绝",
+    "PASS CLI CronCreate path-only 落盘，且 useSharedTaskRuntime 下 draft-* 共享同 PID、0 目录/普通项目独占 PID",
+  );
+
+  // ---- 测试 10：pluginProcessManager 在 standalone-server 下的 lane / processLifecycleReporter / idleTimeoutMs 自动回收与按需拉起 ----
+  const pluginEvents = [];
+  const isPidAlive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  pluginIdleServices = mod.createLocalServices({
+    credentialCipherProvider: cipher,
+    zcodeBuiltinProviderConfigFilePath: join(repoRoot, "config/provider/zcode-builtin.test.json"),
+    serviceAuthorityMode: "standalone-server",
+    projectStorageHostId: frozenHostId,
+    allowStandaloneCloudWorkspaces: true,
+    standaloneWorkspaceRoot: workspaceRoot,
+    allowStandaloneMultiRoot: true,
+    pluginManagementIdleTimeoutMs: 180,
+    processLifecycleReporter: {
+      onSpawn: (event) => pluginEvents.push({ type: "spawn", ...event }),
+      onReady: (event) => pluginEvents.push({ type: "ready", ...event }),
+      onError: (event) => pluginEvents.push({ type: "error", ...event }),
+      onExit: (event) => pluginEvents.push({ type: "exit", ...event }),
+    },
+  });
+  const pluginIdleAgent = pluginIdleServices.get(mod.IZCodeAgentService);
+  const firstPluginList = await pluginIdleAgent.listPlugins({ workspacePath: frozenRootA });
+  assert.deepEqual(firstPluginList, { plugins: [], diagnostics: [] });
+  await waitUntil(
+    () => pluginEvents.some((e) => e.type === "spawn" && e.lane === "plugin-management"),
+    "plugin-management spawn event",
+  );
+  const firstPluginSpawn = pluginEvents.find(
+    (e) => e.type === "spawn" && e.lane === "plugin-management",
+  );
+  const pluginPid1 = firstPluginSpawn.pid;
+  assert.ok(typeof pluginPid1 === "number" && pluginPid1 > 0);
+
+  await waitUntil(
+    () =>
+      pluginEvents.some(
+        (e) => e.type === "exit" && e.lane === "plugin-management" && e.pid === pluginPid1,
+      ) && !isPidAlive(pluginPid1),
+    "plugin-management idle-timeout reclaim",
+  );
+  const firstPluginExit = pluginEvents.find(
+    (e) => e.type === "exit" && e.lane === "plugin-management" && e.pid === pluginPid1,
+  );
+  assert.equal(firstPluginExit.terminationKind, "expected");
+  assert.equal(firstPluginExit.terminationReason, "idle-timeout");
+
+  const secondPluginList = await pluginIdleAgent.listPlugins({ workspacePath: frozenRootA });
+  assert.deepEqual(secondPluginList, { plugins: [], diagnostics: [] });
+  await waitUntil(
+    () =>
+      pluginEvents.some(
+        (e) => e.type === "spawn" && e.lane === "plugin-management" && e.pid !== pluginPid1,
+      ),
+    "plugin-management respawn after idle reclaim",
+  );
+  const secondPluginSpawn = pluginEvents.find(
+    (e) => e.type === "spawn" && e.lane === "plugin-management" && e.pid !== pluginPid1,
+  );
+  assert.notEqual(secondPluginSpawn.pid, pluginPid1);
+  await mod.disposeServiceResourcesAndWait(pluginIdleServices);
+  pluginIdleServices = undefined;
+  console.log(
+    "PASS pluginProcessManager 空闲回收：standalone-server 触发 idle-timeout 回收旧 PID 后，再次调用干净拉起新 PID",
   );
 } finally {
+  if (pluginIdleServices && mod)
+    await mod.disposeServiceResourcesAndWait(pluginIdleServices).catch(() => {});
   if (frozenServices && mod)
     await mod.disposeServiceResourcesAndWait(frozenServices).catch(() => {});
-  for (const h of [hostServicesDisabled, hostServicesEnabled])
+  for (const h of [hostServicesDisabled, hostServicesEnabled, hostServicesPureRemote])
     if (h && mod) await mod.disposeServiceResourcesAndWait(h.services).catch(() => {});
   db?.close();
   for (const [k, v] of Object.entries(savedEnv)) {

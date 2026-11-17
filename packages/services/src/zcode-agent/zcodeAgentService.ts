@@ -1144,6 +1144,8 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
 > {
   /** 仅供 MCP 状态探测进程使用，不能把空闲回收传给 chat。 */
   mcpStatusIdleTimeoutMs?: number;
+  /** 仅供插件/控制面进程使用（standalone-server 默认 5 分钟空闲回收），不能把空闲回收传给 chat。 */
+  pluginManagementIdleTimeoutMs?: number;
   accountProviderConfigSource?: ProviderSource<AccountProviderConfigSnapshot>;
   /** Desktop Host 请求 Main 登记 Agent 已授权的精确本地视频路径。 */
   authorizeLocalMediaPreviewPath?: (path: string) => Promise<string>;
@@ -1195,6 +1197,7 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
   resolveAutomationExecutionContext?: (target: {
     workspacePath: string;
     workspaceIdentity?: string;
+    targetTaskId?: string;
   }) => Promise<{ hostId: string; workspaceIdentity?: string }>;
   defaultAutomationHostId?: string;
   /**
@@ -1454,9 +1457,14 @@ export function createZCodeAgentService(
   const pluginProcessManager = new ZCodeAgentProcessManager({
     commandResolver: options?.commandResolver,
     presentationSurface: options?.presentationSurface,
+    processLifecycleReporter: options?.processLifecycleReporter,
     requestTimeoutMs: options?.requestTimeoutMs,
     resolveSpawnEnv: options?.resolveSpawnEnv,
     waitForSpawnAdmission: options?.waitForSpawnAdmission,
+    lane: "plugin-management",
+    ...(options?.pluginManagementIdleTimeoutMs
+      ? { idleTimeoutMs: options.pluginManagementIdleTimeoutMs }
+      : {}),
   });
   // 合并时误删了独立进程：mcp/list 的慢握手会堵住串行 stdio 队列，连带卡住插件卸载。
   // 恢复专用控制面进程及空闲回收；共享 workspace 路径，不共享请求队列或 watchdog。

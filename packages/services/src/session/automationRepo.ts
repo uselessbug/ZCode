@@ -237,6 +237,26 @@ function readSerializedModelSelection(value: string | null): ModelSelection | un
   }
 }
 
+/**
+ * 只读查询 workspace_alias 表中已持久化的 canonical_key；不扫描或合并同路径其它记录。
+ * 供 standalone 启动对齐、创建校验与派发校验在不触发 SourceServerWorkspaceAliasRepo 批量迁移副作用的前提下读取别名。
+ */
+export function readWorkspaceAliasCanonicalKeyFromDatabase(
+  db: DatabaseSyncInstance,
+  workspacePath: string,
+): string | null {
+  const trimmed = workspacePath.trim();
+  if (!trimmed) return null;
+  const hasAliasTable = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_alias'")
+    .get();
+  if (!hasAliasTable) return null;
+  const row = db.prepare("SELECT canonical_key FROM workspace_alias WHERE path = ?").get(trimmed) as
+    | { canonical_key: string }
+    | undefined;
+  return row?.canonical_key?.trim() || null;
+}
+
 /** 退避重试时间：now + min(BASE * 2^(attempts-1), CAP)。 */
 export function computeRetryAt(now: number, attempts: number): number {
   const backoff = Math.min(
@@ -1083,39 +1103,75 @@ export class AutomationRepo {
    */
   async readWorkspaceAliasCanonicalKey(workspacePath: string): Promise<string | null> {
     await this.ensureReady();
-    const trimmed = workspacePath.trim();
-    if (!trimmed) return null;
-    const db = this.getDatabase();
-    const hasAliasTable = db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_alias'")
-      .get();
-    if (!hasAliasTable) return null;
-    const row = db
-      .prepare("SELECT canonical_key FROM workspace_alias WHERE path = ?")
-      .get(trimmed) as { canonical_key: string } | undefined;
-    return row?.canonical_key?.trim() || null;
+    return readWorkspaceAliasCanonicalKeyFromDatabase(this.getDatabase(), workspacePath);
+  }
+
+  private hasCanonicalReferencedSessionSync(automationId: string): boolean {
+    const row = this.getRow(automationId);
+    if (!row) return false;
+    const hit = this.getDatabase()
+      .prepare(
+        `SELECT 1 FROM tasks
+        WHERE workspace_identity IS NOT NULL
+          AND trim(workspace_identity) != ''
+          AND workspace_identity != workspace_path
+          AND workspace_path = @workspace_path
+          AND (
+            (@target_task_id IS NOT NULL AND task_id = @target_task_id)
+            OR task_id IN (
+              SELECT session_id FROM automation_runs
+              WHERE automation_id = @id AND session_id IS NOT NULL
+            )
+          )
+        LIMIT 1`,
+      )
+      .get({
+        id: automationId,
+        workspace_path: row.workspace_path,
+        target_task_id: row.target_task_id ?? null,
+      });
+    return Boolean(hit);
   }
 
   /**
-   * standalone 启动身份对齐：在同一写事务内把历史缺失 identity 或本机路径键的定时任务及运行台账
-   * 对齐为当前服务器权威 canonicalWorkspaceKey 与 hostId。
+   * 检查定时任务的 target_task_id 或历史 automation_runs.session_id 是否在 tasks 表中关联了
+   * 带非空 canonical workspace_identity 的既有会话行，用于 standalone 下保护已有会话坐标不分裂。
+   */
+  async hasCanonicalReferencedSession(automationId: string): Promise<boolean> {
+    await this.ensureReady();
+    return this.hasCanonicalReferencedSessionSync(automationId);
+  }
+
+  /**
+   * standalone 启动身份对齐：在同一写事务内把历史缺失 identity、本机路径键或同服务器旧身份的
+   * 定时任务及运行台账对齐为目标 workspaceKey / workspaceIdentity 与 hostId。
    */
   async alignStandaloneWorkspaceIdentity(params: {
     automationId: string;
     expectedOldWorkspaceKey: string;
     canonicalWorkspaceKey: string;
+    targetWorkspaceIdentity?: string | null;
     hostId: string;
   }): Promise<boolean> {
     await this.ensureReady();
     const db = this.getDatabase();
     const now = Date.now();
+    const targetIdentity =
+      params.targetWorkspaceIdentity === undefined
+        ? params.canonicalWorkspaceKey
+        : params.targetWorkspaceIdentity;
     db.exec("BEGIN IMMEDIATE");
     try {
+      // 原子保护：若已有 canonical tasks 会话引用此定时任务，禁止将其剥离为 path-only。
+      if (targetIdentity === null && this.hasCanonicalReferencedSessionSync(params.automationId)) {
+        db.exec("COMMIT");
+        return false;
+      }
       const updated = db
         .prepare(
           `UPDATE automations
           SET workspace_key = @canonical_key,
-              workspace_identity = @canonical_key,
+              workspace_identity = @workspace_identity,
               host_id = @host_id,
               updated_at = @now
           WHERE automation_id = @id AND workspace_key = @expected_old_key`,
@@ -1124,6 +1180,7 @@ export class AutomationRepo {
           id: params.automationId,
           expected_old_key: params.expectedOldWorkspaceKey,
           canonical_key: params.canonicalWorkspaceKey,
+          workspace_identity: targetIdentity,
           host_id: params.hostId,
           now,
         });

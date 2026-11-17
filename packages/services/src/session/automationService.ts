@@ -75,6 +75,7 @@ export interface AutomationServiceOptions {
   resolveExecutionContext?: (target: {
     workspacePath: string;
     workspaceIdentity?: string;
+    targetTaskId?: string;
   }) => Promise<{ hostId: string; workspaceIdentity?: string }>;
   defaultHostId?: string;
 }
@@ -188,6 +189,7 @@ export class AutomationService {
       const resolved = await this.options.resolveExecutionContext({
         workspacePath: createParams.workspacePath,
         workspaceIdentity: createParams.workspaceIdentity,
+        targetTaskId: createParams.targetTaskId,
       });
       execution = {
         projectId: createParams.projectId ?? null,

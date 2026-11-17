@@ -32,6 +32,7 @@ export interface CreateAutomationRuntimeOptions {
   /** standalone-server 传入权威 Host 身份解析，开启启动对齐与派发前归属校验。 */
   standaloneAuthority?: {
     projectStorageHostId: string;
+    localWorkspaceAliasEnabled?: boolean;
     resolveWorkspace: (workspacePath: string) => Promise<{ canonicalWorkspaceKey: string }>;
   };
 }
@@ -52,6 +53,7 @@ export function createAutomationRuntime(
         assertStandaloneAutomationOwnership({
           request,
           projectStorageHostId: options.standaloneAuthority!.projectStorageHostId,
+          localWorkspaceAliasEnabled: options.standaloneAuthority!.localWorkspaceAliasEnabled,
           resolveWorkspace: options.standaloneAuthority!.resolveWorkspace,
         })
     : undefined;
@@ -105,6 +107,7 @@ export function createAutomationRuntime(
         await alignStandaloneAutomations({
           repo,
           projectStorageHostId: options.standaloneAuthority.projectStorageHostId,
+          localWorkspaceAliasEnabled: options.standaloneAuthority.localWorkspaceAliasEnabled,
           resolveWorkspace: options.standaloneAuthority.resolveWorkspace,
           logger,
         });
