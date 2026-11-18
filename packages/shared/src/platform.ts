@@ -78,6 +78,8 @@ export interface TaskNotificationPayload {
   taskId: string;
   status: "completed" | "failed" | "permission_request" | "elicitation_request" | "feedback_update";
   requestId?: string;
+  workspacePath?: string;
+  workspaceIdentity?: string;
   title: string;
   body: string;
 }

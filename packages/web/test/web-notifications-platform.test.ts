@@ -689,16 +689,88 @@ describe("in-page task notifications", () => {
     assert.equal(sounds, 1);
   });
 
-  it("skips notifications while the page is focused or permission is missing", async () => {
+  it("carries workspacePath and workspaceIdentity in the service worker notification data", async () => {
+    const env = createEnv({ permission: "granted", existingSubscription: true });
+    const controller = createWebNotificationController({
+      pushEnabled: true,
+      host: env.host,
+      reconcileOnStart: false,
+    });
+    controller.showTaskNotification({
+      ...payload,
+      workspacePath: "/workspace/maintenance",
+      workspaceIdentity: "id-maint",
+    });
+    await flush();
+    assert.deepEqual(env.shown[0]?.options.data, {
+      taskId: "task-1",
+      workspacePath: "/workspace/maintenance",
+      workspaceIdentity: "id-maint",
+    });
+  });
+
+  it("passes the workspace through when a fallback Notification is clicked", async () => {
+    const env = createEnv({ permission: "granted", serviceWorker: false });
+    const controller = createWebNotificationController({
+      pushEnabled: true,
+      host: env.host,
+      reconcileOnStart: false,
+    });
+    const clicks: Array<[string, unknown]> = [];
+    controller.onTaskNotificationClick((taskId, context) => clicks.push([taskId, context]));
+    controller.showTaskNotification({
+      ...payload,
+      workspacePath: "/workspace/maintenance",
+      workspaceIdentity: "id-maint",
+    });
+    await flush();
+    env.legacyNotifications[0]!.onclick?.();
+    assert.deepEqual(clicks, [
+      ["task-1", { workspacePath: "/workspace/maintenance", workspaceIdentity: "id-maint" }],
+    ]);
+  });
+
+  it("starts the service worker message queue after registering the listener", () => {
+    const env = createEnv({ permission: "granted", existingSubscription: true });
+    const container = env.host.navigator.serviceWorker as unknown as {
+      startMessages?: () => void;
+    };
+    let started = 0;
+    container.startMessages = () => void (started += 1);
+    createWebNotificationController({ pushEnabled: true, host: env.host, reconcileOnStart: false });
+    assert.equal(started, 1);
+  });
+
+  it("skips notifications only while the page is focused on that very task, or permission is missing", async () => {
     const focused = createEnv({ permission: "granted", existingSubscription: true });
     focused.setFocused(true);
-    createWebNotificationController({
+    const focusedController = createWebNotificationController({
       pushEnabled: true,
       host: focused.host,
       reconcileOnStart: false,
-    }).showTaskNotification(payload);
+    });
+    focusedController.syncActiveTaskSession("task-1");
+    focusedController.showTaskNotification(payload);
     await flush();
     assert.equal(focused.shown.length, 0);
+
+    // 聚焦但在看别的任务：后台任务的通知照常展示。
+    focusedController.syncActiveTaskSession("task-other");
+    focusedController.showTaskNotification(payload);
+    await flush();
+    assert.equal(focused.shown.length, 1);
+
+    // 页面不在前台时，即使记录的是同一个任务也要提示。
+    const background = createEnv({ permission: "granted", existingSubscription: true });
+    const backgroundController = createWebNotificationController({
+      pushEnabled: true,
+      host: background.host,
+      reconcileOnStart: false,
+    });
+    backgroundController.syncActiveTaskSession("task-1");
+    backgroundController.showTaskNotification(payload);
+    await flush();
+    assert.equal(background.shown.length, 1);
 
     const denied = createEnv({ permission: "denied", existingSubscription: true });
     createWebNotificationController({
@@ -783,24 +855,44 @@ describe("in-page task notifications", () => {
     assert.equal(env.shown.length, 0);
   });
 
-  it("closes a pushed notification right away when the page is in the foreground", async () => {
+  it("closes a pushed notification right away only when the page is viewing that task", async () => {
     const env = createEnv({ permission: "granted", existingSubscription: true });
-    createWebNotificationController({
+    const controller = createWebNotificationController({
       pushEnabled: true,
       host: env.host,
       reconcileOnStart: false,
     });
+    controller.syncActiveTaskSession("task-1");
     env.setFocused(true);
     env.displayed.push({ tag: "zcode:task:task-1:terminal", closed: false });
+    env.displayed.push({ tag: "zcode:task:task-2:terminal", closed: false });
     env.displayed.push({ tag: "other", closed: false });
+    // 前台标签页在看任务 A：后台任务 B 的推送不能被误关。
     env.sw.emit("message", {
-      data: { type: "zcode:web-push-shown", tag: "zcode:task:task-1:terminal" },
+      data: { type: "zcode:web-push-shown", tag: "zcode:task:task-2:terminal", taskId: "task-2" },
     });
     await flush();
     assert.deepEqual(
       env.displayed.map((item) => item.closed),
-      [true, false],
+      [false, false, false],
     );
+    env.sw.emit("message", {
+      data: { type: "zcode:web-push-shown", tag: "zcode:task:task-1:terminal", taskId: "task-1" },
+    });
+    await flush();
+    assert.deepEqual(
+      env.displayed.map((item) => item.closed),
+      [true, false, false],
+    );
+
+    // 不在前台的页面不收回，即使正是它记录的任务。
+    env.setFocused(false);
+    env.displayed.push({ tag: "zcode:task:task-1:terminal", closed: false });
+    env.sw.emit("message", {
+      data: { type: "zcode:web-push-shown", tag: "zcode:task:task-1:terminal", taskId: "task-1" },
+    });
+    await flush();
+    assert.equal(env.displayed[3]?.closed, false);
   });
 
   it("clears stale ZCode notifications when the page regains focus", async () => {
@@ -825,6 +917,34 @@ describe("in-page task notifications", () => {
     assert.deepEqual(
       env.displayed.map((item) => item.closed),
       [true, false],
+    );
+  });
+
+  it("keeps other tasks' notifications when the page regains focus", async () => {
+    const env = createEnv({ permission: "granted", existingSubscription: true });
+    const controller = createWebNotificationController({
+      pushEnabled: true,
+      host: env.host,
+      reconcileOnStart: false,
+    });
+    controller.syncActiveTaskSession("task-a");
+    env.displayed.push({
+      tag: "zcode:task:task-a:terminal",
+      data: { taskId: "task-a" },
+      closed: false,
+    });
+    env.displayed.push({
+      tag: "zcode:task:task-b:terminal",
+      data: { taskId: "task-b" },
+      closed: false,
+    });
+    env.displayed.push({ tag: "zcode:generic", closed: false });
+    env.setFocused(true);
+    env.windowEvents.emit("focus");
+    await flush();
+    assert.deepEqual(
+      env.displayed.map((item) => item.closed),
+      [true, false, true],
     );
   });
 
@@ -912,6 +1032,155 @@ describe("in-page task notifications", () => {
     controller.showTaskNotification(payload);
     await flush();
     assert.equal(env.legacyNotifications.length, 1);
+  });
+
+  /** 把 registration.active 换成可编程的假 Service Worker，记录页面发来的请求。 */
+  async function attachWorker(
+    env: Env,
+    respond: ((message: any, port: MessagePort) => void) | null,
+  ): Promise<any[]> {
+    const requests: any[] = [];
+    const registration = await (
+      env.host.navigator.serviceWorker as unknown as { getRegistration(): Promise<any> }
+    ).getRegistration();
+    registration.active = {
+      postMessage: (message: unknown, transfer: MessagePort[]) => {
+        requests.push(message);
+        respond?.(message, transfer[0]!);
+      },
+    };
+    return requests;
+  }
+
+  it("lets the service worker decide: it shows once and only the answered page rings", async () => {
+    const env = createEnv({ permission: "granted", existingSubscription: true });
+    let sounds = 0;
+    const controller = createWebNotificationController({
+      pushEnabled: true,
+      host: env.host,
+      reconcileOnStart: false,
+      playSound: () => void (sounds += 1),
+    });
+    const requests = await attachWorker(env, (_message, port) =>
+      port.postMessage({ shown: true, playSound: true }),
+    );
+    controller.showTaskNotification({ ...payload, workspacePath: "/repo" });
+    await flush();
+    assert.deepEqual(plain(requests), [
+      {
+        type: "zcode:show-task-notification",
+        tag: "zcode:task:task-1:terminal",
+        payload: { ...payload, workspacePath: "/repo" },
+      },
+    ]);
+    assert.equal(env.shown.length, 0, "页面不直接展示");
+    assert.equal(sounds, 1);
+  });
+
+  it("stays quiet when the service worker says another tab owns the notification", async () => {
+    const env = createEnv({ permission: "granted", existingSubscription: true });
+    let sounds = 0;
+    const controller = createWebNotificationController({
+      pushEnabled: true,
+      host: env.host,
+      reconcileOnStart: false,
+      playSound: () => void (sounds += 1),
+    });
+    await attachWorker(env, (_message, port) =>
+      port.postMessage({ shown: false, playSound: false }),
+    );
+    controller.showTaskNotification(payload);
+    await flush();
+    assert.equal(env.shown.length, 0);
+    assert.equal(env.legacyNotifications.length, 0);
+    assert.equal(sounds, 0);
+    // 本页仍记住该 tag，4 秒内不会再次打扰 Service Worker。
+    controller.showTaskNotification(payload);
+    await flush();
+    assert.equal(env.shown.length, 0);
+  });
+
+  it("shows the notification itself when the service worker reports an error", async () => {
+    const env = createEnv({ permission: "granted", existingSubscription: true });
+    let sounds = 0;
+    const controller = createWebNotificationController({
+      pushEnabled: true,
+      host: env.host,
+      reconcileOnStart: false,
+      playSound: () => void (sounds += 1),
+    });
+    await attachWorker(env, (_message, port) =>
+      port.postMessage({ shown: false, playSound: false, error: true }),
+    );
+    controller.showTaskNotification(payload);
+    await flush();
+    assert.equal(env.shown.length, 1);
+    assert.equal(sounds, 1);
+  });
+
+  it("reports the active task and workspaces when the service worker asks", async () => {
+    const env = createEnv({ permission: "granted", existingSubscription: true });
+    env.setFocused(true);
+    const controller = createWebNotificationController({
+      pushEnabled: true,
+      host: env.host,
+      reconcileOnStart: false,
+    });
+    const query = async () => {
+      const channel = new MessageChannel();
+      const reply = new Promise((resolve) => {
+        channel.port1.onmessage = (event) => resolve(event.data);
+      });
+      env.sw.emit("message", {
+        data: { type: "zcode:query-client-state" },
+        ports: [channel.port2],
+      });
+      const state = await reply;
+      channel.port1.close();
+      return state;
+    };
+    assert.deepEqual(await query(), {
+      focused: true,
+      activeTaskId: null,
+      activeWorkspacePath: null,
+      openWorkspacePaths: [],
+    });
+
+    controller.syncWindowTabs(["/repo/b", "/repo/a", "/repo/b"]);
+    controller.syncActiveTaskSession("task-7");
+    assert.deepEqual(await query(), {
+      focused: true,
+      activeTaskId: "task-7",
+      activeWorkspacePath: "/repo/b",
+      openWorkspacePaths: ["/repo/b", "/repo/a", "/repo/b"],
+    });
+
+    // 尚无激活工作区时首项为空串，不能把第一个已打开的工作区当成激活的。
+    controller.syncWindowTabs(["", "/repo/a"]);
+    controller.syncActiveTaskSession(null);
+    env.setFocused(false);
+    assert.deepEqual(await query(), {
+      focused: false,
+      activeTaskId: null,
+      activeWorkspacePath: null,
+      openWorkspacePaths: ["/repo/a"],
+    });
+  });
+
+  it("does not answer state queries on the Web remote control page", async () => {
+    const env = createEnv({ permission: "granted", existingSubscription: true });
+    createWebNotificationController({
+      pushEnabled: false,
+      host: env.host,
+      reconcileOnStart: false,
+    });
+    let replied = false;
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => void (replied = true);
+    env.sw.emit("message", { data: { type: "zcode:query-client-state" }, ports: [channel.port2] });
+    await flush();
+    channel.port1.close();
+    assert.equal(replied, false);
   });
 });
 
@@ -1032,6 +1301,8 @@ describe("push service worker script", () => {
     const { readFile } = await import("node:fs/promises");
     const vm = await import("node:vm");
     const handlers = new Map<string, (event: any) => void>();
+    let showFails = false;
+    let beforeShow: (() => Promise<void>) | undefined;
     const calls = {
       shown: [] as Array<{ title: string; options: any }>,
       closed: [] as string[],
@@ -1052,6 +1323,8 @@ describe("push service worker script", () => {
       },
       registration: {
         showNotification: async (title: string, options: any) => {
+          if (showFails) throw new TypeError("Illegal constructor");
+          await beforeShow?.();
           calls.shown.push({ title, options });
         },
         getNotifications: async ({ tag }: { tag: string }) => [
@@ -1060,13 +1333,30 @@ describe("push service worker script", () => {
       },
     };
     // vm 内创建的对象原型属于另一个 realm，断言前统一转成普通 JSON。
-    vm.runInNewContext(await readFile(scriptPath, "utf8"), { self, URL, console });
+    vm.runInNewContext(await readFile(scriptPath, "utf8"), {
+      self,
+      URL,
+      console,
+      Date,
+      MessageChannel,
+      setTimeout,
+      clearTimeout,
+    });
     const dispatch = async (type: string, event: Record<string, unknown>) => {
       const waits: Promise<unknown>[] = [];
       handlers.get(type)?.({ ...event, waitUntil: (p: Promise<unknown>) => waits.push(p) });
       await Promise.all(waits);
     };
-    return { calls, dispatch };
+    return {
+      calls,
+      dispatch,
+      setBeforeShow: (hook: (() => Promise<void>) | undefined) => {
+        beforeShow = hook;
+      },
+      setShowFails: (value: boolean) => {
+        showFails = value;
+      },
+    };
   }
 
   const pushEvent = (payload: unknown) => ({ data: { json: () => payload } });
@@ -1090,13 +1380,58 @@ describe("push service worker script", () => {
     assert.equal(calls.claimed, 1);
   });
 
+  interface PageState {
+    focused: boolean;
+    activeTaskId?: string | null;
+    activeWorkspacePath?: string | null;
+    openWorkspacePaths?: string[];
+  }
+
+  /**
+   * 模拟工作台标签页。收到 zcode:query-client-state 时按 pageState 经传入的端口回复；
+   * 不给 pageState 就不回复，模拟挂起的标签页（Service Worker 会在超时后按“未知”处理）。
+   * 真实 WindowClient.focus() 会 resolve 聚焦后的 client；Android 后台时它仍可能不可见。
+   */
+  const makeWindowClient = (
+    url: string,
+    extra: Record<string, unknown> & {
+      onFocus?: () => void;
+      onMessage?: (message: unknown) => void;
+      focusResult?: "self" | "throw" | { focused?: boolean; visibilityState?: string };
+      pageState?: PageState;
+    } = {},
+  ) => {
+    const { onFocus, onMessage, focusResult = "self", pageState, ...state } = extra;
+    const client: Record<string, unknown> = {
+      url,
+      focused: false,
+      visibilityState: "visible",
+      ...state,
+      postMessage: (message: any, transfer?: any[]) => {
+        if (message?.type === "zcode:query-client-state") {
+          if (pageState) transfer?.[0]?.postMessage(pageState);
+          return;
+        }
+        onMessage?.(message);
+      },
+    };
+    client.focus = async () => {
+      onFocus?.();
+      if (focusResult === "throw") throw new Error("focus denied");
+      if (focusResult === "self") return client;
+      return { ...client, ...focusResult, postMessage: client.postMessage };
+    };
+    return client;
+  };
+
+  const WORKBENCH_URL = "https://zcode.example/";
+
   it("shows a notification and tells background tabs", async () => {
     const posted: unknown[] = [];
-    const tab = {
-      url: "https://zcode.example/",
-      focused: false,
-      postMessage: (message: unknown) => posted.push(message),
-    };
+    const tab = makeWindowClient(WORKBENCH_URL, {
+      onMessage: (message) => posted.push(message),
+      pageState: { focused: false },
+    });
     const { calls, dispatch } = await loadWorker([tab]);
     await dispatch("push", pushEvent(showPayload));
     assert.equal(calls.shown.length, 1);
@@ -1114,18 +1449,22 @@ describe("push service worker script", () => {
       },
     });
     assert.deepEqual(plain(posted), [
-      { type: "zcode:web-push-shown", tag: "zcode:task:t1:terminal", eventId: "e1" },
+      {
+        type: "zcode:web-push-shown",
+        tag: "zcode:task:t1:terminal",
+        eventId: "e1",
+        taskId: "t1",
+      },
     ]);
   });
 
   it("broadcasts the secondary tag and honours silent", async () => {
     const posted: unknown[] = [];
     const { calls, dispatch } = await loadWorker([
-      {
-        url: "https://zcode.example/",
-        focused: false,
-        postMessage: (m: unknown) => posted.push(m),
-      },
+      makeWindowClient(WORKBENCH_URL, {
+        onMessage: (message) => posted.push(message),
+        pageState: { focused: false },
+      }),
     ]);
     await dispatch(
       "push",
@@ -1144,62 +1483,98 @@ describe("push service worker script", () => {
         tag: "zcode:automation:run-1",
         secondaryTag: "zcode:task:t1:terminal",
         eventId: "e1",
+        taskId: "t1",
       },
     ]);
   });
 
-  it("skips the notification only for a visible focused workbench on non-Apple browsers", async () => {
-    const focusedWorkbench = {
-      url: "https://zcode.example/",
-      focused: true,
-      visibilityState: "visible",
-      postMessage: () => {},
-    };
-    const chrome = await loadWorker([focusedWorkbench]);
+  it("skips a push only when a focused workbench is viewing that very task on non-Apple browsers", async () => {
+    const viewing = makeWindowClient(WORKBENCH_URL, {
+      pageState: { focused: true, activeTaskId: "t1" },
+    });
+    const chrome = await loadWorker([viewing]);
     await chrome.dispatch("push", pushEvent(showPayload));
     assert.equal(chrome.calls.shown.length, 0);
 
-    // 聚焦但不可见、可见但未聚焦、以及非工作台页面都不豁免。
-    for (const client of [
-      { ...focusedWorkbench, visibilityState: "hidden" },
-      { ...focusedWorkbench, focused: false },
-      { ...focusedWorkbench, url: "https://zcode.example/remote/v4" },
-      { ...focusedWorkbench, url: "https://zcode.example/share/abc" },
-      { ...focusedWorkbench, url: "https://zcode.example/cn/share/abc" },
-      { ...focusedWorkbench, url: "https://evil.example/" },
-    ]) {
+    // 另一个任务、后台、没有任务、挂起未回复（有 taskId 时以精确匹配为准）、非工作台页面都不豁免。
+    const state = (extra: PageState): { pageState: PageState } => ({ pageState: extra });
+    for (const [label, client] of [
+      [
+        "viewing another task",
+        makeWindowClient(WORKBENCH_URL, state({ focused: true, activeTaskId: "t2" })),
+      ],
+      [
+        "viewing the task in the background",
+        makeWindowClient(WORKBENCH_URL, state({ focused: false, activeTaskId: "t1" })),
+      ],
+      [
+        "focused on settings",
+        makeWindowClient(WORKBENCH_URL, state({ focused: true, activeTaskId: null })),
+      ],
+      [
+        "unresponsive but visible and focused",
+        makeWindowClient(WORKBENCH_URL, { focused: true, visibilityState: "visible" }),
+      ],
+      ...[
+        "https://zcode.example/remote/v4",
+        "https://zcode.example/share/abc",
+        "https://zcode.example/cn/share/abc",
+        "https://evil.example/",
+      ].map(
+        (url) =>
+          [url, makeWindowClient(url, state({ focused: true, activeTaskId: "t1" }))] as const,
+      ),
+    ] as const) {
       const worker = await loadWorker([client]);
       await worker.dispatch("push", pushEvent(showPayload));
-      assert.equal(worker.calls.shown.length, 1, client.url + client.visibilityState);
+      assert.equal(worker.calls.shown.length, 1, label);
     }
   });
 
-  it("always shows on iOS and Mac Safari, even with a focused workbench", async () => {
-    const focusedWorkbench = {
-      url: "https://zcode.example/index.html",
-      focused: true,
-      visibilityState: "visible",
-      postMessage: () => {},
-    };
+  it("falls back to generic foreground suppression for a push without a task", async () => {
+    const genericPush = { ...showPayload, taskId: undefined };
+    const cases: Array<[string, Record<string, unknown>, number]> = [
+      ["replied focused", { pageState: { focused: true, activeTaskId: "t9" } }, 0],
+      ["replied unfocused", { focused: true, pageState: { focused: false } }, 1],
+      ["unresponsive visible and focused", { focused: true, visibilityState: "visible" }, 0],
+      ["unresponsive hidden", { focused: true, visibilityState: "hidden" }, 1],
+    ];
+    for (const [label, extra, expectedShown] of cases) {
+      const worker = await loadWorker([makeWindowClient(WORKBENCH_URL, extra)]);
+      await worker.dispatch("push", pushEvent(genericPush));
+      assert.equal(worker.calls.shown.length, expectedShown, label);
+    }
+  });
+
+  it("always shows on iOS and Mac Safari, even when the task is being viewed, and reports the task", async () => {
+    const posted: unknown[] = [];
+    const focusedWorkbench = () =>
+      makeWindowClient("https://zcode.example/index.html", {
+        focused: true,
+        onMessage: (message) => posted.push(message),
+        pageState: { focused: true, activeTaskId: "t1" },
+      });
     for (const userAgent of [
       IOS_UA,
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15",
     ]) {
-      const { calls, dispatch } = await loadWorker([focusedWorkbench], userAgent);
+      posted.length = 0;
+      const { calls, dispatch } = await loadWorker([focusedWorkbench()], userAgent);
       await dispatch("push", pushEvent(showPayload));
       assert.equal(calls.shown.length, 1);
+      assert.equal((plain(posted)[0] as { taskId?: string }).taskId, "t1");
     }
     // iOS Chrome / Firefox (CriOS / FxiOS) 底层同样是 Apple WebKit，不能跳过展示。
     const crios = await loadWorker(
-      [focusedWorkbench],
+      [focusedWorkbench()],
       "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 CriOS/124 Mobile/15E148 Safari/604.1",
     );
     await crios.dispatch("push", pushEvent(showPayload));
     assert.equal(crios.calls.shown.length, 1);
 
-    // Android Chrome 属于真 Chromium，工作台在前台时允许跳过展示。
+    // Android Chrome 属于真 Chromium，前台正在看该任务时允许跳过展示。
     const androidChrome = await loadWorker(
-      [focusedWorkbench],
+      [focusedWorkbench()],
       "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
     );
     await androidChrome.dispatch("push", pushEvent(showPayload));
@@ -1232,12 +1607,11 @@ describe("push service worker script", () => {
     const messages: unknown[] = [];
     let focused = 0;
     const { calls, dispatch } = await loadWorker([
-      { url: "https://zcode.example/remote/v4", focus: async () => {}, postMessage: () => {} },
-      {
-        url: "https://zcode.example/?foo=1",
-        focus: async () => void (focused += 1),
-        postMessage: (message: unknown) => messages.push(message),
-      },
+      makeWindowClient("https://zcode.example/remote/v4"),
+      makeWindowClient("https://zcode.example/?foo=1", {
+        onFocus: () => void (focused += 1),
+        onMessage: (message) => messages.push(message),
+      }),
     ]);
     let closed = false;
     await dispatch("notificationclick", {
@@ -1259,18 +1633,85 @@ describe("push service worker script", () => {
     assert.deepEqual(calls.opened, []);
   });
 
+  it("posts the message to the focused client the browser resolved, without reloading", async () => {
+    const messages: unknown[] = [];
+    const { calls, dispatch } = await loadWorker([
+      makeWindowClient("https://zcode.example/", {
+        visibilityState: "hidden",
+        onMessage: (message) => messages.push(["original", message]),
+        focusResult: { focused: true, visibilityState: "visible" },
+      }),
+    ]);
+    await dispatch("notificationclick", {
+      notification: { close: () => {}, data: { taskId: "t1", workspacePath: "/repo" } },
+    });
+    assert.equal(messages.length, 1);
+    assert.deepEqual(calls.opened, []);
+  });
+
+  it("opens the deep link when focus() rejects, e.g. Android browsers in the background", async () => {
+    const messages: unknown[] = [];
+    const { calls, dispatch } = await loadWorker([
+      makeWindowClient("https://zcode.example/", {
+        visibilityState: "hidden",
+        focusResult: "throw",
+        onMessage: (message) => messages.push(message),
+      }),
+    ]);
+    await dispatch("notificationclick", {
+      notification: {
+        close: () => {},
+        data: { taskId: "t1", workspacePath: "/repo", workspaceIdentity: "id-1" },
+      },
+    });
+    assert.equal(messages.length, 1);
+    assert.deepEqual(calls.opened, [
+      "https://zcode.example/?zcodeTask=t1&zcodeWorkspace=%2Frepo&zcodeWorkspaceIdentity=id-1",
+    ]);
+  });
+
+  it("opens the deep link when focus() resolves a client that is neither focused nor visible", async () => {
+    const messages: unknown[] = [];
+    const { calls, dispatch } = await loadWorker([
+      makeWindowClient("https://zcode.example/", {
+        visibilityState: "hidden",
+        onMessage: (message) => messages.push(message),
+        focusResult: { focused: false, visibilityState: "hidden" },
+      }),
+    ]);
+    await dispatch("notificationclick", {
+      notification: { close: () => {}, data: { taskId: "t1", workspacePath: "/repo" } },
+    });
+    assert.equal(messages.length, 1);
+    assert.deepEqual(calls.opened, ["https://zcode.example/?zcodeTask=t1&zcodeWorkspace=%2Frepo"]);
+  });
+
+  it("opens the deep link when focus() resolves nothing", async () => {
+    const { calls, dispatch } = await loadWorker([
+      {
+        url: "https://zcode.example/",
+        visibilityState: "hidden",
+        focus: async () => undefined,
+        postMessage: () => {},
+      },
+    ]);
+    await dispatch("notificationclick", {
+      notification: { close: () => {}, data: { taskId: "t1" } },
+    });
+    assert.deepEqual(calls.opened, ["https://zcode.example/?zcodeTask=t1"]);
+  });
+
   it("prefers the focused or visible workbench window when several are open", async () => {
     const messages: string[] = [];
-    const makeClient = (name: string, extra: Record<string, unknown>) => ({
-      url: "https://zcode.example/",
-      focus: async () => {},
-      postMessage: () => messages.push(name),
-      ...extra,
-    });
+    const named = (name: string, extra: Record<string, unknown>) =>
+      makeWindowClient("https://zcode.example/", {
+        onMessage: () => messages.push(name),
+        ...extra,
+      });
     const { dispatch } = await loadWorker([
-      makeClient("background", { visibilityState: "hidden", focused: false }),
-      makeClient("visible", { visibilityState: "visible", focused: false }),
-      makeClient("focused", { visibilityState: "visible", focused: true }),
+      named("background", { visibilityState: "hidden", focused: false }),
+      named("visible", { visibilityState: "visible", focused: false }),
+      named("focused", { visibilityState: "visible", focused: true }),
     ]);
     await dispatch("notificationclick", {
       notification: { close: () => {}, data: { taskId: "t1" } },
@@ -1303,5 +1744,495 @@ describe("push service worker script", () => {
     ]);
     await dispatch("notificationclick", { notification: { close: () => {}, data: {} } });
     assert.equal(calls.opened[1], "https://zcode.example/");
+  });
+
+  /** 经 MessageChannel 向 Service Worker 发页内通知请求，返回它的裁决。 */
+  async function requestShow(
+    dispatch: (type: string, event: Record<string, unknown>) => Promise<void>,
+    request: unknown,
+  ) {
+    const channel = new MessageChannel();
+    const reply = new Promise((resolve) => {
+      channel.port1.onmessage = (event) => resolve(event.data);
+    });
+    await dispatch("message", { data: request, ports: [channel.port2] });
+    const decision = plain(await reply);
+    channel.port1.close();
+    return decision;
+  }
+
+  const taskRequest = (extra: Record<string, unknown> = {}) => ({
+    type: "zcode:show-task-notification",
+    tag: "zcode:task:t1:terminal",
+    payload: {
+      taskId: "t1",
+      status: "completed",
+      title: "Task completed",
+      body: "Task: demo",
+      workspacePath: "/repo",
+      ...extra,
+    },
+  });
+
+  it("shows page notifications silently once per tag across tabs and pushes", async () => {
+    const worker = await loadWorker([
+      makeWindowClient(WORKBENCH_URL, { pageState: { focused: false } }),
+    ]);
+    assert.deepEqual(await requestShow(worker.dispatch, taskRequest()), {
+      shown: true,
+      playSound: true,
+    });
+    assert.equal(worker.calls.shown.length, 1);
+    assert.deepEqual(plain(worker.calls.shown[0]?.options), {
+      body: "Task: demo",
+      tag: "zcode:task:t1:terminal",
+      silent: true,
+      icon: "/icon-192.png",
+      data: { taskId: "t1", workspacePath: "/repo", tag: "zcode:task:t1:terminal" },
+    });
+    // 同一 tag 4 秒内（无论来自别的标签页还是刚到的推送）不再展示、不再响铃。
+    assert.deepEqual(await requestShow(worker.dispatch, taskRequest()), {
+      shown: false,
+      playSound: false,
+    });
+    assert.equal(worker.calls.shown.length, 1);
+
+    // 推送展示过的 tag 同样让随后的页内请求让路；推送本身永远展示（userVisibleOnly）。
+    const afterPush = await loadWorker([]);
+    await afterPush.dispatch("push", pushEvent(showPayload));
+    assert.deepEqual(await requestShow(afterPush.dispatch, taskRequest()), {
+      shown: false,
+      playSound: false,
+    });
+    await afterPush.dispatch("push", pushEvent(showPayload));
+    assert.equal(afterPush.calls.shown.length, 2);
+  });
+
+  it("skips a push that repeats a page notification when a workbench window is visible, and silently merges when hidden", async () => {
+    // 有可见同源工作台窗口（Chromium 豁免 userVisibleOnly）：直接跳过重复展示。
+    const visibleChrome = await loadWorker([
+      makeWindowClient(WORKBENCH_URL, {
+        visibilityState: "visible",
+        pageState: { focused: false },
+      }),
+    ]);
+    assert.equal((await requestShow(visibleChrome.dispatch, taskRequest())).shown, true);
+    await visibleChrome.dispatch("push", pushEvent(showPayload));
+    assert.equal(visibleChrome.calls.shown.length, 1);
+    await visibleChrome.dispatch(
+      "push",
+      pushEvent({ ...showPayload, tag: "zcode:automation:run-1", secondaryTag: showPayload.tag }),
+    );
+    assert.equal(visibleChrome.calls.shown.length, 1);
+    // 不同 tag 的 push 不受影响。
+    await visibleChrome.dispatch(
+      "push",
+      pushEvent({ ...showPayload, tag: "zcode:task:t2:terminal" }),
+    );
+    assert.equal(visibleChrome.calls.shown.length, 2);
+
+    // 所有窗口都已最小化不可见时：调用 silent+renotify:false 平滑合并，严格满足 Chromium userVisibleOnly 配额。
+    const hiddenChrome = await loadWorker([
+      makeWindowClient(WORKBENCH_URL, {
+        visibilityState: "hidden",
+        pageState: { focused: false },
+      }),
+    ]);
+    assert.equal((await requestShow(hiddenChrome.dispatch, taskRequest())).shown, true);
+    await hiddenChrome.dispatch("push", pushEvent({ ...showPayload, silent: false }));
+    assert.equal(hiddenChrome.calls.shown.length, 2);
+    assert.equal(hiddenChrome.calls.shown[1]?.options.silent, true);
+    assert.equal(hiddenChrome.calls.shown[1]?.options.renotify, false);
+
+    const automation = await loadWorker([]);
+    assert.equal((await requestShow(automation.dispatch, taskRequest())).shown, true);
+    await automation.dispatch(
+      "push",
+      pushEvent({
+        ...showPayload,
+        silent: false,
+        tag: "zcode:automation:run-1",
+        secondaryTag: showPayload.tag,
+      }),
+    );
+    assert.equal(automation.calls.shown[1]?.options.tag, showPayload.tag);
+    assert.equal(automation.calls.shown[1]?.options.silent, true);
+    assert.equal(automation.calls.shown[1]?.options.renotify, false);
+
+    // Apple WebKit 每条 push 必须有可见通知（userVisibleOnly），不能因为页内刚提示过而跳过。
+    const ios = await loadWorker(
+      [makeWindowClient(WORKBENCH_URL, { pageState: { focused: false } })],
+      IOS_UA,
+    );
+    assert.equal((await requestShow(ios.dispatch, taskRequest())).shown, true);
+    await ios.dispatch("push", pushEvent(showPayload));
+    assert.equal(ios.calls.shown.length, 2);
+  });
+
+  it("waits for an in-flight page notification before deciding whether a push is a duplicate", async () => {
+    let finishShow!: () => void;
+    let startShow!: () => void;
+    const showing = new Promise<void>((resolve) => {
+      startShow = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      finishShow = resolve;
+    });
+    const worker = await loadWorker([
+      makeWindowClient(WORKBENCH_URL, {
+        visibilityState: "visible",
+        pageState: { focused: false },
+      }),
+    ]);
+    worker.setBeforeShow(async () => {
+      if (worker.calls.shown.length === 0) {
+        startShow();
+        await release;
+        throw new Error("Could not display the page notification");
+      }
+    });
+    const pendingPage = requestShow(worker.dispatch, taskRequest());
+    await showing;
+    worker.setBeforeShow(undefined);
+    const pendingPush = worker.dispatch("push", pushEvent(showPayload));
+    finishShow();
+    assert.equal((await pendingPage).error, true);
+    await pendingPush;
+    assert.equal(worker.calls.shown.length, 1);
+    assert.equal(worker.calls.shown[0]?.options.tag, showPayload.tag);
+  });
+
+  it("does not show a page notification while another focused tab is viewing the task, and does not hold the tag", async () => {
+    const worker = await loadWorker([
+      makeWindowClient(WORKBENCH_URL, { pageState: { focused: true, activeTaskId: "t1" } }),
+    ]);
+    assert.deepEqual(await requestShow(worker.dispatch, taskRequest()), {
+      shown: false,
+      playSound: false,
+    });
+    assert.equal(worker.calls.shown.length, 0);
+
+    // 查看者离开后，同一事件再次请求可以正常展示。
+    const left = await loadWorker([
+      makeWindowClient(WORKBENCH_URL, { pageState: { focused: true, activeTaskId: "other" } }),
+    ]);
+    assert.deepEqual(await requestShow(left.dispatch, taskRequest()), {
+      shown: true,
+      playSound: true,
+    });
+  });
+
+  it("rejects malformed page requests and releases the tag when showing fails", async () => {
+    const worker = await loadWorker([]);
+    for (const request of [
+      { type: "zcode:show-task-notification" },
+      { ...taskRequest(), tag: "" },
+      taskRequest({ taskId: "" }),
+      taskRequest({ title: 1 }),
+    ]) {
+      assert.deepEqual(await requestShow(worker.dispatch, request), {
+        shown: false,
+        playSound: false,
+        error: true,
+      });
+    }
+    assert.equal(worker.calls.shown.length, 0);
+
+    // 第一次展示失败后 tag 必须释放，第二次才能成功。
+    const failing = await loadWorker([]);
+    failing.setShowFails(true);
+    assert.deepEqual(await requestShow(failing.dispatch, taskRequest()), {
+      shown: false,
+      playSound: false,
+      error: true,
+    });
+    failing.setShowFails(false);
+    assert.deepEqual(await requestShow(failing.dispatch, taskRequest()), {
+      shown: true,
+      playSound: true,
+    });
+    assert.equal(failing.calls.shown.length, 1);
+  });
+
+  it("ignores unrelated worker messages", async () => {
+    const { calls, dispatch } = await loadWorker([]);
+    await dispatch("message", { data: null, ports: [] });
+    await dispatch("message", { data: { type: "other" }, ports: [] });
+    assert.equal(calls.shown.length, 0);
+  });
+
+  describe("click routing across several workbench tabs", () => {
+    const click = (data: Record<string, unknown>) => ({ notification: { close: () => {}, data } });
+
+    function openTabs(
+      states: Array<PageState | undefined>,
+      extras: Array<Record<string, unknown>> = [],
+    ) {
+      const log: string[] = [];
+      const clients = states.map((pageState, index) =>
+        makeWindowClient(WORKBENCH_URL, {
+          pageState,
+          onFocus: () => log.push(`focus:${index}`),
+          onMessage: (message) =>
+            log.push(`message:${index}:${(message as { type: string }).type}`),
+          ...extras[index],
+        }),
+      );
+      return { log, clients };
+    }
+
+    it("focuses the tab that already shows the task and leaves the other tab alone", async () => {
+      const { log, clients } = openTabs([
+        {
+          focused: false,
+          activeTaskId: "task-a",
+          activeWorkspacePath: "/repo",
+          openWorkspacePaths: ["/repo"],
+        },
+        {
+          focused: false,
+          activeTaskId: "task-b",
+          activeWorkspacePath: "/repo",
+          openWorkspacePaths: ["/repo"],
+        },
+      ]);
+      const { calls, dispatch } = await loadWorker(clients);
+      await dispatch("notificationclick", click({ taskId: "task-b", workspacePath: "/repo" }));
+      assert.deepEqual(log, ["focus:1", "message:1:zcode:notification-click"]);
+      assert.deepEqual(calls.opened, []);
+    });
+
+    it("prefers the focused tab when several tabs show the same task", async () => {
+      const same = { activeTaskId: "task-a", openWorkspacePaths: ["/repo"] };
+      const { log, clients } = openTabs(
+        [
+          { focused: false, ...same },
+          { focused: false, ...same },
+          { focused: true, ...same },
+        ],
+        [{ visibilityState: "hidden" }, { visibilityState: "visible" }, { focused: true }],
+      );
+      const { dispatch } = await loadWorker(clients);
+      await dispatch("notificationclick", click({ taskId: "task-a", workspacePath: "/repo" }));
+      assert.deepEqual(log, ["focus:2", "message:2:zcode:notification-click"]);
+    });
+
+    it("falls back from task to active workspace, open workspace, then any focused tab", async () => {
+      const states: PageState[] = [
+        {
+          focused: false,
+          activeTaskId: "x",
+          activeWorkspacePath: "/one",
+          openWorkspacePaths: ["/one", "/three"],
+        },
+        {
+          focused: false,
+          activeTaskId: "y",
+          activeWorkspacePath: "/two",
+          openWorkspacePaths: ["/two"],
+        },
+      ];
+      const route = async (
+        data: Record<string, unknown>,
+        extras: Array<Record<string, unknown>> = [],
+      ) => {
+        const { log, clients } = openTabs(states, extras);
+        const { dispatch } = await loadWorker(clients);
+        await dispatch("notificationclick", click(data));
+        return log.filter((entry) => entry.startsWith("focus:"));
+      };
+      assert.deepEqual(await route({ taskId: "unknown", workspacePath: "/two" }), ["focus:1"]);
+      assert.deepEqual(await route({ taskId: "unknown", workspacePath: "/three" }), ["focus:0"]);
+      assert.deepEqual(
+        await route({ taskId: "unknown", workspacePath: "/nowhere" }, [{}, { focused: true }]),
+        ["focus:1"],
+      );
+      assert.deepEqual(await route({ taskId: "unknown" }, [{ focused: true }, {}]), ["focus:0"]);
+    });
+
+    it("treats unresponsive tabs as unknown and still picks the best answering tab", async () => {
+      const { log, clients } = openTabs([
+        undefined,
+        { focused: false, activeTaskId: "task-b", openWorkspacePaths: [] },
+      ]);
+      const { dispatch } = await loadWorker(clients);
+      await dispatch("notificationclick", click({ taskId: "task-b" }));
+      assert.deepEqual(log, ["focus:1", "message:1:zcode:notification-click"]);
+    });
+  });
+
+  describe("two real controllers sharing one service worker", () => {
+    const payloadFor = (taskId: string) => ({
+      taskId,
+      status: "completed" as const,
+      title: `Task ${taskId} completed`,
+      body: `Task: ${taskId}`,
+      workspacePath: "/repo",
+    });
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 150));
+
+    async function openBrowser(
+      tabCount: number,
+      options: { userAgent?: string; workspaces?: string[] } = {},
+    ) {
+      const windowClients: Array<Record<string, unknown>> = [];
+      const worker = await loadWorker(windowClients, options.userAgent);
+      const tabs = Array.from({ length: tabCount }, (_unused, index) => {
+        const env = createEnv({ permission: "granted", existingSubscription: true });
+        const tab = {
+          index,
+          env,
+          sounds: 0,
+          clicks: [] as string[],
+          focused: false,
+          controller: createWebNotificationController({
+            pushEnabled: true,
+            host: env.host,
+            reconcileOnStart: false,
+            playSound: () => void (tab.sounds += 1),
+          }),
+          setFocused(value: boolean) {
+            tab.focused = value;
+            env.setFocused(value);
+          },
+        };
+        tab.controller.onTaskNotificationClick((taskId) => tab.clicks.push(taskId));
+        tab.controller.syncWindowTabs(["/repo", ...(options.workspaces ?? [])]);
+        return tab;
+      });
+      const focusLog: number[] = [];
+      for (const tab of tabs) {
+        const registration = await (
+          tab.env.host.navigator.serviceWorker as unknown as {
+            getRegistration(): Promise<{ active: unknown }>;
+          }
+        ).getRegistration();
+        registration.active = {
+          postMessage: (message: unknown, transfer: unknown[]) =>
+            void worker.dispatch("message", { data: message, ports: transfer }),
+        };
+        const client: Record<string, unknown> = {
+          url: WORKBENCH_URL,
+          get focused() {
+            return tab.focused;
+          },
+          get visibilityState() {
+            return tab.focused ? "visible" : "hidden";
+          },
+          postMessage: (message: unknown, transfer?: unknown[]) =>
+            tab.env.sw.emit("message", { data: message, ports: transfer ?? [] }),
+          focus: async () => {
+            focusLog.push(tab.index);
+            // 真实浏览器里 focus() 成功后该标签页就是前台。
+            for (const other of tabs) other.setFocused(other === tab);
+            return client;
+          },
+        };
+        windowClients.push(client);
+      }
+      return { tabs, worker, focusLog };
+    }
+
+    it("tab 1 viewing task A suppresses the notification and sound for task A from background tab 2", async () => {
+      const { tabs, worker } = await openBrowser(2);
+      const [tab1, tab2] = [tabs[0]!, tabs[1]!];
+      tab1.setFocused(true);
+      tab1.controller.syncActiveTaskSession("task-a");
+      tab2.controller.syncActiveTaskSession("task-a");
+      tab2.controller.showTaskNotification(payloadFor("task-a"));
+      await settle();
+      assert.equal(worker.calls.shown.length, 0);
+      assert.deepEqual([tab1.sounds, tab2.sounds], [0, 0]);
+      // 页面自己不得绕过 Service Worker 直接展示。
+      assert.deepEqual([tab1.env.shown.length, tab2.env.shown.length], [0, 0]);
+
+      // 同一任务的推送同样被前台查看者吸收。
+      await worker.dispatch(
+        "push",
+        pushEvent({ ...showPayload, taskId: "task-a", tag: "zcode:task:task-a:terminal" }),
+      );
+      assert.equal(worker.calls.shown.length, 0);
+    });
+
+    it("tab 1 viewing task A still notifies, with a single sound, for background task B", async () => {
+      const { tabs, worker } = await openBrowser(2);
+      const [tab1, tab2] = [tabs[0]!, tabs[1]!];
+      tab1.setFocused(true);
+      tab1.controller.syncActiveTaskSession("task-a");
+      tab2.controller.syncActiveTaskSession("task-a");
+      tab1.controller.showTaskNotification(payloadFor("task-b"));
+      tab2.controller.showTaskNotification(payloadFor("task-b"));
+      await settle();
+      assert.equal(worker.calls.shown.length, 1);
+      assert.equal(worker.calls.shown[0]?.options.tag, "zcode:task:task-b:terminal");
+      assert.equal(worker.calls.shown[0]?.options.silent, true);
+      assert.equal(tab1.sounds + tab2.sounds, 1);
+
+      // 非 Apple 浏览器的推送：前台只在看任务 A，任务 B 的推送正常展示，任务 A 的被吸收。
+      await worker.dispatch(
+        "push",
+        pushEvent({ ...showPayload, taskId: "task-c", tag: "zcode:task:task-c:terminal" }),
+      );
+      assert.equal(worker.calls.shown.length, 2);
+      await worker.dispatch(
+        "push",
+        pushEvent({ ...showPayload, taskId: "task-a", tag: "zcode:task:task-a:terminal" }),
+      );
+      assert.equal(worker.calls.shown.length, 2);
+    });
+
+    it("two background tabs on the same project show one notification and ring once", async () => {
+      const { tabs, worker } = await openBrowser(2);
+      const [tab1, tab2] = [tabs[0]!, tabs[1]!];
+      tab1.controller.showTaskNotification(payloadFor("task-a"));
+      tab2.controller.showTaskNotification(payloadFor("task-a"));
+      await settle();
+      assert.equal(worker.calls.shown.length, 1);
+      assert.deepEqual([tab1.sounds, tab2.sounds], [1, 0]);
+      assert.deepEqual([tab1.env.shown.length, tab2.env.shown.length], [0, 0]);
+      // 4 秒窗口内再来一次同一事件仍然不重复。
+      tab2.controller.showTaskNotification(payloadFor("task-a"));
+      await settle();
+      assert.equal(worker.calls.shown.length, 1);
+      assert.deepEqual([tab1.sounds, tab2.sounds], [1, 0]);
+    });
+
+    it("falls back to the page when the service worker does not answer in time", async () => {
+      const env = createEnv({ permission: "granted", existingSubscription: true });
+      let sounds = 0;
+      const controller = createWebNotificationController({
+        pushEnabled: true,
+        host: env.host,
+        reconcileOnStart: false,
+        playSound: () => void (sounds += 1),
+      });
+      const registration = await (
+        env.host.navigator.serviceWorker as unknown as {
+          getRegistration(): Promise<{ active: unknown }>;
+        }
+      ).getRegistration();
+      registration.active = { postMessage: () => {} };
+      controller.showTaskNotification(payloadFor("task-a"));
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      assert.equal(env.shown.length, 1);
+      assert.equal(sounds, 1);
+    });
+
+    it("routes a click on task B to tab 2, leaving tab 1 on task A untouched", async () => {
+      const { tabs, worker, focusLog } = await openBrowser(2);
+      const [tab1, tab2] = [tabs[0]!, tabs[1]!];
+      tab1.controller.syncActiveTaskSession("task-a");
+      tab2.controller.syncActiveTaskSession("task-b");
+      await worker.dispatch("notificationclick", {
+        notification: {
+          close: () => {},
+          data: { taskId: "task-b", workspacePath: "/repo" },
+        },
+      });
+      assert.deepEqual(focusLog, [1]);
+      assert.deepEqual(tab2.clicks, ["task-b"]);
+      assert.deepEqual(tab1.clicks, []);
+      assert.deepEqual(worker.calls.opened, []);
+    });
   });
 });

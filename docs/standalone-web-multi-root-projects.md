@@ -86,8 +86,10 @@ sequenceDiagram
 5. 普通远端 `moveTask` 任务 cwd 不在唯一 root：仍是 `project.cwd-not-in-roots`，且 `addMissingRoot: true` 也不能把项目变成 2 root。
 6. 跨 Host 移动（任务 Host 与项目 Host 不同）仍抛 `project.cross-host-move`。
 7. 独立 Web 0 目录项目生命周期对齐官方桌面：0 目录新建时保留 `roots: []` 与干净默认名（未填名称时为 `New project` / `defaultName`，磁盘不提前创建目录）；编辑已有项目传入 `roots: []` 时允许清空为 0 目录（`roots: undefined` 保持沿用旧 roots）；首次 `prepareSession({ projectId })` 时复用 `initializeProjectRoot` 在 `<standaloneWorkspaceRoot>/.zcode/workspace/<projectId>` 懒创建并登记工作目录。
-8. UI：独立 Web 项目编辑弹层允许新增 / 移除多个源文件夹（包含清空至 0 个）、设置主要 root；真实远端仍只有 1 个源文件夹且既有 root 不可移除。真机需人工复核（见验收脚本头部说明）。
+8. 无项目草稿目录缺失自动换绑恢复：当已绑定 `draftId` 的 `<standaloneWorkspaceRoot>/.zcode/conversations/draft-<draftId>` 目录在磁盘上缺失时，`prepareSession({ draftId, reuseDraft: true })` 返回 `project.draft-workspace-missing`；前端 `rotateMissingPendingTaskDraft` 须先检查当前草稿及在途 `commandId`（即使已被其他入口换绑，只要当前存在 `commandId` 即返回 `null`，不返回或覆盖在途草稿），调用方在收到 `project.draft-workspace-missing` 时须先核验当前导航仍有效再换绑，幂等重试须使用当前 `rotatedDraft` 的绑定状态（`reuseDraft: Boolean(rotatedDraft.workspacePath)`，禁止强行传 `reuseDraft: false` 复活已删目录），异步结果返回后须再核验当前导航与草稿所有权（`readPendingTaskDraft(scope)?.draftId === pendingDraft.draftId`）才写回绑定和提交导航，同时完整保留输入框草稿正文；无项目草稿菜单（`resolveConversationWorkspaceTarget`）命中当前受管 `pendingDraft` 路径时同样须经 `prepareSession` 校验，历史非项目会话快捷路径保持不变。
+9. UI：独立 Web 项目编辑弹层允许新增 / 移除多个源文件夹（包含清空至 0 个）、设置主要 root，本地设备名显示为“当前服务器”；真实远端仍只有 1 个源文件夹且既有 root 不可移除。
 
 可重复验收脚本见
 `packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-multi-root-projects.mjs`（真实 SQLite + 真实
-`ProjectRepository` / `createProjectService`，逐条覆盖 1–7）。
+`ProjectRepository` / `createProjectService` + 真实 `composerDraftStore.rotateMissingPendingTaskDraft`，逐条覆盖 1–8）及
+`packages/web/test/e2e/remote-control/projects/manual-review/pending/standalone-pending-draft-recovery.mjs`（真实 `useRootWorkspaceActions` / `useConversationWorkspaceActions` / `resolveConversationWorkspaceTarget` / `composerDraftStore` 竞态与菜单路径回归）。

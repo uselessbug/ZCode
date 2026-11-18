@@ -18,7 +18,7 @@ import {
   resolveWebRemoteControlWorkspaceKey,
 } from "@zcode/shared";
 /* eslint-disable max-lines -- Web 远程控制启动、错误页和 web 平台桥接暂时集中在入口编排。 */
-import { useLayoutEffect, type ComponentProps } from "react";
+import type { ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AppErrorBoundary,
@@ -250,6 +250,8 @@ interface WebBootstrapResult {
   allowOpenWorkspace?: boolean;
   /** 仅 /api/server-info 声明 capabilities.managedWorktrees 时为 true；`?remote=` 跨机代理与失败回退均不开启。 */
   managedWorktrees?: boolean;
+  /** 首屏 /api/server-info 的访问结果：ok 表示已确认登录态有效，首连可直接握手。 */
+  initialAccessState: "ok" | "auth-required" | "unknown";
 }
 
 type WebRemoteControlWorkspaceListUpdateListener = (
@@ -462,22 +464,33 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
     : `${resolveDefaultWsOrigin()}/ws`;
 
   if (remoteId) {
-    return { wsUrl };
+    return { wsUrl, initialAccessState: "unknown" };
   }
 
   // 受管 worktree 频道只在 Host 经 /api/server-info 声明 capabilities.managedWorktrees 时开启；
   // 响应失败、解析异常或旧 Server 缺省一律关闭（fail-closed），`?remote=` 跨机代理也不携带。
+  // 同一次请求顺带确认登录态：redirect: "manual" 能识别网关把请求 302 到登录页，
+  // 首连据此省掉一次重复的访问检查。
   try {
     const response = await fetch("/api/server-info", {
       cache: "no-store",
+      redirect: "manual",
+      credentials: "same-origin",
     });
-    if (!response.ok) {
-      return { wsUrl };
+    if (response.type === "opaqueredirect" || response.status === 401 || response.status === 403) {
+      return { wsUrl, initialAccessState: "auth-required" };
+    }
+    if (
+      !response.ok ||
+      response.headers.get("content-type")?.includes("application/json") !== true
+    ) {
+      return { wsUrl, initialAccessState: "unknown" };
     }
     const serverInfo = (await response.json()) as Partial<ServerRemoteInfo>;
     const workspace = Array.isArray(serverInfo.workspaces) ? serverInfo.workspaces[0] : undefined;
     return {
       wsUrl,
+      initialAccessState: "ok",
       ...(serverInfo.capabilities?.managedWorktrees === true ? { managedWorktrees: true } : {}),
       ...(workspace?.path ? { initialWorkspaceAbsPath: workspace.path } : {}),
       ...(workspace?.workspaceIdentity
@@ -485,7 +498,7 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
         : {}),
     };
   } catch {
-    return { wsUrl };
+    return { wsUrl, initialAccessState: "unknown" };
   }
 }
 
@@ -1838,116 +1851,19 @@ async function bootstrapExternalRelayWebRemoteControl(
 
 type StandaloneWebConnectionState = "connecting" | "reconnecting" | "connected" | "auth-required";
 
-// 曾成功加载过 services 后的重连提示延迟；避免一次瞬时抖动就闪出横幅。
-const STANDALONE_RECONNECT_HINT_DELAY_MS = 1_500;
-
-// 修复原因：祖先元素加 inert 会 blur 当前编辑器，移除 inert 不会自动恢复焦点，重连后用户会丢焦点。
-// 这里只在 bootstrap 拥有连接状态的地方保存断线前的 root 内可编辑元素（input/textarea/contenteditable）
-// 及其选区，在 connected 提交并移除 inert 后按严格条件恢复；不引入全局焦点框架，也不处理 IME/移动端键盘策略。
-interface StandaloneFocusRestoreSnapshot {
-  element: HTMLElement;
-  selectionStart: number | null;
-  selectionEnd: number | null;
-  range: Range | null;
-}
-
-interface StandaloneFocusRestoreStore {
-  pending: StandaloneFocusRestoreSnapshot | undefined;
-}
-
-function isStandaloneRestorableFocusTarget(node: Element | null): node is HTMLElement {
-  if (!(node instanceof HTMLElement)) return false;
-  return node.tagName === "INPUT" || node.tagName === "TEXTAREA" || node.isContentEditable;
-}
-
-function captureStandaloneFocusForRestore(): StandaloneFocusRestoreSnapshot | undefined {
-  if (typeof document === "undefined") return undefined;
-  const active = document.activeElement;
-  if (!isStandaloneRestorableFocusTarget(active)) return undefined;
-  const rootElement = document.getElementById("root");
-  // 只保存当前 root 内的元素；portal 到 body 的对话框等不恢复。
-  if (!rootElement || !rootElement.contains(active)) return undefined;
-  if (active.tagName === "INPUT" || active.tagName === "TEXTAREA") {
-    const field = active as HTMLInputElement | HTMLTextAreaElement;
-    return {
-      element: active,
-      selectionStart: field.selectionStart,
-      selectionEnd: field.selectionEnd,
-      range: null,
-    };
-  }
-  const selection = document.getSelection();
-  const range =
-    selection && selection.rangeCount > 0 && active.contains(selection.anchorNode)
-      ? selection.getRangeAt(0).cloneRange()
-      : null;
-  return { element: active, selectionStart: null, selectionEnd: null, range };
-}
-
-function restoreStandaloneFocusAfterReconnect(store: StandaloneFocusRestoreStore): void {
-  const pending = store.pending;
-  if (!pending) return;
-  if (typeof document === "undefined") return;
-  // 只有文档可见、有焦点，且当前焦点仍停在 body（用户没有点击重试/登录等控件）时才恢复，避免抢焦点。
-  if (document.visibilityState !== "visible" || !document.hasFocus()) return;
-  // 修复：后台已连通时不能提前消费快照；等页面重新获得焦点后再恢复。
-  // 用户已转到别的控件则消费并放弃，避免返回页面后抢焦点。
-  store.pending = undefined;
-  if (document.activeElement !== document.body) return;
-  const element = pending.element;
-  // 元素可能已在重连期间被卸载；此时不恢复。
-  if (!element.isConnected) return;
-  element.focus({ preventScroll: true });
-  if (pending.selectionStart !== null && pending.selectionEnd !== null) {
-    try {
-      (element as HTMLInputElement | HTMLTextAreaElement).setSelectionRange(
-        pending.selectionStart,
-        pending.selectionEnd,
-      );
-    } catch {
-      // number/email 等输入类型不支持 setSelectionRange，忽略即可。
-    }
-    return;
-  }
-  if (pending.range) {
-    const selection = document.getSelection();
-    if (selection && element.contains(pending.range.startContainer)) {
-      try {
-        selection.removeAllRanges();
-        selection.addRange(pending.range);
-      } catch {
-        // 选区锚点已随重渲染失效时忽略，保留 focus 结果。
-      }
-    }
-  }
-}
-
-// connected 提交并移除 inert 后，用 useLayoutEffect 在 DOM 更新完成时恢复焦点；
-// 依赖 state 变化触发，不做 sleep/轮询。
-function StandaloneFocusRestoreEffect({
-  state,
-  store,
-}: {
-  state: StandaloneWebConnectionState;
-  store: StandaloneFocusRestoreStore;
-}): null {
-  useLayoutEffect(() => {
-    if (state !== "connected") return;
-    const restore = () => restoreStandaloneFocusAfterReconnect(store);
-    restore();
-    window.addEventListener("focus", restore);
-    document.addEventListener("visibilitychange", restore);
-    return () => {
-      window.removeEventListener("focus", restore);
-      document.removeEventListener("visibilitychange", restore);
-    };
-  }, [state, store]);
-  return null;
-}
+// 首次连接超过该时间仍未连上才显示连接提示；之前保留 index.html 的启动动画，避免先闪一下横幅。
+const STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS = 3_000;
+// 曾成功加载过 services 后的重连提示延迟；页面一直可读可写，后台静默重连期间不打扰用户。
+const STANDALONE_RECONNECT_HINT_DELAY_MS = 4_500;
+// 空闲周期心跳的超时；后台恢复时探活要更快失败以便立即重连。
+const STANDALONE_IDLE_PULSE_TIMEOUT_MS = 10_000;
+const STANDALONE_RECOVER_PULSE_TIMEOUT_MS = 2_500;
 
 interface StandaloneWebConnectionPorts {
   connect(options: { signal: AbortSignal; onClose(): void }): Promise<RootServices>;
   checkAccess(signal: AbortSignal): Promise<boolean>;
+  /** 首屏已确认登录态有效时为 true，首次建连直接握手；握手失败后才用 checkAccess 区分鉴权失效。 */
+  initialAccessVerified: boolean;
   onReady(services: RootServices): void;
   onState(state: StandaloneWebConnectionState): void;
   windowTarget: Pick<Window, "addEventListener" | "removeEventListener">;
@@ -1959,12 +1875,15 @@ interface StandaloneWebConnectionPorts {
 function createStandaloneWebConnection(ports: StandaloneWebConnectionPorts) {
   let stopped = false;
   let hadReady = false;
+  let accessVerified = ports.initialAccessVerified;
+  // 连续失败次数：0 表示这是一次意外断开后的第一次重连，立即重试。
   let failures = 0;
   let current: AbortController | undefined;
   let live: RootServices | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
-  let pulseInFlight = false;
+  let pulseDeadline: ReturnType<typeof setTimeout> | undefined;
+  let pulseDeadlineAt = 0;
   let broadcastSubscription: { dispose(): void } | undefined;
   const broadcastListeners = new Set<
     Parameters<RootServices["broadcastService"]["onMessage"]>[0]
@@ -2008,11 +1927,16 @@ function createStandaloneWebConnection(ports: StandaloneWebConnectionPorts) {
     clearTimeout(heartbeatTimer);
     retryTimer = heartbeatTimer = undefined;
   };
+  const clearPulseDeadline = () => {
+    clearTimeout(pulseDeadline);
+    pulseDeadline = undefined;
+    pulseDeadlineAt = 0;
+  };
   const forget = () => {
     const old = current;
     current = undefined;
     live = undefined;
-    pulseInFlight = false;
+    clearPulseDeadline();
     broadcastSubscription?.dispose();
     broadcastSubscription = undefined;
     old?.abort();
@@ -2020,13 +1944,14 @@ function createStandaloneWebConnection(ports: StandaloneWebConnectionPorts) {
   const schedule = () => {
     if (stopped || retryTimer) return;
     publish("reconnecting");
-    retryTimer = setTimeout(
-      () => {
-        retryTimer = undefined;
-        void attempt();
-      },
-      Math.min(8_000, 1_000 * 2 ** Math.min(failures++, 3)),
-    );
+    // 第一次重连不等待（后台回切时 visible 与 close 谁先到都不会多等 1 秒），
+    // 再失败才按 1s、2s、4s、8s 退避；成功连上或主动恢复会把计数清零。
+    const delay = failures === 0 ? 0 : Math.min(8_000, 1_000 * 2 ** Math.min(failures - 1, 3));
+    failures += 1;
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined;
+      void attempt();
+    }, delay);
   };
   const drop = (owner: AbortController) => {
     if (current !== owner || stopped) return;
@@ -2034,33 +1959,29 @@ function createStandaloneWebConnection(ports: StandaloneWebConnectionPorts) {
     forget();
     schedule();
   };
-  const readPulse = async (services: RootServices) => {
-    let deadline: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        services.systemService.info(),
-        new Promise<never>((_resolve, reject) => {
-          deadline = setTimeout(() => reject(new Error("Heartbeat timed out")), 10_000);
-        }),
-      ]);
-    } finally {
-      clearTimeout(deadline);
-    }
+  const setPulseDeadline = (owner: AbortController, timeoutMs: number) => {
+    clearTimeout(pulseDeadline);
+    pulseDeadlineAt = Date.now() + timeoutMs;
+    pulseDeadline = setTimeout(() => drop(owner), timeoutMs);
   };
-  const pulse = async () => {
+  const pulse = async (timeoutMs = STANDALONE_IDLE_PULSE_TIMEOUT_MS) => {
     const owner = current;
     const services = live;
-    if (!owner || !services || pulseInFlight || stopped) return;
-    pulseInFlight = true;
+    if (!owner || !services || stopped) return;
+    if (pulseDeadline !== undefined) {
+      // 切回前台时复用已经发出的心跳，只缩短仍在等待的截止时间。
+      if (Date.now() + timeoutMs < pulseDeadlineAt) setPulseDeadline(owner, timeoutMs);
+      return;
+    }
     clearTimeout(heartbeatTimer);
+    setPulseDeadline(owner, timeoutMs);
     try {
-      await readPulse(services);
+      await services.systemService.info();
       if (current !== owner || stopped) return;
+      clearPulseDeadline();
       heartbeatTimer = setTimeout(() => void pulse(), 25_000);
     } catch {
       drop(owner);
-    } finally {
-      if (current === owner) pulseInFlight = false;
     }
   };
   const attempt = async () => {
@@ -2069,16 +1990,25 @@ function createStandaloneWebConnection(ports: StandaloneWebConnectionPorts) {
     const owner = new AbortController();
     current = owner;
     publish(hadReady ? "reconnecting" : "connecting");
+    // 登录态已知有效（首屏确认过，或曾连上过）时直接握手，只需一次往返；
+    // 握手失败后才检查是不是登录态过期，其余情况先检查再握手。
+    const skippedAccessCheck = hadReady || accessVerified;
+    accessVerified = false;
     try {
-      if (!(await ports.checkAccess(owner.signal))) {
+      if (!skippedAccessCheck && !(await ports.checkAccess(owner.signal))) {
         if (current !== owner || stopped) return;
         forget();
         publish("auth-required");
         return;
       }
       if (current !== owner || stopped) return;
-      const services = await ports.connect({ signal: owner.signal, onClose: () => drop(owner) });
-      await readPulse(services);
+      const services = await ports.connect({
+        signal: owner.signal,
+        // 握手失败时适配器也会回调 close。此时由下方 catch 检查鉴权，避免提前清掉代际。
+        onClose: () => {
+          if (live) drop(owner);
+        },
+      });
       if (current !== owner || stopped) return;
       live = services;
       broadcastSubscription = services.broadcastService.onMessage((message) => {
@@ -2092,21 +2022,36 @@ function createStandaloneWebConnection(ports: StandaloneWebConnectionPorts) {
       publish("connected");
       heartbeatTimer = setTimeout(() => void pulse(), 25_000);
     } catch {
+      if (skippedAccessCheck && current === owner && !stopped) {
+        try {
+          if (!(await ports.checkAccess(owner.signal))) {
+            if (current !== owner || stopped) return;
+            forget();
+            publish("auth-required");
+            return;
+          }
+        } catch {
+          // 探测本身失败说明服务端或网络不可达，按普通断线退避重试。
+        }
+      }
       drop(owner);
     }
   };
   const recover = () => {
     if (stopped) return;
-    if (live) void pulse();
-    else if (!current) {
+    // 回到前台是新的恢复窗口：不论 close 与 visible 谁先到，第一次重连都不等待。
+    failures = 0;
+    if (live) {
+      void pulse(STANDALONE_RECOVER_PULSE_TIMEOUT_MS);
+    } else if (!current) {
       clearTimers();
       void attempt();
     }
   };
   // 复用官方远控生命周期恢复：只有真正经历过 hidden/pagehide/freeze 暂停后，
   // 恢复事件（visible/pageshow/online/resume）才触发重连，避免首屏 pageshow 或并发恢复事件重复建连。
-  // onSuspend 保持最小接线：不主动关闭健康 WebSocket、不清空业务状态，也不改动 25s/10s/8s 阈值；
-  // 是否重连仍由既有 recover（含 current/pulseInFlight 并发保护）决定，不额外引入 single-flight 框架。
+  // onSuspend 保持最小接线：不主动关闭健康 WebSocket、不清空业务状态；
+  // 当前代际和探活截止时间负责去重，保持最多一条连接和一次探活。
   const lifecycle = createWebRemoteControlLifecycleRecovery({
     documentTarget: ports.documentTarget,
     windowTarget: ports.windowTarget,
@@ -2171,30 +2116,38 @@ async function bootstrapWebApp() {
   }
 
   // 通知点击冷启动：读取 zcodeTask/zcodeWorkspace 后立即清掉，刷新页面不会再次跳转。
+  // 带 workspace 的深链直接作为 Root 的初始 workspace/任务，避免先落到服务器默认 workspace 的草稿，
+  // 也不再放进点击队列重复执行；Root 在历史 tab 恢复完成后才注入初始目标，不会被 restoreTabs 覆盖。
+  // 只带 taskId 的深链没有目标 workspace，仍走点击队列由 Root 遍历已打开的 workspace 定位。
+  const coldLaunchTarget = consumeNotificationDeepLink();
+  const coldLaunchWorkspace = coldLaunchTarget?.workspacePath ? coldLaunchTarget : null;
   const platform = createWebPlatform({
-    initialNotificationTarget: consumeNotificationDeepLink(),
+    initialNotificationTarget: coldLaunchWorkspace ? null : coldLaunchTarget,
   });
   document.title = "ZCode - Web + Server";
   let services: RootServices | undefined;
-  let state: StandaloneWebConnectionState = "connecting";
+  const authRequiredAtStart = bootstrap.initialAccessState === "auth-required";
+  let state: StandaloneWebConnectionState = authRequiredAtStart ? "auth-required" : "connecting";
   let connection: ReturnType<typeof createStandaloneWebConnection> | undefined;
   let hasLoadedServices = false;
-  // 修复原因：底层连接状态要立即如实反映（inert 与重试入口不能延迟），但一次瞬时抖动不应闪出重连横幅。
-  // 因此只在“曾成功加载过 services”后的 reconnecting 延迟 1500ms 才显示提示；
-  // 首连 connecting 与 auth-required 立即显示，保证文案与登录入口即时正确。
-  let showConnectionHint = true;
-  let reconnectHintTimer: ReturnType<typeof setTimeout> | undefined;
-  const focusRestoreStore: StandaloneFocusRestoreStore = { pending: undefined };
+  // 连接提示有宽限期：首连 3 秒、重连 4.5 秒内悄悄进行，不闪横幅；auth-required 立即提示。
+  // 首连成功前提示不显示时不渲染，#root 保留 index.html 的启动动画，连上后一次渲染直出首页。
+  let showConnectionHint = authRequiredAtStart;
+  let connectionHintTimer: ReturnType<typeof setTimeout> | undefined;
   const zh = isZhLocale();
-  const clearReconnectHintTimer = () => {
-    if (reconnectHintTimer) clearTimeout(reconnectHintTimer);
-    reconnectHintTimer = undefined;
+  const isPending = (value: StandaloneWebConnectionState) =>
+    value === "connecting" || value === "reconnecting";
+  const clearConnectionHintTimer = () => {
+    if (connectionHintTimer) clearTimeout(connectionHintTimer);
+    connectionHintTimer = undefined;
   };
-  const render = () =>
+  const render = () => {
+    if (!services && !showConnectionHint) return;
     root.render(
       <>
-        {/* 修复依据：保持同一组件树和 key，让重连更新服务，而不是卸载草稿和导航。 */}
-        <div className="contents" inert={state !== "connected"}>
+        {/* 修复依据：保持同一组件树和 key，让重连更新服务，而不是卸载草稿和导航。
+            重连期间不锁定页面：用户可继续滚动阅读、在输入框打字，软键盘也不会被收起。 */}
+        <div className="contents">
           {services ? (
             <AppErrorBoundary>
               <ZCodeIntlProvider
@@ -2208,9 +2161,18 @@ async function bootstrapWebApp() {
                   // 无 workspaceIdentity 时 store 必须走该 Host 的 mcpSyncService，
                   // 不得回退无桌面代理的 Web platform 空实现。
                   mcpBaseHostDirectoryService={services.mcpSyncService}
-                  initialWorkspaceAbsPath={bootstrap.initialWorkspaceAbsPath}
-                  initialWorkspaceIdentity={bootstrap.initialWorkspaceIdentity}
-                  initialTaskId={bootstrap.initialTaskId}
+                  initialWorkspaceAbsPath={
+                    coldLaunchWorkspace?.workspacePath ?? bootstrap.initialWorkspaceAbsPath
+                  }
+                  initialWorkspaceIdentity={
+                    coldLaunchWorkspace
+                      ? coldLaunchWorkspace.workspaceIdentity
+                      : bootstrap.initialWorkspaceIdentity
+                  }
+                  initialTaskId={coldLaunchWorkspace?.taskId ?? bootstrap.initialTaskId}
+                  initialWebRemoteControlMobileNavigationIntent={
+                    coldLaunchWorkspace ? "chat" : undefined
+                  }
                   restoreSession={bootstrap.restoreSession}
                   allowOpenWorkspace={bootstrap.allowOpenWorkspace}
                   preferDirectoryBrowser
@@ -2224,8 +2186,6 @@ async function bootstrapWebApp() {
             </AppErrorBoundary>
           ) : null}
         </div>
-        {/* connected 提交并移除 inert 后，在 React commit 阶段恢复断线前的编辑器焦点。 */}
-        <StandaloneFocusRestoreEffect state={state} store={focusRestoreStore} />
         {showConnectionHint && state !== "connected" ? (
           <div
             role="status"
@@ -2253,9 +2213,8 @@ async function bootstrapWebApp() {
             <button
               className="rounded-md border border-border px-3 py-1 hover:bg-hover"
               onClick={() => {
-                // 用户显式点击重试后不再恢复断线前的编辑器焦点。
-                focusRestoreStore.pending = undefined;
-                connection?.retry();
+                if (connection) connection.retry();
+                else startConnection();
               }}
             >
               {zh ? "重试连接" : "Retry"}
@@ -2264,71 +2223,83 @@ async function bootstrapWebApp() {
         ) : null}
       </>,
     );
-  const applyState = (next: StandaloneWebConnectionState) => {
-    // controller 在 schedule 与每次 attempt 都会重复 publish("reconnecting")；
-    // 相同状态不能重置提示延迟或已显示状态，否则持续离线时横幅会反复消失。
-    // 只在实际状态变化时清理/切换计时；首连 connecting 仍需一次 render 显示横幅。
-    if (next === state) {
-      render();
-      return;
-    }
-    // 从 connected 进入断线前保存当前可编辑焦点与选区，供恢复时使用。
-    if (state === "connected" && next !== "connected") {
-      focusRestoreStore.pending = captureStandaloneFocusForRestore();
-    }
-    state = next;
-    clearReconnectHintTimer();
-    if (next !== "reconnecting" || !hasLoadedServices) {
-      // connected 立即隐藏；auth-required 与首连阶段立即显示，不延迟鉴权错误。
-      showConnectionHint = next !== "connected";
-      render();
-      return;
-    }
-    // 曾成功加载过 services 的重连：先隐藏横幅，1500ms 内恢复则完全不闪。
-    showConnectionHint = false;
-    render();
-    reconnectHintTimer = setTimeout(() => {
-      reconnectHintTimer = undefined;
-      if (state === next) {
+  };
+  const armConnectionHintTimer = () => {
+    clearConnectionHintTimer();
+    connectionHintTimer = setTimeout(
+      () => {
+        connectionHintTimer = undefined;
+        if (!isPending(state)) return;
         showConnectionHint = true;
         render();
-      }
-    }, STANDALONE_RECONNECT_HINT_DELAY_MS);
+      },
+      hasLoadedServices
+        ? STANDALONE_RECONNECT_HINT_DELAY_MS
+        : STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS,
+    );
   };
-  connection = createStandaloneWebConnection({
-    connect: (options) =>
-      connectViaWebSocket(bootstrap.wsUrl, {
-        ...options,
-        managedWorktreeService: bootstrap.managedWorktrees === true,
-      }),
-    async checkAccess(signal) {
-      const response = await fetch("/api/server-info", {
-        cache: "no-store",
-        redirect: "manual",
-        credentials: "same-origin",
-        signal: AbortSignal.any([signal, AbortSignal.timeout(8_000)]),
-      });
-      if (response.type === "opaqueredirect" || response.status === 401 || response.status === 403)
-        return false;
-      if (!response.ok) throw new Error("Server unavailable");
-      return response.headers.get("content-type")?.includes("application/json") === true;
-    },
-    onReady(next) {
-      services = next;
-      hasLoadedServices = true;
-      render();
-    },
-    onState(next) {
-      applyState(next);
-    },
-    windowTarget: window,
-    documentTarget: document,
-  });
+  const applyState = (next: StandaloneWebConnectionState) => {
+    // controller 在 schedule 与每次 attempt 都会重复 publish connecting/reconnecting；
+    // 同一次离线期间不能重置宽限计时，也不能收起已经显示的提示。
+    const wasPending = isPending(state);
+    state = next;
+    if (isPending(next)) {
+      // 从 connected 或 auth-required 进入新的待连接阶段；已显示的提示（如点击重试）保持不动。
+      if (!wasPending && !showConnectionHint) armConnectionHintTimer();
+    } else {
+      clearConnectionHintTimer();
+      showConnectionHint = next === "auth-required";
+    }
+    render();
+  };
+  const startConnection = () => {
+    connection = createStandaloneWebConnection({
+      initialAccessVerified: bootstrap.initialAccessState === "ok",
+      connect: (options) =>
+        connectViaWebSocket(bootstrap.wsUrl, {
+          ...options,
+          managedWorktreeService: bootstrap.managedWorktrees === true,
+        }),
+      async checkAccess(signal) {
+        const response = await fetch("/api/server-info", {
+          cache: "no-store",
+          redirect: "manual",
+          credentials: "same-origin",
+          signal: AbortSignal.any([signal, AbortSignal.timeout(8_000)]),
+        });
+        if (
+          response.type === "opaqueredirect" ||
+          response.status === 401 ||
+          response.status === 403
+        )
+          return false;
+        if (!response.ok) throw new Error("Server unavailable");
+        return response.headers.get("content-type")?.includes("application/json") === true;
+      },
+      onReady(next) {
+        services = next;
+        hasLoadedServices = true;
+        render();
+      },
+      onState(next) {
+        applyState(next);
+      },
+      windowTarget: window,
+      documentTarget: document,
+    });
+  };
+  // 登录态已确认失效时只显示重新验证入口，由用户点“重试连接”再建连；否则立即建连并开始宽限计时。
+  if (!authRequiredAtStart) {
+    armConnectionHintTimer();
+    startConnection();
+  } else {
+    render();
+  }
   window.addEventListener("pagehide", (event) => {
     // BFCache 恢复（persisted）继续走既有 lifecycle 恢复路径，不做整页刷新；
     // 真实退出时释放连接并清理提示计时器。
     if (!event.persisted) {
-      clearReconnectHintTimer();
+      clearConnectionHintTimer();
       connection?.dispose();
     }
   });

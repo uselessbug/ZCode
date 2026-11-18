@@ -319,7 +319,22 @@ export function createProjectService(options: {
           );
           // 已交付的目录若被移走，只报告缺失；不能用 mkdir 静默重建空目录。
           if (params?.reuseDraft) {
-            if (!(await stat(path)).isDirectory()) throw new Error("project.directory-required");
+            let directoryStat: Awaited<ReturnType<typeof stat>>;
+            try {
+              directoryStat = await stat(path);
+            } catch (error) {
+              if (
+                draftId &&
+                error &&
+                typeof error === "object" &&
+                "code" in error &&
+                error.code === "ENOENT"
+              ) {
+                throw new Error("project.draft-workspace-missing");
+              }
+              throw error;
+            }
+            if (!directoryStat.isDirectory()) throw new Error("project.directory-required");
           } else await mkdir(path, { recursive: true });
           return { workspacePath: path, additionalDirectories: [], projectId: null };
         }

@@ -39,7 +39,9 @@ import { PlatformProvider } from "@/hooks/usePlatform.js";
 import { ServiceProvider, useComposerClientNamespace } from "@/hooks/useServices.js";
 import {
   readComposerWorkspaceScope,
+  readPendingTaskDraft,
   readV4ComposerDraft,
+  resolveComposerScope,
   V4_DRAFT_SCOPE_ROOT,
 } from "@/v4/composer/composerDraftStore.js";
 import {
@@ -861,6 +863,7 @@ function RootInner({
     });
   }
 
+  const composerClientNamespace = useComposerClientNamespace();
   const handleResolveConversationWorkspaceForShell = useCallback(
     async () =>
       // Bug 原因：此前只回传 workspacePath，Shell 再按路径反查 identity；多设备 conversation 路径
@@ -869,9 +872,18 @@ function RootInner({
         getTabs: () => tabStoreApi.getState().tabs,
         activeWorkspacePath,
         activeWorkspaceIdentity,
+        getManagedPendingDraftWorkspacePath: () =>
+          readPendingTaskDraft(resolveComposerScope(null, undefined, composerClientNamespace))
+            ?.workspacePath ?? null,
         resolveLocalConversationWorkspacePath: handleResolveConversationWorkspace,
       }),
-    [activeWorkspacePath, activeWorkspaceIdentity, handleResolveConversationWorkspace, tabStoreApi],
+    [
+      activeWorkspacePath,
+      activeWorkspaceIdentity,
+      composerClientNamespace,
+      handleResolveConversationWorkspace,
+      tabStoreApi,
+    ],
   );
 
   useEffect(() => {
@@ -918,7 +930,6 @@ function RootInner({
     setWorkspaceActionError(null);
   }, [activeWorkspacePath, setWorkspaceActionError]);
 
-  const composerClientNamespace = useComposerClientNamespace();
   const restorePersistedSession = useCallback(
     async (...args: Parameters<typeof restoreWorkspaceTabs>) => {
       const restored = await restoreWorkspaceTabs(...args);

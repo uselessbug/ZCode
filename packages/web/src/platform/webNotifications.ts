@@ -16,6 +16,8 @@ import {
 
 /** 同一个 tag 在该窗口内只提示一次，避免页内通知与 Web Push 重复响。 */
 export const WEB_NOTIFICATION_DEDUPE_WINDOW_MS = 4_000;
+/** 页内通知交给 Service Worker 统一裁决时的等待上限，超时回退到本页直接展示。 */
+const SERVICE_WORKER_DECISION_TIMEOUT_MS = 300;
 const NOTIFICATION_ICON_PATH = "/icon-192.png";
 const PUSH_LOCALE_STORAGE_KEY = "zcode:web-push:locale";
 
@@ -34,6 +36,9 @@ export interface WebNotificationTaskPayload {
   taskId: string;
   status: Parameters<typeof buildTaskNotificationTag>[0]["status"];
   requestId?: string;
+  /** 通知点击后用来定位会话所属工作区。 */
+  workspacePath?: string;
+  workspaceIdentity?: string;
   title: string;
   body: string;
 }
@@ -145,6 +150,10 @@ export function createWebNotificationController(options: WebNotificationControll
     ? [options.initialTarget]
     : [];
   const recentTags = new Map<string, number>();
+  // 本页正在查看的任务与工作区，由 Root 通过平台接口同步；Service Worker 查询时原样回报。
+  let activeTaskId: string | null = null;
+  let activeWorkspacePath: string | null = null;
+  let openWorkspacePaths: string[] = [];
   const local: { busy: boolean; error: WebNotificationErrorCode | null } = {
     busy: false,
     error: null,
@@ -499,6 +508,24 @@ export function createWebNotificationController(options: WebNotificationControll
     return host.document.visibilityState !== "hidden" && host.document.hasFocus();
   }
 
+  /** 本页处于前台且正显示该任务；没有 taskId 时只看前台状态。 */
+  function isViewingTask(taskId: string | undefined): boolean {
+    return isPageForeground() && (!taskId || activeTaskId === taskId);
+  }
+
+  /**
+   * 约定 paths[0] 是当前激活的工作区（没有激活工作区时为空串），其后是本页所有已打开的工作区。
+   * 平台接口里没有单独的“激活工作区”入口，复用 syncWindowTabs 携带。
+   */
+  function syncWindowTabs(paths: string[]): void {
+    activeWorkspacePath = paths[0] || null;
+    openWorkspacePaths = paths.filter(Boolean);
+  }
+
+  function syncActiveTaskSession(sessionId: string | null): void {
+    activeTaskId = sessionId;
+  }
+
   function emitNotificationClick(
     taskId: string,
     context?: { workspacePath?: string; workspaceIdentity?: string },
@@ -542,12 +569,54 @@ export function createWebNotificationController(options: WebNotificationControll
     recentTags.set(tag, now());
   }
 
-  async function deliverTaskNotification(
+  function clickTargetOf(payload: WebNotificationTaskPayload): NotificationClickTarget {
+    return {
+      taskId: payload.taskId,
+      ...(payload.workspacePath ? { workspacePath: payload.workspacePath } : {}),
+      ...(payload.workspaceIdentity ? { workspaceIdentity: payload.workspaceIdentity } : {}),
+    };
+  }
+
+  /** 把页内通知交给 Service Worker 统一裁决（跨标签去重、同任务前台抑制）；不可用或超时返回 null。 */
+  function askServiceWorker(
+    worker: ServiceWorker,
     payload: WebNotificationTaskPayload,
     tag: string,
+  ): Promise<{ shown: boolean; playSound: boolean; error: boolean } | null> {
+    return new Promise((resolve) => {
+      const channel = new MessageChannel();
+      const finish = (result: { shown: boolean; playSound: boolean; error: boolean } | null) => {
+        clearTimeout(timer);
+        channel.port1.close();
+        resolve(result);
+      };
+      const timer = setTimeout(() => finish(null), SERVICE_WORKER_DECISION_TIMEOUT_MS);
+      channel.port1.onmessage = (event: MessageEvent) => {
+        const data = event.data as { shown?: unknown; playSound?: unknown; error?: unknown } | null;
+        finish(
+          data && typeof data === "object"
+            ? {
+                shown: data.shown === true,
+                playSound: data.playSound === true,
+                error: data.error === true,
+              }
+            : null,
+        );
+      };
+      try {
+        worker.postMessage({ type: "zcode:show-task-notification", payload, tag }, [channel.port2]);
+      } catch {
+        finish(null);
+      }
+    });
+  }
+
+  /** 本页直接展示：优先 registration.showNotification，其次 new Notification。 */
+  async function showTaskNotificationLocally(
+    payload: WebNotificationTaskPayload,
+    tag: string,
+    registration: ServiceWorkerRegistration | undefined,
   ): Promise<boolean> {
-    // 远控页没有独立 Server，也不借用根作用域的 Service Worker，直接走 Notification。
-    const registration = pushEnabled ? await findRegistration() : undefined;
     if (registration?.active) {
       try {
         await registration.showNotification(payload.title, {
@@ -555,7 +624,7 @@ export function createWebNotificationController(options: WebNotificationControll
           tag,
           silent: true,
           icon: NOTIFICATION_ICON_PATH,
-          data: { taskId: payload.taskId },
+          data: clickTargetOf(payload),
         });
         return true;
       } catch {
@@ -573,7 +642,8 @@ export function createWebNotificationController(options: WebNotificationControll
       notification.onclick = () => {
         host.focus();
         notification.close();
-        emitNotificationClick(payload.taskId);
+        const { taskId, ...context } = clickTargetOf(payload);
+        emitNotificationClick(taskId, Object.keys(context).length > 0 ? context : undefined);
       };
       return true;
     } catch {
@@ -581,17 +651,37 @@ export function createWebNotificationController(options: WebNotificationControll
     }
   }
 
+  /**
+   * played：已展示且由本页响铃；skipped：别处已展示或有标签页正看着该任务，本页什么都不做；
+   * failed：没能展示，调用方释放去重占位。
+   * 独立 Web 有激活的 Service Worker 时由它跨标签裁决，保证同一事件只弹一次、只响一次。
+   */
+  async function deliverTaskNotification(
+    payload: WebNotificationTaskPayload,
+    tag: string,
+  ): Promise<"played" | "skipped" | "failed"> {
+    // 远控页没有独立 Server，也不借用根作用域的 Service Worker，直接走 Notification。
+    const registration = pushEnabled ? await findRegistration() : undefined;
+    if (registration?.active) {
+      const decision = await askServiceWorker(registration.active, payload, tag);
+      if (decision && !decision.error) {
+        return decision.shown && decision.playSound ? "played" : "skipped";
+      }
+    }
+    return (await showTaskNotificationLocally(payload, tag, registration)) ? "played" : "failed";
+  }
+
   function showTaskNotification(payload: WebNotificationTaskPayload): void {
     if (!isEnabled()) return;
-    if (host.document.hasFocus()) return;
+    if (isViewingTask(payload.taskId)) return;
     if (readPermission() !== "granted") return;
     const tag = buildTaskNotificationTag(payload);
     if (isRecentTag(tag)) return;
     // 先占位再异步发送，连续两次调用不会各弹一条。
     markTag(tag);
-    void deliverTaskNotification(payload, tag).then((shown) => {
-      if (shown) void options.playSound?.();
-      else recentTags.delete(tag);
+    void deliverTaskNotification(payload, tag).then((outcome) => {
+      if (outcome === "played") void options.playSound?.();
+      else if (outcome === "failed") recentTags.delete(tag);
     });
   }
 
@@ -608,14 +698,28 @@ export function createWebNotificationController(options: WebNotificationControll
       | null
       | undefined;
     if (!data || typeof data !== "object") return;
+    if (data.type === "zcode:query-client-state") {
+      // Service Worker 做展示或点击路由决策前的快照查询，只回报本页事实，不做判断。
+      event.ports?.[0]?.postMessage({
+        focused: isPageForeground(),
+        activeTaskId,
+        activeWorkspacePath,
+        openWorkspacePaths,
+      });
+      return;
+    }
     if (data.type === "zcode:web-push-shown") {
       // 主标签与次标签（如定时任务与会话终态）都记入去重窗口，避免页内通知再响一次。
       const tags = [data.tag, data.secondaryTag].filter(
         (tag): tag is string => typeof tag === "string" && tag.length > 0,
       );
       for (const tag of tags) markTag(tag);
-      // iOS/Safari 下 Service Worker 无法在前台跳过展示；用户正看着页面时随即收回，避免残留。
-      if (tags.length > 0 && isPageForeground()) {
+      // iOS/Safari 下 Service Worker 无法跳过展示；只有本页正看着该任务时才随即收回，
+      // 前台标签页在看任务 A 时，不能把任务 B 的推送一并关掉。
+      if (
+        tags.length > 0 &&
+        isViewingTask(typeof data.taskId === "string" && data.taskId ? data.taskId : undefined)
+      ) {
         void closeDisplayedNotifications((notification) => tags.includes(notification.tag));
       }
       return;
@@ -637,12 +741,22 @@ export function createWebNotificationController(options: WebNotificationControll
   }
 
   // 远控页不使用 Service Worker 推送，也就不监听它的消息。
-  if (pushEnabled) serviceWorker()?.addEventListener("message", handleServiceWorkerMessage);
+  if (pushEnabled) {
+    const container = serviceWorker();
+    container?.addEventListener("message", handleServiceWorkerMessage);
+    // addEventListener 不会隐式启动消息队列；Android 等浏览器里页面刚被拉起时需要显式开始接收。
+    container?.startMessages?.();
+  }
 
   if (pushEnabled && hasPushApi()) {
-    // 回到前台说明用户已经在工作台里看到了任务状态，旧的系统通知不再需要保留。
+    // 回到前台说明用户已经在工作台里看到了当前任务的状态，其通知不再需要保留；
+    // 其他任务（如后台任务 B）的通知用户还没看过，保留。
     const clearWhenForeground = () => {
-      if (isPageForeground()) void closeDisplayedNotifications(() => true);
+      if (!isPageForeground()) return;
+      void closeDisplayedNotifications((notification) => {
+        const taskId = (notification.data as { taskId?: unknown } | null)?.taskId;
+        return typeof taskId !== "string" || taskId === activeTaskId;
+      });
     };
     host.addEventListener("focus", clearWhenForeground);
     host.document.addEventListener("visibilitychange", clearWhenForeground);
@@ -661,6 +775,8 @@ export function createWebNotificationController(options: WebNotificationControll
     requestWebNotificationPermission,
     setWebPushSubscribed,
     showTaskNotification,
+    syncWindowTabs,
+    syncActiveTaskSession,
     onTaskNotificationClick,
     notifyRendererReady: flushPendingClicks,
   };

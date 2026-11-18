@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Emitter } from "@zcode/rpc";
+import type { IPlatformService } from "@zcode/shared";
 import type { IBroadcastService, VirtualProject } from "@zcode/services";
 import { createZCodeStore } from "@/store/index.js";
 import { StoreContext, useZCodeStore } from "@/store/StoreProvider.js";
@@ -13,6 +14,7 @@ import { SourceServerManagementPanel } from "@/settings/SourceServerManagementPa
 import { ZCodeIntlProvider } from "@/i18n/IntlProvider.js";
 import { TooltipProvider } from "@/components/ui/tooltip.js";
 import { ServiceProvider } from "@/hooks/useServices.js";
+import { PlatformProvider } from "@/hooks/usePlatform.js";
 import "@/styles.css";
 
 const query = new URLSearchParams(location.search);
@@ -33,6 +35,13 @@ const broadcast: IBroadcastService = {
   releaseClaim: async () => {},
   tryClaim: async () => false,
 };
+// ProjectComposerMenu 通过 useIsServerHostedSettingsScope 读取平台能力，必须有 PlatformProvider。
+// canOpenLocalFiles 与行内 isDesktop 同源：桌面模拟为 true（本机作用域），
+// mobile=1 的手机远控模拟为 false（作用域由当前服务器 Host 承载）。
+const platform = {
+  canOpenLocalFiles: !mobile,
+  executeDesktopCommand: async () => {},
+} as unknown as IPlatformService;
 const store = createZCodeStore(broadcast);
 document.documentElement.className = `${theme} theme-zai-${theme}`;
 const rows = (["online", "offline", "needs-upgrade"] as const).map((state, i) => {
@@ -143,13 +152,15 @@ function Fixture() {
 createRoot(document.getElementById("root")!).render(
   <StoreContext.Provider value={store}>
     <ServiceProvider services={{} as never}>
-      <ZCodeIntlProvider initialLocale={locale}>
-        <TooltipProvider>
-          <TabStoreProvider>
-            <Fixture />
-          </TabStoreProvider>
-        </TooltipProvider>
-      </ZCodeIntlProvider>
+      <PlatformProvider platform={platform}>
+        <ZCodeIntlProvider initialLocale={locale}>
+          <TooltipProvider>
+            <TabStoreProvider>
+              <Fixture />
+            </TabStoreProvider>
+          </TooltipProvider>
+        </ZCodeIntlProvider>
+      </PlatformProvider>
     </ServiceProvider>
   </StoreContext.Provider>,
 );

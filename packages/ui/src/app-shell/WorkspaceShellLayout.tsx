@@ -83,6 +83,7 @@ import { AnimatedTerminalPanel } from "@/app-shell/AnimatedTerminalPanel.js";
 import { SIDE_PANE_DEFAULT_EXPANDED_SIZE } from "@/app-shell/sidePaneLayout.js";
 import { useAnimatedResizablePanel } from "@/app-shell/useAnimatedResizablePanel.js";
 import { ensureTaskNavigationWorkspace } from "@/app-shell/taskNavigationWorkspace.js";
+import { subscribeNotificationTaskNavigation } from "@/app-shell/useWorkspaceTaskNavigation.js";
 
 import {
   resolveWorkspaceShellPanelRadiusPx,
@@ -1614,6 +1615,25 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
     },
     [handleSelectTask, intl, isWebRemoteControlShell, showChatMainView, tabStoreApi],
   );
+  // 系统通知点击：Root 解析出真实 workspace 后，走与侧栏点击任务完全一致的选择路径，
+  // 窄屏单栏壳层同时递增序号，让停在 Home 的手机立即切入目标会话的 Chat。
+  const [revealChatRequestId, setRevealChatRequestId] = useState(0);
+  const selectTaskInChatRef = useRef(handleSelectTaskInChat);
+  useLayoutEffect(() => {
+    selectTaskInChatRef.current = handleSelectTaskInChat;
+  }, [handleSelectTaskInChat]);
+  useEffect(
+    () =>
+      subscribeNotificationTaskNavigation((request) => {
+        selectTaskInChatRef.current(
+          request.workspacePath,
+          request.taskId,
+          request.workspaceIdentity,
+        );
+        if (request.revealChat) setRevealChatRequestId((requestId) => requestId + 1);
+      }),
+    [],
+  );
   // 中枢直接启动 accepted 后切到新会话（run 卡已在顶部）：复用运行历史那条导航，
   // target 恒带工作流所属项目坐标（不变式 7），remoteSessionId 决定连接 endpoint。
   // 「已保存」芯片的落点：交给 App 切主视图并设深链（与「自动化」入口同一条导航历史）。
@@ -2520,6 +2540,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
             ? pendingComposerPrefill?.requestId
             : undefined
         }
+        revealChatRequestId={revealChatRequestId}
         webRemoteControlTerminalTransportState={webRemoteControlTerminalTransportState}
         isSidePaneOpen={isSidePaneOpen}
         onCloseSidePane={isSidePaneOpen ? handleToggleSidePane : undefined}

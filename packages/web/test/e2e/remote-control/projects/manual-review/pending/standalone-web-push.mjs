@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Web Push 后端、SW、设置页与通知点击导航回归集中在同一个串行脚本里，共享 esbuild 打包与 jsdom 环境。 */
 // 独立 Web 后台推送（Web Push）一体化定向回归：本地 esbuild 打包真实源码，不连接任何真实 Host，
 // 不触碰用户数据。三部分检查串行执行：
 //  1. 后端 Web Push 套件：esbuild 打包 packages/server/test/web-push.test.ts，子进程 `node --test`，退出码必须为 0。
@@ -7,6 +8,16 @@
 //       packages/ui/src/settings-search/SettingsSearch.tsx 与 settingsSearchIndex.ts（SETTINGS_SEARCH_ITEMS）
 //     仅把 i18n Provider 换成读取真实 zh-CN / en-US 词表的最小桩（缺 key 直接抛错）。
 //     并校验静态产物 packages/web/public/manifest.webmanifest 与 packages/web/index.html。
+//  4. 通知点击导航回归（真实源码，独立 esbuild 打包 + jsdom）：
+//       useRootPlatformEffects（通知点击解析 + 冷启动 bootstrap）、useTabPersistence（历史 tab 恢复）、
+//       useWorkspaceTaskNavigation.handleSelectTask 与通知导航缓冲通道、WebRemoteControlMobileShell。
+//     全程 taskListCache === null（V4 真实状态）；只替换 toast、services 与 i18n 的最小桩。
+//     另验手机壳 Home 列表在前台时 syncActiveTaskSession 上报 null（不吞该任务的通知）。
+//  5. 终态通知与独立 Web 连接恢复回归：
+//       packages/ui/src/lib/taskNotificationOrchestrator.ts（真实 collectTerminalTaskNotificationPayloads：
+//       completedSuccess 完成、error 失败、completedInterrupted 静默）；
+//       packages/web/src/main.tsx（抽取真实 createStandaloneWebConnection 源码段执行：首连单往返、后台恢复 0ms 重连、
+//       退避序列；源码级断言 3000ms / 4500ms 宽限期、首屏不清空 #root 启动动画、无 inert 与 StandaloneFocusRestore 残留）。
 //
 // 容器资源纪律：所有 esbuild 构建与子进程严格串行，且 GOMAXPROCS 默认 2（外部已设置则尊重外部值）；
 // 临时打包目录在 finally 中用 fs.rm 清理。
@@ -182,7 +193,7 @@ function createPlugin(stubs, { externalNative = [] } = {}) {
   };
 }
 
-async function bundleUi(contents, outfile, stubs) {
+async function bundleUi(contents, outfile, stubs, { banner } = {}) {
   await esbuild.build({
     stdin: { contents, resolveDir: uiSrc, loader: "tsx", sourcefile: "isolation-entry.tsx" },
     outfile,
@@ -195,6 +206,9 @@ async function bundleUi(contents, outfile, stubs) {
     nodePaths,
     alias: reactAlias,
     define: { "import.meta.env": '{"PROD":true,"DEV":false}' },
+    // 导航回归会经由真实模块图引入图片资源；jsdom 里只需要一个可用的 URL。
+    loader: { ".png": "dataurl", ".svg": "dataurl", ".webp": "dataurl", ".jpg": "dataurl" },
+    ...(banner ? { banner: { js: banner } } : {}),
     plugins: [createPlugin(stubs)],
   });
 }
@@ -311,6 +325,212 @@ const UI_ENTRY = `
   import zhCN from "@/i18n/locales/zh-CN.js";
   import enUS from "@/i18n/locales/en-US.js";
   export const LOCALES = { "zh-CN": zhCN, "en-US": enUS };
+`;
+
+// ---------------------------------------------------------------------------
+// 第 4 部分：通知点击导航回归的入口与桩。
+// ---------------------------------------------------------------------------
+const TOAST_STUB = `
+  export function toast(message) {
+    (globalThis.__toasts ??= []).push(String(message));
+    return 1;
+  }
+  export function dismissToast() {}
+  export function updateToast() {}
+`;
+
+const WORKSPACE_SERVICES_STUB = `
+  export function useBaseWorkspaceServices() {
+    return globalThis.__baseServices;
+  }
+  export function useOptionalBaseWorkspaceServices() {
+    return globalThis.__baseServices ?? null;
+  }
+`;
+
+const SERVICES_STUB = `
+  export function useServices() {
+    return globalThis.__baseServices;
+  }
+  export function useOptionalServices() {
+    return globalThis.__baseServices ?? null;
+  }
+  export function useComposerClientNamespace() {
+    return "web-test";
+  }
+`;
+
+// 主题菜单依赖 StoreProvider，任务查看上报依赖远控桥；两者与导航无关，换成空组件。
+const NULL_COMPONENT_STUB = `
+  export function WebRemoteControlThemeMenu() { return null; }
+  export function WebRemoteControlTaskViewReporter() { return null; }
+`;
+
+const NAV_ENTRY = `
+  import { createElement as h, act, useCallback, useEffect, useMemo, useRef, useState } from "react";
+  import { createRoot } from "react-dom/client";
+  import { TabStoreProvider, useTabStore, useTabStoreApi } from "@/store/TabStoreProvider.js";
+  import { useZCodeSessionStore } from "@/store/zcodeSessionStore.js";
+  import { onTaskNavigationCommitted } from "@/store/zcodeSessionStoreNavigation.js";
+  import { isWorkspaceTab } from "@/store/tabStore.js";
+  import { useRootPlatformEffects } from "@/root/useRootPlatformEffects.js";
+  import { useTabPersistence } from "@/hooks/useTabPersistence.js";
+  import {
+    subscribeNotificationTaskNavigation,
+    useWorkspaceTaskNavigation,
+  } from "@/app-shell/useWorkspaceTaskNavigation.js";
+  import {
+    WebRemoteControlMobileShell,
+    isWebRemoteControlMobileHomeListVisible,
+  } from "@/WebRemoteControlMobileShell.js";
+  import { createIntl } from "@/i18n/IntlProvider.js";
+  import zhCN from "@/i18n/locales/zh-CN.js";
+  export const LOCALES = { "zh-CN": zhCN };
+  export {
+    h,
+    act,
+    useZCodeSessionStore,
+    onTaskNavigationCommitted,
+    TabStoreProvider,
+    isWorkspaceTab,
+    isWebRemoteControlMobileHomeListVisible,
+  };
+
+  export async function mountElement(element) {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => { root.render(element); });
+    return {
+      container,
+      rerender: (next) => act(async () => { root.render(next); }),
+      async unmount() {
+        await act(async () => { root.unmount(); });
+        container.remove();
+      },
+    };
+  }
+
+  export function createFakePlatform({ standalone = true } = {}) {
+    let handler = null;
+    const noop = () => () => {};
+    return {
+      platform: {
+        onFocusTab: noop,
+        onNewTab: noop,
+        onNewTask: noop,
+        onOpenWorkspace: noop,
+        onTaskNotificationClick: (next) => {
+          handler = next;
+          return () => { if (handler === next) handler = null; };
+        },
+        syncWindowTabs(paths) {
+          (globalThis.__syncedWindowTabs ??= []).push(paths);
+        },
+        syncActiveTaskSession(sessionId) {
+          (globalThis.__syncedSessions ??= []).push(sessionId);
+        },
+        setApplicationLocale: async () => {},
+        ...(standalone ? { setWebPushSubscribed: async () => ({}) } : {}),
+      },
+      click: (taskId, context) => handler(taskId, context),
+      hasHandler: () => handler !== null,
+    };
+  }
+
+  // 与 Root + WorkspaceShellLayout 的接线保持同构：useTabPersistence 决定何时允许 bootstrap，
+  // useRootPlatformEffects 处理通知点击，壳层订阅通知导航并驱动手机壳切到 Chat。
+  function Harness({ platform, initial, settingService, isDesktop, onApi, intl, mobile }) {
+    const api = useTabStoreApi();
+    useEffect(() => { onApi?.(api); }, [api, onApi]);
+    const tabs = useTabStore((state) => state.tabs);
+    const activeWorkspacePath = useTabStore((state) => state.activeWorkspacePath);
+    const activeWorkspaceIdentity = useTabStore((state) => state.activeWorkspaceIdentity);
+    const [, setIsBootstrapping] = useState(Boolean(initial?.workspacePath));
+    const { hasCompletedInitialRestore, hasCompletedFullRestore } = useTabPersistence({
+      settingService,
+      restoreSession: Boolean(settingService),
+      persistSession: false,
+    });
+    const addTab = useCallback((path, options) => { api.getState().addTab(path, options); }, [api]);
+    const activateTabByPath = useCallback(
+      (path, options) => api.getState().activateTabByPath(path, options),
+      [api],
+    );
+    const startDraftInWorkspace = useCallback((path, identity, options) => {
+      (globalThis.__drafts ??= []).push(path);
+      useZCodeSessionStore.getState().startDraft(path, undefined, identity, options);
+    }, []);
+    const noop = useCallback(() => {}, []);
+    useRootPlatformEffects({
+      initialWorkspaceAbsPath: initial?.workspacePath,
+      initialWorkspaceIdentity: initial?.workspaceIdentity,
+      initialTaskId: initial?.taskId,
+      clientMode: "desktop-continuous",
+      canBootstrapInitialWorkspace: hasCompletedInitialRestore,
+      addTab,
+      setIsBootstrappingInitialWorkspace: setIsBootstrapping,
+      platform,
+      activateTabByPath,
+      startDraftInWorkspace,
+      startNewTaskFromActiveWorkspace: noop,
+      openWorkspace: noop,
+      openWorkspacePath: noop,
+      setWorkspaceActionError: noop,
+      isDesktop,
+      locale: "zh-CN",
+      tabs,
+      activeWorkspacePath,
+      activeWorkspaceIdentity,
+      hasCompletedFullTabRestore: hasCompletedFullRestore,
+      intl,
+      isRestoringOAuthSession: false,
+    });
+    return mobile ? h(MobileShellStub, { intl, activateTabByPath }) : null;
+  }
+
+  function MobileShellStub({ intl, activateTabByPath }) {
+    const activeWorkspacePath = useTabStore((state) => state.activeWorkspacePath) ?? "";
+    const activeWorkspaceIdentity = useTabStore((state) => state.activeWorkspaceIdentity) ?? undefined;
+    const activeTaskId = useZCodeSessionStore(
+      (state) => state.getWorkspaceState(activeWorkspacePath, activeWorkspaceIdentity).activeTaskId,
+    );
+    const { handleSelectTask } = useWorkspaceTaskNavigation({
+      intl,
+      workspaceAbsPath: activeWorkspacePath,
+      workspaceIdentity: activeWorkspaceIdentity,
+      activateTabByPath,
+    });
+    const selectRef = useRef(handleSelectTask);
+    selectRef.current = handleSelectTask;
+    const [revealChatRequestId, setRevealChatRequestId] = useState(0);
+    useEffect(
+      () =>
+        subscribeNotificationTaskNavigation((request) => {
+          (globalThis.__navRequests ??= []).push(request);
+          selectRef.current(request.workspacePath, request.taskId, request.workspaceIdentity);
+          if (request.revealChat) setRevealChatRequestId((id) => id + 1);
+        }),
+      [],
+    );
+    return h(WebRemoteControlMobileShell, {
+      isMobileViewport: true,
+      activeWorkspacePath,
+      activeWorkspaceIdentity,
+      activeTaskId: activeTaskId ?? null,
+      taskViewEnabled: false,
+      revealChatRequestId,
+      renderTaskHome: () => h("div", { "data-testid": "task-home" }, "home"),
+      renderChatHeader: () => null,
+      chatContent: h("div", { "data-testid": "chat", "data-task": activeTaskId ?? "" }),
+    });
+  }
+
+  export function mountHarness(props) {
+    return mountElement(
+      h(TabStoreProvider, null, h(Harness, { ...props, intl: createIntl("zh-CN") })),
+    );
+  }
 `;
 
 // ---------------------------------------------------------------------------
@@ -735,6 +955,759 @@ function createSuite(mod, win) {
 }
 
 // ---------------------------------------------------------------------------
+// 第 4 部分：通知点击导航回归。
+// ---------------------------------------------------------------------------
+function createNavigationSuite(mod, win) {
+  const settle = (ms = 30) =>
+    mod.act(async () => {
+      await new Promise((done) => setTimeout(done, ms));
+    });
+  // 点击与后续异步导航放在同一个 act 里，避免状态更新落在 act 之外。
+  const clickAndSettle = (m, taskId, context, ms = 80) =>
+    mod.act(async () => {
+      m.fake.click(taskId, context);
+      await new Promise((done) => setTimeout(done, ms));
+    });
+  const OPEN_FAILED = mod.LOCALES["zh-CN"]["automations.runs.openSessionFailed"];
+  const BACK_HOME = mod.LOCALES["zh-CN"]["webRemoteControl.mobileShell.backHome"];
+  const MAINTENANCE = "/workspace/maintenance";
+  const DEFAULT_WORKSPACE = "/workspace";
+
+  const initialSessionState = mod.useZCodeSessionStore.getInitialState();
+  function resetGlobals() {
+    mod.useZCodeSessionStore.setState(initialSessionState, true);
+    globalThis.__webPushLocale = "zh-CN";
+    globalThis.__toasts = [];
+    globalThis.__drafts = [];
+    globalThis.__navRequests = [];
+    globalThis.__syncedSessions = [];
+    globalThis.__syncedWindowTabs = [];
+    globalThis.__taskMetaCalls = [];
+    win.history.replaceState(null, "");
+  }
+
+  // services 只提供通知流程用到的 getTaskMeta；metaFor 决定每次查询的结果或抛错。
+  function installServices(metaFor) {
+    globalThis.__baseServices = {
+      zcodeTaskService: {
+        getTaskMeta: async (params) => {
+          globalThis.__taskMetaCalls.push(params);
+          return metaFor(params, globalThis.__taskMetaCalls.length);
+        },
+        setTaskUnread: async () => ({}),
+      },
+    };
+  }
+
+  const taskMeta = (params, overrides = {}) => ({
+    taskId: params.taskId,
+    title: "demo",
+    workspacePath: params.workspacePath,
+    ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+    ...overrides,
+  });
+
+  function snapshot(api) {
+    const state = api.getState();
+    const active = state.tabs.find((tab) => tab.id === state.activeTabId);
+    return {
+      kind: active?.kind,
+      path: active && mod.isWorkspaceTab(active) ? active.workspacePath : undefined,
+      workspacePaths: state.tabs.filter(mod.isWorkspaceTab).map((tab) => tab.workspacePath),
+    };
+  }
+  const activeTask = (path, identity) =>
+    mod.useZCodeSessionStore.getState().getWorkspaceState(path, identity).activeTaskId;
+  const page = (container) =>
+    container.querySelector("[data-mobile-page]")?.getAttribute("data-mobile-page");
+
+  async function mountReady({ initial, settingService, standalone = true } = {}) {
+    const fake = mod.createFakePlatform({ standalone });
+    let api = null;
+    const mounted = await mod.mountHarness({
+      platform: fake.platform,
+      initial,
+      settingService,
+      isDesktop: !standalone,
+      mobile: true,
+      onApi: (next) => {
+        api = next;
+      },
+    });
+    await settle();
+    return { ...mounted, fake, api: () => api };
+  }
+
+  async function runSuite() {
+    console.log("通知点击导航（taskListCache === null，真实 hook 与手机壳）");
+
+    await check(
+      "设置页上点击通知：getTaskMeta 定位，打开目标 tab、退出设置页、选中任务并切到 Chat",
+      async () => {
+        resetGlobals();
+        installServices((params) => taskMeta(params));
+        const m = await mountReady();
+        await mod.act(async () => {
+          m.api().getState().addTab(DEFAULT_WORKSPACE);
+          m.api().getState().openSettingsTab();
+        });
+        assert.equal(snapshot(m.api()).kind, "settings", "前置：设置页处于激活态");
+        assert.equal(page(m.container), "home", "前置：手机壳停在 Home");
+        assert.equal(
+          mod.useZCodeSessionStore.getState().getWorkspaceState(MAINTENANCE).taskListCache,
+          null,
+          "前置：V4 下 taskListCache 恒为 null",
+        );
+
+        await clickAndSettle(m, "task-1", { workspacePath: MAINTENANCE });
+
+        assert.deepEqual(globalThis.__toasts, [], "不应弹出失败 toast");
+        const after = snapshot(m.api());
+        assert.equal(after.kind, "workspace", "必须退出设置页");
+        assert.equal(after.path, MAINTENANCE);
+        assert.ok(after.workspacePaths.includes(DEFAULT_WORKSPACE), "原 tab 保留");
+        assert.equal(activeTask(MAINTENANCE), "task-1");
+        assert.deepEqual(globalThis.__drafts, [], "不得落入草稿");
+        assert.equal(globalThis.__taskMetaCalls.length, 1);
+        assert.equal(globalThis.__taskMetaCalls[0].workspacePath, MAINTENANCE);
+        assert.equal(page(m.container), "chat", "手机壳应从 Home 自动切到 Chat");
+        assert.equal(
+          m.container.querySelector('[data-testid="chat"]')?.getAttribute("data-task"),
+          "task-1",
+        );
+        await m.unmount();
+      },
+    );
+
+    await check(
+      "手机壳在 Chat 点返回仍可回到 Home，同一请求不会重放；再次点击通知重新切入 Chat",
+      async () => {
+        resetGlobals();
+        installServices((params) => taskMeta(params));
+        const m = await mountReady();
+        await mod.act(async () => {
+          m.api().getState().addTab(MAINTENANCE);
+        });
+        await clickAndSettle(m, "task-a", { workspacePath: MAINTENANCE });
+        assert.equal(page(m.container), "chat");
+
+        const back = [...m.container.querySelectorAll("button")].find(
+          (node) => node.getAttribute("aria-label") === BACK_HOME,
+        );
+        assert.ok(back, "缺少返回 Home 的按钮");
+        await mod.act(async () => {
+          back.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+        });
+        await settle();
+        assert.equal(page(m.container), "home", "返回箭头必须能回到 Home");
+        await settle(60);
+        assert.equal(page(m.container), "home", "已处理的请求不能再次把用户拉回 Chat");
+
+        await clickAndSettle(m, "task-b", { workspacePath: MAINTENANCE });
+        assert.equal(page(m.container), "chat");
+        assert.equal(activeTask(MAINTENANCE), "task-b");
+        await m.unmount();
+      },
+    );
+
+    await check(
+      "canonical workspaceIdentity 查不到时回退纯 path；tab 无 identity 时沿用本地 tab",
+      async () => {
+        resetGlobals();
+        installServices((params) => (params.workspaceIdentity ? null : taskMeta(params)));
+        const m = await mountReady();
+        await mod.act(async () => {
+          m.api().getState().addTab(MAINTENANCE);
+        });
+        await clickAndSettle(m, "task-1", {
+          workspacePath: MAINTENANCE,
+          workspaceIdentity: "canonical:maint",
+        });
+        assert.deepEqual(globalThis.__toasts, []);
+        assert.deepEqual(
+          globalThis.__taskMetaCalls.map((call) => call.workspaceIdentity),
+          ["canonical:maint", undefined],
+          "先带 identity 查，再回退不带 identity",
+        );
+        assert.deepEqual(snapshot(m.api()).workspacePaths, [MAINTENANCE], "不得另开 identity tab");
+        assert.equal(activeTask(MAINTENANCE), "task-1");
+
+        // Host 回包带 canonical identity、而浏览器本地 tab 没有时，同样沿用本地 tab。
+        await mod.act(async () => {
+          resetGlobals();
+        });
+        installServices((params) => taskMeta(params, { workspaceIdentity: "canonical:maint" }));
+        await clickAndSettle(m, "task-2", {
+          workspacePath: MAINTENANCE,
+          workspaceIdentity: "canonical:maint",
+        });
+        assert.deepEqual(globalThis.__toasts, []);
+        assert.deepEqual(snapshot(m.api()).workspacePaths, [MAINTENANCE]);
+        assert.equal(activeTask(MAINTENANCE), "task-2");
+        await m.unmount();
+      },
+    );
+
+    await check("只有 taskId 的旧桌面 IPC：遍历已打开的 workspace tab 定位所属工作区", async () => {
+      resetGlobals();
+      installServices((params) => (params.workspacePath === MAINTENANCE ? taskMeta(params) : null));
+      const m = await mountReady({ standalone: false });
+      await mod.act(async () => {
+        m.api().getState().addTab(MAINTENANCE);
+        m.api().getState().addTab("/workspace/other");
+      });
+      assert.equal(snapshot(m.api()).path, "/workspace/other");
+      await clickAndSettle(m, "task-1", undefined);
+      assert.deepEqual(globalThis.__toasts, []);
+      assert.equal(snapshot(m.api()).path, MAINTENANCE);
+      assert.equal(activeTask(MAINTENANCE), "task-1");
+      assert.equal(activeTask("/workspace/other"), null);
+      await m.unmount();
+    });
+
+    await check("连接断线重连：RPC 暂时抛错时等待重试，不立即判定不存在", async () => {
+      resetGlobals();
+      installServices((params, callCount) => {
+        if (callCount <= 2) throw new Error("connection lost");
+        return taskMeta(params);
+      });
+      const m = await mountReady();
+      await mod.act(async () => {
+        m.api().getState().addTab(DEFAULT_WORKSPACE);
+      });
+      await clickAndSettle(m, "task-1", { workspacePath: MAINTENANCE }, 100);
+      assert.deepEqual(globalThis.__toasts, [], "重试期间不应提示失败");
+      assert.equal(activeTask(MAINTENANCE), null, "连接恢复前不应选中");
+      await settle(1_000);
+      assert.deepEqual(globalThis.__toasts, []);
+      assert.ok(globalThis.__taskMetaCalls.length >= 3);
+      assert.equal(snapshot(m.api()).path, MAINTENANCE);
+      assert.equal(activeTask(MAINTENANCE), "task-1");
+      await m.unmount();
+    });
+
+    await check("getTaskMeta 明确返回 null：弹出打开失败 toast，且不改动 tab", async () => {
+      resetGlobals();
+      installServices(() => null);
+      const m = await mountReady();
+      await mod.act(async () => {
+        m.api().getState().addTab(DEFAULT_WORKSPACE);
+      });
+      await clickAndSettle(m, "missing", { workspacePath: MAINTENANCE });
+      assert.deepEqual(globalThis.__toasts, [OPEN_FAILED]);
+      assert.deepEqual(snapshot(m.api()).workspacePaths, [DEFAULT_WORKSPACE]);
+      assert.equal(globalThis.__navRequests.length, 0);
+      assert.equal(page(m.container), "home");
+      await m.unmount();
+    });
+
+    await check(
+      "syncActiveTaskSession：设置页与手机 Home 列表上报 null，进入 Chat 后才上报当前任务",
+      async () => {
+        resetGlobals();
+        installServices((params) => taskMeta(params));
+        const m = await mountReady();
+        const lastSynced = () => globalThis.__syncedSessions.at(-1);
+        const clickBack = async () => {
+          const back = [...m.container.querySelectorAll("button")].find(
+            (node) => node.getAttribute("aria-label") === BACK_HOME,
+          );
+          assert.ok(back, "缺少返回 Home 的按钮");
+          await mod.act(async () => {
+            back.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+          });
+          await settle();
+        };
+        await mod.act(async () => {
+          m.api().getState().addTab(MAINTENANCE);
+        });
+        await clickAndSettle(m, "task-a", { workspacePath: MAINTENANCE });
+        assert.equal(page(m.container), "chat");
+        assert.equal(lastSynced(), "task-a", "停在 Chat：正在查看该任务");
+
+        // 手机窄屏回到 Home 列表：activeTaskId 仍保留，但聊天区不可见，不能把该任务当成正在查看。
+        await clickBack();
+        assert.equal(page(m.container), "home");
+        assert.equal(activeTask(MAINTENANCE), "task-a", "前置：activeTaskId 未被清空");
+        assert.equal(lastSynced(), null, "Home 列表在前台：必须上报 null，通知照常展示");
+
+        // 再次通知点击切入 Chat：恢复上报该任务。
+        await clickAndSettle(m, "task-b", { workspacePath: MAINTENANCE });
+        assert.equal(page(m.container), "chat");
+        assert.equal(lastSynced(), "task-b");
+
+        // 设置页不是 workspace tab：workspacePath 为空，同样上报 null。
+        await mod.act(async () => {
+          m.api().getState().openSettingsTab();
+        });
+        await settle();
+        assert.equal(snapshot(m.api()).kind, "settings");
+        assert.equal(lastSynced(), null, "设置页不得吞掉任何任务的通知");
+        assert.deepEqual(globalThis.__syncedWindowTabs.at(-1), ["", MAINTENANCE]);
+
+        // 壳层卸载后复位，避免残留的 Home 状态让桌面或宽屏一直上报“未在查看”。
+        await clickBack();
+        assert.equal(mod.isWebRemoteControlMobileHomeListVisible(), true, "前置：Home 在前台");
+        await m.unmount();
+        assert.equal(mod.isWebRemoteControlMobileHomeListVisible(), false);
+      },
+    );
+
+    await check(
+      "历史 tab 恢复完成前点击通知：等待就绪后再导航，不被 restoreTabs 覆盖",
+      async () => {
+        resetGlobals();
+        installServices((params) => taskMeta(params));
+        let release;
+        const gate = new Promise((resolve) => {
+          release = resolve;
+        });
+        const settingService = {
+          get: async () => {
+            await gate;
+            return { lastActiveWorkspace: { kind: "local", workspacePath: DEFAULT_WORKSPACE } };
+          },
+          update: async () => {},
+        };
+        const m = await mountReady({ settingService });
+        await clickAndSettle(m, "task-1", { workspacePath: MAINTENANCE }, 80);
+        assert.equal(globalThis.__taskMetaCalls.length, 0, "恢复完成前不应查询");
+        assert.deepEqual(snapshot(m.api()).workspacePaths, []);
+        assert.deepEqual(globalThis.__toasts, []);
+
+        release();
+        await settle(150);
+        assert.deepEqual(globalThis.__toasts, []);
+        const after = snapshot(m.api());
+        assert.equal(after.path, MAINTENANCE);
+        assert.ok(after.workspacePaths.includes(DEFAULT_WORKSPACE), "恢复出的 tab 必须保留");
+        assert.equal(activeTask(MAINTENANCE), "task-1");
+        await m.unmount();
+      },
+    );
+
+    await check(
+      "冷启动深链：已有其他持久化 tab 时最终激活目标 workspace 与任务，不落入默认草稿",
+      async () => {
+        resetGlobals();
+        installServices((params) => taskMeta(params));
+        const committed = [];
+        const subscription = mod.onTaskNavigationCommitted((entry) => committed.push(entry.taskId));
+        const settingService = {
+          get: async () => ({
+            lastActiveWorkspace: { kind: "local", workspacePath: "/workspace/previous" },
+          }),
+          update: async () => {},
+        };
+        const m = await mountReady({
+          settingService,
+          initial: { workspacePath: MAINTENANCE, taskId: "task-cold" },
+        });
+        await settle(100);
+        const after = snapshot(m.api());
+        assert.equal(after.path, MAINTENANCE, "最终激活的必须是深链 workspace");
+        assert.ok(after.workspacePaths.includes("/workspace/previous"), "历史 tab 不丢");
+        assert.equal(activeTask(MAINTENANCE), "task-cold");
+        assert.deepEqual(globalThis.__drafts, [], "不得走默认草稿");
+        assert.ok(committed.includes("task-cold"), "选中冷启动任务必须发布已查看事实以清除未读");
+        assert.deepEqual(globalThis.__toasts, []);
+        subscription.dispose();
+        await m.unmount();
+      },
+    );
+
+    await check(
+      "冷启动深链带 canonical identity：沿用已恢复的同路径本地 tab，不重复开 tab",
+      async () => {
+        resetGlobals();
+        installServices((params) => taskMeta(params));
+        const settingService = {
+          get: async () => ({ lastActiveWorkspace: { kind: "local", workspacePath: MAINTENANCE } }),
+          update: async () => {},
+        };
+        const m = await mountReady({
+          settingService,
+          initial: {
+            workspacePath: MAINTENANCE,
+            workspaceIdentity: "canonical:maint",
+            taskId: "task-cold",
+          },
+        });
+        await settle(100);
+        assert.deepEqual(snapshot(m.api()).workspacePaths, [MAINTENANCE]);
+        assert.equal(activeTask(MAINTENANCE), "task-cold");
+        await m.unmount();
+      },
+    );
+  }
+
+  return { runSuite };
+}
+
+// ---------------------------------------------------------------------------
+// 第 5 部分：终态通知收集（真实 taskNotificationOrchestrator）。
+// ---------------------------------------------------------------------------
+const ORCHESTRATOR_ENTRY = `
+  export { collectTerminalTaskNotificationPayloads } from "@/lib/taskNotificationOrchestrator.js";
+`;
+
+async function runTerminalNotificationSuite(mod) {
+  console.log("终态通知收集：collectTerminalTaskNotificationPayloads");
+  const formatMessage = ({ id }, values) => (values?.title ? `${id}:${values.title}` : String(id));
+  const session = (sessionId, phase, title = "demo") => ({ sessionId, phase, title });
+  const collect = (previousPhase, nextPhase, extra = {}) =>
+    mod.collectTerminalTaskNotificationPayloads({
+      previousBySessionId: new Map(
+        previousPhase === null ? [] : [["s1", session("s1", previousPhase)]],
+      ),
+      sessions: [session("s1", nextPhase)],
+      formatMessage,
+      ...extra,
+    });
+
+  await check(
+    "completedSuccess 产生完成通知，error 产生失败通知，并携带 workspace 上下文",
+    async () => {
+      const workspace = { workspacePath: "/repo", workspaceIdentity: "id-1" };
+      const [completed] = collect("running", "completedSuccess", { workspace });
+      assert.equal(completed.status, "completed");
+      assert.equal(completed.taskId, "s1");
+      assert.equal(completed.title, "notification.completed");
+      assert.equal(completed.workspacePath, "/repo");
+      assert.equal(completed.workspaceIdentity, "id-1");
+
+      const failed = collect("running", "error");
+      assert.equal(failed.length, 1);
+      assert.equal(failed[0].status, "failed");
+      assert.equal(failed[0].title, "notification.error");
+    },
+  );
+
+  await check(
+    "completedInterrupted（主动停止或发新消息打断旧回合）不发任何通知，含从各前态进入",
+    async () => {
+      for (const previous of ["running", "completedSuccess", "error", "idle"]) {
+        assert.deepEqual(
+          collect(previous, "completedInterrupted"),
+          [],
+          `${previous} -> interrupted`,
+        );
+      }
+      // 一批会话里只有中断的会话被静默，其余终态照常通知。
+      const payloads = mod.collectTerminalTaskNotificationPayloads({
+        previousBySessionId: new Map([
+          ["s1", session("s1", "running")],
+          ["s2", session("s2", "running")],
+          ["s3", session("s3", "running")],
+        ]),
+        sessions: [
+          session("s1", "completedInterrupted"),
+          session("s2", "completedSuccess"),
+          session("s3", "error"),
+        ],
+        formatMessage,
+      });
+      assert.deepEqual(
+        payloads.map((payload) => [payload.taskId, payload.status]),
+        [
+          ["s2", "completed"],
+          ["s3", "failed"],
+        ],
+      );
+    },
+  );
+
+  await check("首次出现的会话与重复终态不通知", async () => {
+    assert.deepEqual(collect(null, "completedSuccess"), [], "没有前态：不是状态迁移");
+    assert.deepEqual(collect("completedSuccess", "completedSuccess"), [], "终态未变化");
+    assert.deepEqual(collect("error", "error"), []);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 第 5 部分：独立 Web 连接恢复（真实 main.tsx 源码段）。
+// ---------------------------------------------------------------------------
+async function runStandaloneConnectionSuite() {
+  console.log("独立 Web 首屏零 Banner 与重连：packages/web/src/main.tsx");
+  const source = readFileSync(join(repoRoot, "packages/web/src/main.tsx"), "utf8");
+  const from = source.indexOf("// 首次连接超过该时间仍未连上才显示连接提示");
+  const to = source.indexOf("async function bootstrapWebApp");
+  assert.ok(from > 0 && to > from, "未找到 createStandaloneWebConnection 源码段");
+  const { code } = await esbuild.transform(source.slice(from, to), { loader: "ts" });
+  const load = new Function(
+    "setTimeout",
+    "clearTimeout",
+    "createWebRemoteControlLifecycleRecovery",
+    `${code}
+return {
+  createStandaloneWebConnection,
+  constants: {
+    initialHint: STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS,
+    reconnectHint: STANDALONE_RECONNECT_HINT_DELAY_MS,
+    idlePulse: STANDALONE_IDLE_PULSE_TIMEOUT_MS,
+    recoverPulse: STANDALONE_RECOVER_PULSE_TIMEOUT_MS,
+  },
+};`,
+  );
+  const realSetImmediate = setImmediate;
+  const flush = async () => {
+    for (let index = 0; index < 8; index += 1) await new Promise((done) => realSetImmediate(done));
+  };
+
+  // 假定时器：只记录登记的延迟，由用例按延迟手动触发，既不等待真实时间，也能精确断言 0ms / 退避 / 超时值。
+  function createHarness({ initialAccessVerified, connect, checkAccess }) {
+    const timers = new Map();
+    let nextId = 1;
+    const fakeSetTimeout = (callback, delay) => {
+      const id = nextId++;
+      timers.set(id, { callback, delay });
+      return id;
+    };
+    const fakeClearTimeout = (id) => void timers.delete(id);
+    let lifecycle = null;
+    const { createStandaloneWebConnection, constants } = load(
+      fakeSetTimeout,
+      fakeClearTimeout,
+      (options) => {
+        lifecycle = options;
+        return { dispose() {} };
+      },
+    );
+    const log = { states: [], ready: 0, connects: 0, accessChecks: 0, infoCalls: 0 };
+    const makeServices = (info) => ({
+      systemService: {
+        info: () => {
+          log.infoCalls += 1;
+          return info();
+        },
+      },
+      broadcastService: { onMessage: () => ({ dispose() {} }) },
+      settingService: {},
+    });
+    const connection = createStandaloneWebConnection({
+      initialAccessVerified,
+      connect: async (options) => {
+        log.connects += 1;
+        return connect(options, makeServices, log);
+      },
+      checkAccess: async (signal) => {
+        log.accessChecks += 1;
+        return checkAccess ? checkAccess(signal, log) : true;
+      },
+      onReady: () => void (log.ready += 1),
+      onState: (state) => void log.states.push(state),
+      windowTarget: { addEventListener() {}, removeEventListener() {} },
+      documentTarget: {
+        addEventListener() {},
+        removeEventListener() {},
+        visibilityState: "visible",
+      },
+    });
+    const pendingDelays = () => [...timers.values()].map((timer) => timer.delay);
+    const fire = async (delay) => {
+      const entry = [...timers.entries()].find(([, timer]) => timer.delay === delay);
+      assert.ok(entry, `没有登记 ${delay}ms 的定时器，当前：${JSON.stringify(pendingDelays())}`);
+      timers.delete(entry[0]);
+      entry[1].callback();
+      await flush();
+    };
+    return {
+      connection,
+      constants,
+      log,
+      pendingDelays,
+      fire,
+      recover: async () => {
+        lifecycle.onRecover();
+        await flush();
+      },
+    };
+  }
+  const healthy = (_options, makeServices) => makeServices(() => Promise.resolve({}));
+
+  await check(
+    "首屏已确认登录态：首连不再请求 server-info，只有一次握手往返且无首包探活",
+    async () => {
+      const h = createHarness({ initialAccessVerified: true, connect: healthy });
+      await flush();
+      assert.equal(h.log.accessChecks, 0, "不得重复访问检查");
+      assert.equal(h.log.connects, 1);
+      assert.equal(h.log.infoCalls, 0, "连上后不再额外发 info 探活往返");
+      assert.deepEqual(h.log.states, ["connecting", "connected"]);
+      assert.equal(h.log.ready, 1);
+      assert.ok(h.pendingDelays().includes(25_000), "连上后登记 25s 空闲心跳");
+      h.connection.dispose();
+    },
+  );
+
+  await check("首屏登录态未知：先检查访问再握手；检查失败进入 auth-required 且不握手", async () => {
+    const unknown = createHarness({ initialAccessVerified: false, connect: healthy });
+    await flush();
+    assert.equal(unknown.log.accessChecks, 1);
+    assert.equal(unknown.log.connects, 1);
+    unknown.connection.dispose();
+
+    const denied = createHarness({
+      initialAccessVerified: false,
+      connect: healthy,
+      checkAccess: () => false,
+    });
+    await flush();
+    assert.equal(denied.log.connects, 0);
+    assert.deepEqual(denied.log.states, ["connecting", "auth-required"]);
+    denied.connection.dispose();
+  });
+
+  await check("已验证登录态后握手失败：只用一次访问检查区分鉴权失效与普通断线", async () => {
+    const expired = createHarness({
+      initialAccessVerified: true,
+      connect: ({ onClose }) => {
+        // 真实 WebSocket 适配器拒绝握手时也同步通知 onClose。
+        onClose();
+        return Promise.reject(new Error("WebSocket connection closed"));
+      },
+      checkAccess: () => false,
+    });
+    await flush();
+    assert.equal(expired.log.accessChecks, 1);
+    assert.equal(expired.log.states.at(-1), "auth-required");
+    assert.deepEqual(expired.pendingDelays(), [], "鉴权失效不重试");
+    expired.connection.dispose();
+
+    const offline = createHarness({
+      initialAccessVerified: true,
+      connect: () => Promise.reject(new Error("offline")),
+      checkAccess: () => {
+        throw new Error("network down");
+      },
+    });
+    await flush();
+    assert.equal(offline.log.states.at(-1), "reconnecting");
+    assert.deepEqual(offline.pendingDelays(), [0], "第一次重连不等待");
+    offline.connection.dispose();
+  });
+
+  await check("切后台恢复：2.5s 快速探活失败后 0ms 立即重连，单往返、不再检查访问", async () => {
+    let calls = 0;
+    const h = createHarness({
+      initialAccessVerified: true,
+      connect: (_options, makeServices) => {
+        calls += 1;
+        // 第一代连接的 info 永不返回，模拟被系统冻结的死连接。
+        return makeServices(calls === 1 ? () => new Promise(() => {}) : () => Promise.resolve({}));
+      },
+    });
+    await flush();
+    assert.deepEqual(h.log.states, ["connecting", "connected"]);
+
+    await h.recover();
+    assert.ok(
+      h.pendingDelays().includes(h.constants.recoverPulse),
+      `恢复探活超时应为 ${h.constants.recoverPulse}ms`,
+    );
+    assert.equal(h.constants.recoverPulse, 2_500);
+    await h.fire(2_500);
+    assert.equal(h.log.states.at(-1), "reconnecting");
+    assert.ok(h.pendingDelays().includes(0), "重连延迟必须为 0ms");
+    assert.ok(!h.pendingDelays().includes(1_000), "不能先等 1 秒");
+    await h.fire(0);
+    assert.equal(h.log.connects, 2, "只多一次握手往返");
+    assert.equal(h.log.accessChecks, 0, "曾连上过：不重复检查访问");
+    assert.equal(h.log.states.at(-1), "connected");
+    h.connection.dispose();
+
+    const idle = createHarness({
+      initialAccessVerified: true,
+      connect: (_options, makeServices) => makeServices(() => new Promise(() => {})),
+    });
+    await flush();
+    await idle.fire(25_000);
+    assert.deepEqual(idle.pendingDelays(), [10_000]);
+    await idle.recover();
+    assert.equal(idle.log.infoCalls, 1, "恢复时沿用已发出的心跳请求");
+    assert.deepEqual(idle.pendingDelays(), [2_500]);
+    await idle.fire(2_500);
+    assert.deepEqual(idle.pendingDelays(), [0]);
+    idle.connection.dispose();
+  });
+
+  await check("空闲心跳 10s 超时；连续失败按 0、1s、2s、4s、8s 退避，恢复事件清零", async () => {
+    const idle = createHarness({ initialAccessVerified: true, connect: healthy });
+    await flush();
+    await idle.fire(25_000);
+    assert.equal(idle.constants.idlePulse, 10_000);
+    idle.connection.dispose();
+
+    const h = createHarness({
+      initialAccessVerified: true,
+      connect: () => Promise.reject(new Error("down")),
+    });
+    await flush();
+    const delays = [];
+    for (let index = 0; index < 6; index += 1) {
+      const [delay] = h.pendingDelays();
+      delays.push(delay);
+      await h.fire(delay);
+    }
+    assert.deepEqual(delays, [0, 1_000, 2_000, 4_000, 8_000, 8_000]);
+    // 回到前台是新的恢复窗口：正在退避等待也立即重试，且之后再失败又从 0ms 开始。
+    const before = h.log.connects;
+    await h.recover();
+    assert.equal(h.log.connects, before + 1, "恢复事件应立即重连");
+    assert.deepEqual(h.pendingDelays(), [0]);
+    h.connection.dispose();
+  });
+
+  await check("main.tsx 源码：3000ms / 4500ms 宽限期，首屏不清空 #root 启动动画", async () => {
+    assert.match(source, /STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS = 3_000/u);
+    assert.match(source, /STANDALONE_RECONNECT_HINT_DELAY_MS = 4_500/u);
+    const bootstrapAt = source.indexOf("async function bootstrapWebApp");
+    const standalone = source.slice(source.indexOf("const coldLaunchTarget", bootstrapAt));
+    // 首连成功前（services 为空且提示未显示）不渲染：createRoot 首次 render 才会替换 #root 里的启动动画。
+    assert.match(standalone, /if \(!services && !showConnectionHint\) return;/u);
+    assert.equal(
+      (standalone.match(/root\.render\(/gu) ?? []).length,
+      1,
+      "独立 Web 只能有一个渲染入口，且位于上述守卫之后",
+    );
+    assert.ok(
+      standalone.indexOf("if (!services && !showConnectionHint) return;") <
+        standalone.indexOf("root.render("),
+    );
+    assert.doesNotMatch(standalone, /root\.(unmount|replaceChildren)|innerHTML\s*=/u);
+    assert.match(
+      standalone,
+      /hasLoadedServices\s*\?\s*STANDALONE_RECONNECT_HINT_DELAY_MS\s*:\s*STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS/u,
+      "首连 3s、曾连上过的重连 4.5s",
+    );
+    // 首屏 auth-required 立即提示；其余待连接状态只在宽限期后才显示。
+    assert.match(standalone, /let showConnectionHint = authRequiredAtStart;/u);
+    assert.match(standalone, /initialAccessVerified: bootstrap\.initialAccessState === "ok"/u);
+  });
+
+  await check(
+    "main.tsx 源码：首连不重复请求 /api/server-info，且无 inert 与焦点恢复残留",
+    async () => {
+      // 请求只出现在 resolveWebBootstrap 与 checkAccess 两处；首连成功路径只经过前者。
+      const fetches = source.match(/fetch\("\/api\/server-info"/gu) ?? [];
+      assert.equal(fetches.length, 2, "server-info 只应在首屏 bootstrap 与 checkAccess 请求");
+      assert.match(source, /const skippedAccessCheck = hadReady \|\| accessVerified;/u);
+      assert.doesNotMatch(source, /inert/u, "重连期间不得再锁定页面");
+      for (const leftover of [
+        "StandaloneFocusRestore",
+        "focusRestoreStore",
+        "captureStandaloneFocusForRestore",
+        "restoreStandaloneFocusAfterReconnect",
+        "StandaloneFocusRestoreEffect",
+      ]) {
+        assert.ok(!source.includes(leftover), `main.tsx 仍残留 ${leftover}`);
+      }
+      assert.doesNotMatch(source, /useLayoutEffect/u, "焦点恢复移除后不应遗留未使用的导入");
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 静态产物：PWA manifest 与入口 HTML。
 // ---------------------------------------------------------------------------
 function readPngSize(file) {
@@ -826,6 +1799,28 @@ try {
   await suite.runWebWorkbenchSuite();
   await suite.runMobileProxySuite();
   await suite.runDesktopSuite();
+
+  const navOut = join(workDir, "notification-navigation.mjs");
+  await bundleUi(
+    NAV_ENTRY,
+    navOut,
+    {
+      "ui:i18n/IntlProvider": INTL_STUB,
+      "ui:components/ui/toast": TOAST_STUB,
+      "ui:hooks/useWorkspaceServices": WORKSPACE_SERVICES_STUB,
+      "ui:hooks/useServices": SERVICES_STUB,
+      "ui:WebRemoteControlThemeMenu": NULL_COMPONENT_STUB,
+      "ui:web-remote-control/index": NULL_COMPONENT_STUB,
+    },
+    { banner: NODE_TEST_BANNER },
+  );
+  const navMod = await import(pathToFileURL(navOut).href);
+  await createNavigationSuite(navMod, win).runSuite();
+
+  const orchestratorOut = join(workDir, "task-notification-orchestrator.mjs");
+  await bundleUi(ORCHESTRATOR_ENTRY, orchestratorOut, {});
+  await runTerminalNotificationSuite(await import(pathToFileURL(orchestratorOut).href));
+  await runStandaloneConnectionSuite();
   await runStaticAssetSuite();
   console.log(`standalone-web-push: ${passed} checks passed`);
 } finally {

@@ -5,6 +5,10 @@
 //
 // 本脚本只覆盖服务端合同（root 数量、root 变更、moveTask 缺 root 流程、跨 Host、0 目录项目与懒创建）。
 // UI 层（项目编辑弹层增删 root、侧栏拖动确认框）见规格验收场景 8，需实机复核。
+//
+// 场景 8（无项目草稿目录被移走后的自动换绑恢复）同时打包真实 composerDraftStore.ts 的
+// rotateMissingPendingTaskDraft，与真实 createProjectService.prepareSession 串起来验证：
+// 服务端报 project.draft-workspace-missing，前端换绑新 draftId 重建目录并保留正文草稿。
 import assert from "node:assert/strict";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
@@ -28,12 +32,14 @@ const { build } = await import(pathToFileURL(esbuildPath).href);
 const root = await mkdtemp(join(tmpdir(), "zcode-standalone-multi-root-"));
 const shared = join(repoRoot, "packages/shared/src");
 const services = join(repoRoot, "packages/services/src");
+const uiSrc = join(repoRoot, "packages/ui/src");
 const outfile = join(root, "multi-root-bundle.cjs");
 await build({
   stdin: {
     contents: [
       `export { TaskIndexRepo } from ${JSON.stringify(join(services, "session/taskIndexRepo.ts"))};`,
       `export { createProjectService } from ${JSON.stringify(join(services, "project/index.ts"))};`,
+      `export * as composerDraftStore from ${JSON.stringify(join(uiSrc, "v4/composer/composerDraftStore.ts"))};`,
     ].join("\n"),
     resolveDir: repoRoot,
     loader: "ts",
@@ -50,6 +56,14 @@ await build({
     {
       name: "source-only-multi-root-fixture",
       setup(builder) {
+        // UI 源码使用 `@/` 别名与 `.js` 后缀指向 .ts/.tsx。
+        builder.onResolve({ filter: /^@\// }, ({ path }) => {
+          const base = join(uiSrc, path.slice(2));
+          const stem = base.replace(/\.js$/, "");
+          const found = [`${stem}.ts`, `${stem}.tsx`, base].find((file) => existsSync(file));
+          if (!found) throw new Error(`Cannot resolve UI alias: ${path}`);
+          return { path: found };
+        });
         builder.onResolve({ filter: /^@zcode\// }, ({ path }) => {
           const [, name, ...subpath] = path.split("/");
           const packageRoot = join(repoRoot, "packages", name);
@@ -82,7 +96,7 @@ await build({
     },
   ],
 });
-const { TaskIndexRepo, createProjectService } = require(outfile);
+const { TaskIndexRepo, createProjectService, composerDraftStore } = require(outfile);
 
 const hostId = "remote:server:e2e-standalone-multi-root";
 const otherHostId = "remote:server:e2e-standalone-other";
@@ -313,6 +327,131 @@ const passes = [];
     "无项目草稿目录 .zcode/conversations/draft-<id> 应保持不变",
   );
   passes.push("7 独立 Web 0 目录项目生命周期与 .zcode/workspace/<id> 懒创建");
+}
+
+// 8. 无项目草稿目录被移走：prepareSession(reuseDraft) 报 project.draft-workspace-missing，
+//    前端 rotateMissingPendingTaskDraft 换绑新 draftId 后重建新目录，正文草稿按 scope 保存不丢失。
+{
+  const { service } = await createService(join(root, "draft-missing.sqlite"), standaloneOptions);
+  // composerDraftStore 通过 window.localStorage 持久化；这里提供内存实现，结束后还原。
+  const memory = new Map();
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => memory.get(key) ?? null,
+      setItem: (key, value) => void memory.set(key, String(value)),
+      removeItem: (key) => void memory.delete(key),
+    },
+  };
+  try {
+    const store = composerDraftStore;
+    const scope = store.resolveComposerScope(null, undefined, "web-e2e");
+    const conversations = join(workspaceRoot, ".zcode", "conversations");
+    const directoryOf = (draftId) => join(conversations, `draft-${draftId}`);
+
+    // 首次：无项目 prepareSession({ draftId }) 创建 draft-<id> 目录并绑定。
+    const original = store.ensurePendingTaskDraft(scope);
+    const first = await service.prepareSession({ draftId: original.draftId });
+    assert.equal(first.workspacePath, directoryOf(original.draftId));
+    assert.equal((await stat(first.workspacePath)).isDirectory(), true);
+    store.bindPendingTaskDraft(scope, original.draftId, first.workspacePath);
+    assert.equal(store.readPendingTaskDraft(scope)?.workspacePath, first.workspacePath);
+
+    // 用户已输入但尚未发送的正文草稿，按 ComposerScope 独立保存，与 draftId 无关。
+    const persisted = store.persistV4ComposerDraft(
+      first.workspacePath,
+      undefined,
+      store.V4_DRAFT_SCOPE_ROOT,
+      { text: "尚未发送的草稿正文", mode: "agent" },
+      scope,
+    );
+    assert.ok(persisted !== false, "正文草稿应写入成功");
+
+    // 复用仍存在的目录成功。
+    const reused = await service.prepareSession({ draftId: original.draftId, reuseDraft: true });
+    assert.equal(reused.workspacePath, first.workspacePath);
+
+    // 人为删掉磁盘上的 draft-<id> 目录：只报告缺失，不静默重建空目录。
+    await rm(first.workspacePath, { recursive: true, force: true });
+    await expectError("project.draft-workspace-missing", () =>
+      service.prepareSession({ draftId: original.draftId, reuseDraft: true }),
+    );
+    assert.equal(existsSync(first.workspacePath), false, "报错时不得悄悄重建旧目录");
+
+    // 前端恢复：换绑新 draftId，再用 reuseDraft:false 创建新目录。
+    const rotated = store.rotateMissingPendingTaskDraft(scope, original.draftId);
+    assert.ok(rotated, "无在途命令时应换绑成功");
+    assert.notEqual(rotated.draftId, original.draftId);
+    assert.equal(rotated.workspacePath, undefined, "新草稿尚未绑定目录");
+    assert.equal(rotated.commandId, undefined);
+    assert.equal(store.readPendingTaskDraft(scope)?.draftId, rotated.draftId, "新 draftId 已落盘");
+    const rebuilt = await service.prepareSession({ draftId: rotated.draftId, reuseDraft: false });
+    assert.equal(rebuilt.workspacePath, directoryOf(rotated.draftId));
+    assert.notEqual(rebuilt.workspacePath, first.workspacePath);
+    assert.equal((await stat(rebuilt.workspacePath)).isDirectory(), true, "应重建新目录");
+    store.bindPendingTaskDraft(scope, rotated.draftId, rebuilt.workspacePath);
+    assert.equal(store.readPendingTaskDraft(scope)?.workspacePath, rebuilt.workspacePath);
+
+    // 正文草稿完整保留：新旧目录下按同一 scope 读取到同一份文字。
+    for (const path of [first.workspacePath, rebuilt.workspacePath]) {
+      assert.equal(
+        store.readV4ComposerDraft(path, undefined, store.V4_DRAFT_SCOPE_ROOT, scope)?.text,
+        "尚未发送的草稿正文",
+      );
+    }
+
+    // 新目录可继续复用；旧 draftId 已过期且当前无在途命令时再次换绑返回最新草稿，不重复换绑；
+    // 若调用方按最新草稿的 workspacePath（reuseDraft: true）幂等重试且该目录也缺失，不得静默重建。
+    const reusedAgain = await service.prepareSession({
+      draftId: rotated.draftId,
+      reuseDraft: true,
+    });
+    assert.equal(reusedAgain.workspacePath, rebuilt.workspacePath);
+    const stale = store.rotateMissingPendingTaskDraft(scope, original.draftId);
+    assert.equal(stale?.draftId, rotated.draftId, "过期的 expectedDraftId 返回当前草稿");
+    assert.equal(
+      stale?.workspacePath,
+      rebuilt.workspacePath,
+      "返回当前草稿须保留已绑定的 workspacePath",
+    );
+    assert.equal(store.readPendingTaskDraft(scope)?.draftId, rotated.draftId);
+
+    await rm(rebuilt.workspacePath, { recursive: true, force: true });
+    await expectError("project.draft-workspace-missing", () =>
+      service.prepareSession({
+        draftId: stale.draftId,
+        reuseDraft: Boolean(stale.workspacePath),
+      }),
+    );
+    assert.equal(
+      existsSync(rebuilt.workspacePath),
+      false,
+      "幂等重试必须使用 current.workspacePath 对应的 reuseDraft 状态，不能用 false 重建已删目录",
+    );
+    await mkdir(rebuilt.workspacePath, { recursive: true });
+
+    // 有在途首发命令（commandId）时绝不换绑；即使传入已被其他入口换绑过的旧 draftId 也必须返回 null。
+    store.markPendingTaskDraftCommand(scope, rotated.draftId, "command-1", null);
+    assert.equal(store.rotateMissingPendingTaskDraft(scope, rotated.draftId), null);
+    assert.equal(
+      store.rotateMissingPendingTaskDraft(scope, original.draftId),
+      null,
+      "当前草稿存在在途 commandId 时，即使 expectedDraftId 已过期也必须返回 null",
+    );
+    const inFlight = store.readPendingTaskDraft(scope);
+    assert.equal(inFlight?.draftId, rotated.draftId);
+    assert.equal(inFlight?.commandId, "command-1");
+    assert.equal(inFlight?.workspacePath, rebuilt.workspacePath);
+
+    // 没有任何草稿时返回 null（不凭空创建）。
+    store.completePendingTaskDraft(scope, rotated.draftId);
+    assert.equal(store.rotateMissingPendingTaskDraft(scope, rotated.draftId), null);
+    assert.equal(store.readPendingTaskDraft(scope), null);
+    passes.push("8 无项目草稿目录被移走：自动换绑新 draftId 重建目录并保留正文草稿");
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
 }
 
 for (const line of passes) console.log(`PASS ${line}`);

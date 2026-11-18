@@ -103,16 +103,17 @@ sequenceDiagram
 1. 独立 Web：点击“选择目录”在对话框内浏览服务端目录，确认后来源输入框填充服务端路径，可继续添加。
 2. 桌面端：“选择目录”仍打开系统目录选择框。
 
-## 设置页 Scope 文案：当前服务器 / 当前项目
+## 设置页与项目设备 Scope 文案：当前服务器 / 当前项目
 
-- 独立 Web（含手机远控）下当前服务器承载的 `local` 设备 `user` 作用域指向**当前服务器 Host**：文案统一为“当前服务器”，不写死服务器地址或凭据，不使用浏览器本机语义；远端（`remote`）设备分组仍显示其设备名与“用户”标签。
+- 独立 Web（含手机远控）下当前服务器承载的 `local` 设备 `user` 作用域指向**当前服务器 Host**：文案统一为“当前服务器”（`settings.scope.server`），不写死服务器地址或凭据，不使用浏览器本机语义；远端（`remote`）设备分组仍显示其设备名与“用户”标签。
+- 项目相关界面的本地设备文案同样复用 `useIsServerHostedSettingsScope()`：在独立 Web 与手机远控下，`ProjectEditor.tsx`（新建/编辑项目设备选择）、`ProjectManagementRow.tsx`（项目管理行 `DeviceTag`）、`ProjectFolderTrustDialog.tsx`（工作区目录信任弹窗）与 `ProjectComposerMenu.tsx`（输入框项目选择菜单）将本地设备名称从“此电脑”（`project.thisComputer`）统一显示为“当前服务器”（`settings.scope.server`）；桌面端保持“此电脑”不变。
 - project 作用域仍指**当前项目**，判定与数据不改。
 - 四类资源（技能 / 子代理 / MCP / 指令）的 scope 归属保持一致：user/local → 当前服务器，project → 当前项目；不伪造平台、不改 scope 数据。
 
 ### 验收场景
 
-1. 独立 Web：设置页技能、子代理、MCP 的 user/local 选项文案显示“当前服务器”，project 显示“当前项目”。
-2. 桌面端：文案与作用域行为不变。
+1. 独立 Web：设置页技能、子代理、MCP 的 user/local 选项文案，以及项目新建/编辑、项目管理行、目录信任弹窗、输入框项目菜单的本地设备名均显示“当前服务器”，project 显示“当前项目”。
+2. 桌面端：文案与作用域行为不变（本地设备名保持“此电脑”）。
 
 ## MCP 配置读写与目标服务归属
 

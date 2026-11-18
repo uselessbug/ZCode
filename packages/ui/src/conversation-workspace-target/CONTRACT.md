@@ -1,6 +1,6 @@
 # Conversation workspace 目标解析
 
-模块组合 Root 提供的操作端口，解析“在项目外工作”的目录和身份。窗口 tab store 是 tab 的唯一 owner，Registry / SourceManager 是远程连接和 Source 归属的唯一 owner；解析器只读取事实，不保存副本。
+模块组合 Root 提供的操作端口，解析“在项目外工作”的目录和身份。窗口 tab store 是 tab 的唯一 owner，Registry / SourceManager 是远程连接和 Source 归属的唯一 owner；解析器只读取事实，不保存副本。当当前 `conversation` tab 命中正在受管的 `pendingDraft` 路径时，不短路返回旧路径，须走 `resolveLocalConversationWorkspacePath`（`prepareSession`）复检或换绑重建；真实历史非项目会话 tab 保留快捷路径直接返回。
 
 远端不能解除项目绑定，直接拒绝无项目目标。路径相同不能代表设备相同；Source 解析只消费持久化 alias，含糊结果不猜。workbenchTarget 仅解析分屏焦点，最终创建仍交给 ProjectService 按显式项目准入。本地继续使用既有目录解析端口。调用方只使用公开入口和契约。
 

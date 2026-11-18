@@ -22,6 +22,8 @@ export interface ConversationWorkspaceTargetParams {
   activeWorkspaceIdentity: string | null;
   getRemoteSessionSourceServerId?: (remoteSessionId: string) => string | undefined;
   openRemoteConversation?: (remoteSessionId: string, sourceServerId?: string) => Promise<void>;
+  /** 当前受管的无项目草稿目录；命中该路径时仍须走本地解析以复检/换绑磁盘目录。 */
+  getManagedPendingDraftWorkspacePath?: () => string | null | undefined;
   resolveLocalConversationWorkspacePath: () => Promise<string>;
 }
 

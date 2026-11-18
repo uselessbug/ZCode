@@ -28,9 +28,11 @@ import { useComposerClientNamespace } from "@/hooks/useServices.js";
 import {
   resolveComposerScope,
   ensurePendingTaskDraft,
+  readPendingTaskDraft,
   bindPendingTaskDraft,
   rememberComposerWorkspaceScope,
   readComposerWorkspaceScope,
+  rotateMissingPendingTaskDraft,
 } from "@/v4/composer/composerDraftStore.js";
 import { openFolderFromWorkspaceEntry } from "@/root/openWorkspaceFolderEntry.js";
 import { useConversationWorkspaceActions } from "@/root/useConversationWorkspaceActions.js";
@@ -373,24 +375,56 @@ export function useRootWorkspaceActions({
           });
           return;
         }
-        if (!services.projectService) throw new Error("project.service-unavailable");
-        const pendingDraft =
+        const projectService = services.projectService;
+        if (!projectService) throw new Error("project.service-unavailable");
+        const pendingScope = resolveComposerScope(null, undefined, composerClientNamespace);
+        let pendingDraft =
           !projectId && (!hostId || hostId === "local")
-            ? ensurePendingTaskDraft(resolveComposerScope(null, undefined, composerClientNamespace))
+            ? ensurePendingTaskDraft(pendingScope)
             : null;
-        const target = await services.projectService.prepareSession({
-          ...(projectId ? { projectId } : {}),
-          ...(hostId ? { hostId } : {}),
-          // worktree 模式由 Host 新建受管 worktree 并返回其中的 cwd；不复用未归类草稿目录。
-          ...(typeof request === "object" && request.worktree && projectId
-            ? { worktree: request.worktree }
-            : {}),
-          // 显式 local 与省略 Host 是同一入口，不能漏掉待发送身份而另建目录。
-          ...(pendingDraft
-            ? { draftId: pendingDraft.draftId, reuseDraft: Boolean(pendingDraft.workspacePath) }
-            : {}),
-        });
+        const prepareTarget = (draft: typeof pendingDraft, reuseDraft: boolean) =>
+          projectService.prepareSession({
+            ...(projectId ? { projectId } : {}),
+            ...(hostId ? { hostId } : {}),
+            // worktree 模式由 Host 新建受管 worktree 并返回其中的 cwd；不复用未归类草稿目录。
+            ...(typeof request === "object" && request.worktree && projectId
+              ? { worktree: request.worktree }
+              : {}),
+            // 显式 local 与省略 Host 是同一入口，不能漏掉待发送身份而另建目录。
+            ...(draft ? { draftId: draft.draftId, reuseDraft } : {}),
+          });
+        let target: Awaited<ReturnType<typeof prepareTarget>>;
+        try {
+          target = await prepareTarget(pendingDraft, Boolean(pendingDraft?.workspacePath));
+        } catch (error) {
+          // 导航已过时时直接退出，避免迟到 ENOENT 触发换绑或重建。
+          if (!isCurrent()) return;
+          // 已绑定的草稿目录被移走：换绑新 draftId 重建目录，正文草稿按 scope 保存不会丢失。
+          // 有在途首发命令时 rotate 返回 null，保持原错误，绝不覆盖在途命令。
+          // 手机 bridge 返回普通错误对象，不能只认 instanceof Error。
+          const prepareMessage =
+            error && typeof error === "object" && "message" in error
+              ? String(error.message)
+              : String(error);
+          if (
+            !pendingDraft?.workspacePath ||
+            !prepareMessage.includes("project.draft-workspace-missing")
+          )
+            throw error;
+          const rotatedDraft = rotateMissingPendingTaskDraft(pendingScope, pendingDraft.draftId);
+          if (!rotatedDraft) throw error;
+          pendingDraft = rotatedDraft;
+          // 若已被并发入口换绑且已绑定目录，沿用当前 workspacePath 的 reuseDraft 状态做幂等校验，
+          // 绝不强行传 false 重建已被删除的目录。
+          target = await prepareTarget(rotatedDraft, Boolean(rotatedDraft.workspacePath));
+        }
         if (!isCurrent()) return;
+        if (pendingDraft) {
+          // 异步返回后再次验证草稿所有权：期间已被换绑或发送完成时不得写回旧绑定或切 tab。
+          const currentDraft = readPendingTaskDraft(pendingScope);
+          if (!currentDraft || currentDraft.draftId !== pendingDraft.draftId) return;
+          bindPendingTaskDraft(pendingScope, pendingDraft.draftId, target.workspacePath);
+        }
         if (hostId && hostId !== "local") {
           if (!target.workspaceIdentity || !openRemoteProjectWorkspace)
             throw new Error("project.remote-navigation-unavailable");
@@ -468,6 +502,10 @@ export function useRootWorkspaceActions({
     createTask: startNewTaskFromActiveWorkspace,
     setWorkspaceActionError,
     composerClientNamespace,
+    navigationSequenceRef: navigationSequence,
+    tabStoreApi,
+    activeWorkspacePath,
+    activeWorkspaceIdentity,
   });
 
   const handleLogout = useCallback(async () => {

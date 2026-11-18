@@ -10,10 +10,27 @@ import type { IntlInstance } from "@/i18n/index.js";
 
 type FormatMessage = IntlInstance["formatMessage"];
 
+export interface TaskNotificationWorkspaceContext {
+  workspacePath?: string;
+  workspaceIdentity?: string;
+}
+
+function withWorkspaceContext(
+  payload: TaskNotificationPayload,
+  workspace: TaskNotificationWorkspaceContext | undefined,
+): TaskNotificationPayload {
+  return {
+    ...payload,
+    ...(workspace?.workspacePath ? { workspacePath: workspace.workspacePath } : {}),
+    ...(workspace?.workspaceIdentity ? { workspaceIdentity: workspace.workspaceIdentity } : {}),
+  };
+}
+
 function terminalStatusForPhase(
   phase: SessionPhase,
 ): Extract<TaskNotificationPayload["status"], "completed" | "failed"> | null {
-  if (phase === "completedSuccess" || phase === "completedInterrupted") {
+  // 用户主动停止或运行中发新消息抢占会产生 completedInterrupted，保持静默不弹“任务已完成”。
+  if (phase === "completedSuccess") {
     return "completed";
   }
   if (phase === "error") {
@@ -60,6 +77,7 @@ export function collectTerminalTaskNotificationPayloads(params: {
   previousBySessionId: ReadonlyMap<string, SessionSummary>;
   sessions: readonly SessionSummary[];
   formatMessage: FormatMessage;
+  workspace?: TaskNotificationWorkspaceContext;
 }): TaskNotificationPayload[] {
   const payloads: TaskNotificationPayload[] = [];
   for (const session of params.sessions) {
@@ -72,7 +90,12 @@ export function collectTerminalTaskNotificationPayloads(params: {
     const previousStatus = terminalStatusForPhase(previous.phase);
     if (previousStatus === status) continue;
 
-    payloads.push(terminalPayloadForSession(session, status, params.formatMessage));
+    payloads.push(
+      withWorkspaceContext(
+        terminalPayloadForSession(session, status, params.formatMessage),
+        params.workspace,
+      ),
+    );
   }
   return payloads;
 }
@@ -155,6 +178,7 @@ export function collectPendingInteractionNotificationPayloads(params: {
   snapshot: ConversationSnapshot;
   seenRequestIds: ReadonlySet<string>;
   formatMessage: FormatMessage;
+  workspace?: TaskNotificationWorkspaceContext;
 }): TaskNotificationPayload[] {
   return params.snapshot.pendingInteractions
     .filter((interaction) => !params.seenRequestIds.has(interaction.interactionId))
@@ -164,6 +188,6 @@ export function collectPendingInteractionNotificationPayloads(params: {
         interaction,
         formatMessage: params.formatMessage,
       });
-      return payload ? [payload] : [];
+      return payload ? [withWorkspaceContext(payload, params.workspace)] : [];
     });
 }

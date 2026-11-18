@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- 菜单、项目编辑器、Worktree 弹窗、连接装配与能力协商回归共享同一套 esbuild 打包与 jsdom 环境。 */
 // 独立 Web 与桌面能力对齐（UI 侧）的隔离回归：本地 esbuild 打包真实源码 + jsdom/react-dom 渲染，
 // 不连接任何真实 Host，不触碰用户数据。
 //
@@ -6,12 +7,14 @@
 //   packages/ui/src/TaskActionMenuContent.tsx
 //   packages/ui/src/project-sidebar/grouped/task-context-menu-content.tsx
 //   packages/ui/src/project-sidebar/ProjectEditor.tsx
+//   packages/ui/src/project-sidebar/ProjectManagementRow.tsx（DeviceTag）
+//   packages/ui/src/project-sidebar/ProjectFolderTrustDialog.tsx
 //   packages/ui/src/project-sidebar/ManagedWorktreesDialog.tsx
 //   packages/client/src/websocket.ts（含真实 RemoteServiceAccess、ProxyChannel）
 // 仅把与本场景无关的依赖替换为最小桩：i18n Provider（改读真实 zh-CN / en-US 词表，缺 key 直接抛错）；
 // 菜单组件的 Radix ContextMenu / Tooltip 换成同形态的普通元素（Radix 右键需要真实指针事件）。
 //
-// 覆盖（共 26 项检查）：
+// 覆盖（共 30 项检查）：
 // 任务菜单：TaskActionMenuContent（侧栏与顶栏共用）与 GroupedTaskContextMenuContent（侧栏右键）各 6 项：
 //  1. canOpenLocalFiles=false + onOpenTaskFiles：显示「显示文件树」、点击只触发 onOpenTaskFiles；
 //     不渲染「在文件管理器中打开」与「前往配置」（zh-CN 与 en-US 文案各验一次，共 2 项）。
@@ -26,6 +29,10 @@
 //  9. 真实远端既有项目：不渲染移除/添加目录入口，保存仍携带原目录。
 // 10. 桌面（有 selectDirectories）本地项目：移除入口保持可用。
 // 11. 两份词表均已移除 project.standaloneAutoRootHint，源码树 0 残留引用。
+// 本地设备文案（useIsServerHostedSettingsScope）：
+//  6a. canOpenLocalFiles=false（独立 Web / 手机远控）：ProjectEditor 设备选择、DeviceTag、
+//      ProjectFolderTrustDialog 的本地设备名显示「当前服务器 / Current server」；
+//      canOpenLocalFiles=true（桌面）保持「此电脑 / This computer」；远程 deviceLabel 原样展示。
 // 受管 Worktree 弹窗（ManagedWorktreesDialog）：
 // 12. canOpenLocalFiles=false：不渲染文件管理器按钮，复制路径、删除仍在。
 // 13. canOpenLocalFiles=true（桌面对照）：渲染文件管理器按钮。
@@ -257,6 +264,8 @@ const DIALOG_ENTRY = `
   ${MOUNT_HELPERS}
   export { ProjectEditor } from "@/project-sidebar/ProjectEditor.js";
   export { ManagedWorktreesDialog } from "@/project-sidebar/ManagedWorktreesDialog.js";
+  export { DeviceTag } from "@/project-sidebar/ProjectManagementRow.js";
+  export { ProjectFolderTrustDialog } from "@/project-sidebar/ProjectFolderTrustDialog.js";
   export { PlatformProvider } from "@/hooks/usePlatform.js";
   export { TooltipProvider } from "@/components/ui/tooltip.js";
   import zhCN from "@/i18n/locales/zh-CN.js";
@@ -648,6 +657,107 @@ async function runEditorSuite(mod) {
     await mounted.unmount();
   });
 
+  // 本地设备文案：独立 Web / 手机远控（canOpenLocalFiles=false）显示「当前服务器」，桌面保持「此电脑」。
+  const LOCAL_DEVICE_TEXT = {
+    "zh-CN": { server: "当前服务器", desktop: "此电脑" },
+    "en-US": { server: "Current server", desktop: "This computer" },
+  };
+  const textOf = (selector) => q(selector)[0]?.textContent.trim() ?? "";
+  const withLocale = async (locale, run) => {
+    globalThis.__parityLocale = locale;
+    try {
+      await run();
+    } finally {
+      delete globalThis.__parityLocale;
+    }
+  };
+  for (const locale of ["zh-CN", "en-US"]) {
+    const expected = LOCAL_DEVICE_TEXT[locale];
+    await check(
+      `${locale} ProjectEditor 设备选择：独立 Web 显示当前服务器，桌面显示此电脑`,
+      async () => {
+        await withLocale(locale, async () => {
+          for (const [platform, label] of [
+            [{ canOpenLocalFiles: false }, expected.server],
+            [{ canOpenLocalFiles: true, selectDirectories: async () => [] }, expected.desktop],
+          ]) {
+            const { mounted } = await open({
+              platform,
+              project: null,
+              extra: { devices: [], defaultDeviceId: "local" },
+            });
+            assert.equal(textOf('[data-testid="virtual-project-device"]'), label);
+            const other = label === expected.server ? expected.desktop : expected.server;
+            assert.ok(
+              !q('[data-testid="virtual-project-device"]')[0].textContent.includes(other),
+              "不应同时出现另一种本地设备名",
+            );
+            await mounted.unmount();
+          }
+        });
+      },
+    );
+
+    await check(
+      `${locale} DeviceTag 与信任目录弹窗：本地设备名随平台切换，远程名称原样展示`,
+      async () => {
+        await withLocale(locale, async () => {
+          for (const [canOpenLocalFiles, label] of [
+            [false, expected.server],
+            [true, expected.desktop],
+          ]) {
+            const tag = await mod.mountElement(
+              mod.h(
+                mod.PlatformProvider,
+                { platform: { canOpenLocalFiles } },
+                mod.h(mod.DeviceTag, {}),
+              ),
+            );
+            assert.equal(tag.container.textContent.trim(), label);
+            await tag.unmount();
+
+            const trust = await mod.mountElement(
+              mod.h(
+                mod.PlatformProvider,
+                { platform: { canOpenLocalFiles } },
+                mod.h(mod.ProjectFolderTrustDialog, {
+                  request: { roots: ["/workspace/demo"], restoring: false, resolve() {} },
+                  onClosed() {},
+                }),
+              ),
+            );
+            await settle(mod.act);
+            const dialogText = document.body.textContent;
+            assert.ok(dialogText.includes(label), `信任目录弹窗应显示 ${label}`);
+            assert.ok(
+              !dialogText.includes(label === expected.server ? expected.desktop : expected.server),
+            );
+            await trust.unmount();
+          }
+          const remote = await mod.mountElement(
+            mod.h(
+              mod.PlatformProvider,
+              { platform: { canOpenLocalFiles: false } },
+              mod.h(mod.ProjectFolderTrustDialog, {
+                request: {
+                  roots: ["/srv/repo"],
+                  deviceLabel: "build-box",
+                  restoring: false,
+                  resolve() {},
+                },
+                onClosed() {},
+              }),
+            ),
+          );
+          await settle(mod.act);
+          assert.ok(document.body.textContent.includes("build-box"));
+          assert.ok(!document.body.textContent.includes(expected.server));
+          await remote.unmount();
+        });
+      },
+    );
+  }
+
   await check("词表已移除 project.standaloneAutoRootHint，源码树 0 残留引用", async () => {
     const mod2 = mod;
     for (const [locale, table] of Object.entries(mod2.LOCALES)) {
@@ -840,12 +950,27 @@ async function runCapabilitySuite(schemaMod) {
         });
         return { result: await bootstrap(), calls };
       };
-      const ok = (body) => () => ({ ok: true, json: async () => body });
+      // 与真实 Response 对齐：bootstrap 现在同时读取 type / status / content-type 以确认登录态。
+      const respondWith = ({
+        ok = true,
+        status = 200,
+        type = "basic",
+        contentType,
+        body = {},
+      }) => ({
+        ok,
+        status,
+        type,
+        headers: { get: (name) => (name.toLowerCase() === "content-type" ? contentType : null) },
+        json: async () => body,
+      });
+      const ok = (body) => () => respondWith({ contentType: "application/json", body });
 
       const enabled = await run({ respond: ok(serverInfoBase({ managedWorktrees: true })) });
       assert.equal(enabled.result.managedWorktrees, true);
       assert.equal(enabled.result.initialWorkspaceAbsPath, "/workspace/app");
       assert.equal(enabled.result.wsUrl, "ws://h:1/ws");
+      assert.equal(enabled.result.initialAccessState, "ok", "JSON 200 表示登录态已确认");
 
       for (const caps of [{}, { managedWorktrees: false }, { managedWorktrees: "true" }]) {
         const { result } = await run({ respond: ok(serverInfoBase(caps)) });
@@ -854,21 +979,40 @@ async function runCapabilitySuite(schemaMod) {
       const noCapabilities = await run({ respond: ok({ workspaces: [] }) });
       assert.ok(!("managedWorktrees" in noCapabilities.result));
 
-      const notOk = await run({ respond: () => ({ ok: false, json: async () => ({}) }) });
-      assert.deepEqual(notOk.result, { wsUrl: "ws://h:1/ws" });
+      const notOk = await run({ respond: () => respondWith({ ok: false, status: 500 }) });
+      assert.deepEqual(notOk.result, { wsUrl: "ws://h:1/ws", initialAccessState: "unknown" });
+
+      // 登录态判定：网关 302、401、403 为 auth-required；非 JSON 的 200（如登录页 HTML）视为 unknown。
+      for (const [label, response] of [
+        ["opaqueredirect", { ok: false, status: 0, type: "opaqueredirect" }],
+        ["401", { ok: false, status: 401 }],
+        ["403", { ok: false, status: 403 }],
+      ]) {
+        const denied = await run({ respond: () => respondWith(response) });
+        assert.deepEqual(
+          denied.result,
+          { wsUrl: "ws://h:1/ws", initialAccessState: "auth-required" },
+          label,
+        );
+      }
+      const html = await run({ respond: () => respondWith({ contentType: "text/html" }) });
+      assert.deepEqual(html.result, { wsUrl: "ws://h:1/ws", initialAccessState: "unknown" });
 
       const thrown = await run({
         respond: () => {
           throw new Error("network down");
         },
       });
-      assert.deepEqual(thrown.result, { wsUrl: "ws://h:1/ws" });
+      assert.deepEqual(thrown.result, { wsUrl: "ws://h:1/ws", initialAccessState: "unknown" });
 
       const remote = await run({
         search: "?remote=abc",
         respond: ok(serverInfoBase({ managedWorktrees: true })),
       });
-      assert.deepEqual(remote.result, { wsUrl: "ws://h:1/ws/remote/abc" });
+      assert.deepEqual(remote.result, {
+        wsUrl: "ws://h:1/ws/remote/abc",
+        initialAccessState: "unknown",
+      });
       assert.deepEqual(remote.calls, [], "跨机代理不应读取本机 server-info");
     },
   );

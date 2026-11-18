@@ -38,6 +38,7 @@ import { DirectoryBrowser } from "@/DirectoryBrowser.js";
 import { useRemoteBoundaryAcknowledgement } from "@/RemoteConnectionDialogContent.js";
 import { useProjectDirectoryServices } from "@/project-sidebar/useProjectDirectoryServices.js";
 import { useConfirmDialog } from "@/hooks/useConfirmDialog.js";
+import { useIsServerHostedSettingsScope } from "@/hooks/useFileContextActions.js";
 import { useOptionalPlatform } from "@/hooks/usePlatform.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { getPathLeaf } from "@/lib/path.js";
@@ -149,6 +150,11 @@ export function ProjectEditor({
   // 独立云端 Web 由 standalone 装配显式开启多 root（allowStandaloneMultiRoot），可在网页内增删 root。
   const singleRootMode = remote;
   const msg = (id: string) => intl.formatMessage({ id: `project.${id}` });
+  // 独立 Web / 手机远控下“本地”设备实际是当前服务器 Host；桌面端保持“此电脑”。
+  const serverHosted = useIsServerHostedSettingsScope();
+  const localDeviceLabel = serverHosted
+    ? intl.formatMessage({ id: "settings.scope.server" })
+    : msg("thisComputer");
   const [name, setName] = useState(
     project?.name ?? (fixedFolder ? getPathLeaf(fixedFolder.path) : ""),
   );
@@ -521,7 +527,7 @@ export function ProjectEditor({
                           <DeviceOption
                             label={
                               selectedDeviceId === "local"
-                                ? msg("thisComputer")
+                                ? localDeviceLabel
                                 : (selectedDevice?.label ?? selectedDeviceId)
                             }
                             status={
@@ -534,7 +540,7 @@ export function ProjectEditor({
                       </SelectTrigger>
                       <SelectContent position="popper" className="w-(--radix-select-trigger-width)">
                         <SelectItem value="local" data-device-id="local" className={DEVICE_ITEM}>
-                          <DeviceOption label={msg("thisComputer")} />
+                          <DeviceOption label={localDeviceLabel} />
                         </SelectItem>
                         {devices.map((device) => (
                           <SelectItem

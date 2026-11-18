@@ -116,12 +116,13 @@ sequenceDiagram
 - `ProjectRepository` / `createProjectService` 透传 `allowStandaloneCloudWorkspaces` 与 `standaloneWorkspaceRoot`；`node.ts` 仅在 standalone server 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"` 时开启，root 取 `ZCODE_DEFAULT_WORKSPACE_DIR || /workspace`。
 - `prepareSession` 无 `projectId`：普通本地模式仍用原 `workspaceDirectory`；独立云端开启时用 `<root>/.zcode/conversations`，按 `draftId` 分配稳定目录（相同 `draftId` 幂等复用）。remote owner 未开启策略时仍抛 `project.remote-project-required`。
 - `saveProject` 0 目录项目（对齐官方桌面生命周期）：开启 `allowStandaloneMultiRoot` 的独立 Web 允许 `0..n` 个目录，0 目录新建时保留 `roots: []`（不提前在磁盘建目录，未填名称时使用干净默认名 `New project` / `defaultName`），编辑传入 `roots: []` 允许清空为 0 目录；首次 `prepareSession({ projectId })` 时通过 `initializeProjectRoot` 在 `<root>/.zcode/workspace/<projectId>` 懒创建并登记唯一 root。未开启 `allowStandaloneMultiRoot` 的普通远端仍要求恰好 1 个不可变 root（`project.remote-single-root-required` / `project.remote-root-immutable`）。独立 Web 的多 root 能力与任务移动增补 root 见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
-- 前端：非项目草稿绑定稳定 `draftId`，切换时显式 `projectId: null` 并保留转移中的草稿（无项目草稿目录保持 `<root>/.zcode/conversations/draft-<draftId>`）；`ProjectEditor` 对真实远端仍限制为单 root（选择目录最多保留 1 个、既有项目 root 固定不可移除），独立 Web 对齐官方桌面删除 `standaloneAutoRootHint` 提示，允许增删多个 root、0 目录新建项目以及编辑已有项目移除最后一个目录回到 0 目录状态（首次 `prepareSession` 懒创建 `<root>/.zcode/workspace/<projectId>`）；`formatProjectError` 为三个错误码提供可读国际化文案，不向用户暴露原始错误码。
+- 前端：非项目草稿绑定稳定 `draftId`，切换时显式 `projectId: null` 并保留转移中的草稿（无项目草稿目录保持 `<root>/.zcode/conversations/draft-<draftId>`）；已绑定的草稿目录在磁盘上被移走或清理（`ENOENT`）时，`packages/services/src/project/index.ts` 对 `reuseDraft: true` 分支返回稳定业务错误码 `project.draft-workspace-missing`（不静默重建），`useRootWorkspaceActions.ts` 与 `useConversationWorkspaceActions.ts` 捕获该错误时须先确认当前导航未过时且无在途首发 `commandId`，再调用 `composerDraftStore.ts` 的 `rotateMissingPendingTaskDraft`（先校验 `current` 与 `commandId`，即使被其他入口换绑也先拦截在途命令），并以当前绑定状态 `reuseDraft: Boolean(rotatedDraft.workspacePath)` 幂等重试 `prepareSession`（不强制 `reuseDraft: false` 重建已被删除的目录），异步回包后核验导航与草稿所有权（`readPendingTaskDraft(scope)?.draftId === pendingDraft.draftId`）才写回绑定或导航；当无项目草稿菜单（`resolveConversationWorkspaceTarget`）位于当前受管 `pendingDraft` 路径时同样不绕过 `prepareSession`，真实历史非项目会话快捷路径继续保留；输入框正文草稿按 `ComposerScope` 保存并在换绑后完整保留；`ProjectEditor` 对真实远端仍限制为单 root（选择目录最多保留 1 个、既有项目 root 固定不可移除），独立 Web 对齐官方桌面删除 `standaloneAutoRootHint` 提示，允许增删多个 root、0 目录新建项目以及编辑已有项目移除最后一个目录回到 0 目录状态（首次 `prepareSession` 懒创建 `<root>/.zcode/workspace/<projectId>`）；`formatProjectError` 为三个错误码提供可读国际化文案，不向用户暴露原始错误码。
 
-### 补充项：任务菜单文件入口
+### 补充项：任务菜单文件入口与项目设备名称
 
 - 独立 Web 侧栏任务菜单（列表视图与分组视图）将桌面本地文件管理器入口替换为复用官方 `openTaskFiles` 的「显示文件树」（定位任务 `cwd` 并打开右侧文件栏），顶栏任务菜单与手机远控隐藏该项。
 - 「前往 Provider 配置」在无本机文件打开能力（`!canOpenLocalFiles`）时统一隐藏，避免独立 Web 下点击无反馈。
+- **项目本地设备文案对齐“当前服务器”**：在服务端承载环境（`useIsServerHostedSettingsScope()` 为 `true`，覆盖独立 Web 与手机远控）下，`ProjectEditor.tsx`（新建/编辑项目设备选择）、`ProjectManagementRow.tsx`（项目管理列表 `DeviceTag`）、`ProjectFolderTrustDialog.tsx`（工作区文件夹信任弹窗）与 `ProjectComposerMenu.tsx`（输入框项目选择菜单）四处将本地设备文案从“此电脑”（`project.thisComputer`）统一显示为“当前服务器”（`settings.scope.server`）；桌面端保持“此电脑”不变，远端设备名称原样展示。
 
 ## 验收场景
 
@@ -135,7 +136,7 @@ sequenceDiagram
 
 **Area B**
 
-6. 开启策略时无 `projectId` 的 `prepareSession({draftId})` 在 `<root>/.zcode/conversations` 下分配稳定目录，相同 `draftId` 幂等复用；`reserveCreatedTask` / `resolveDirectories` 允许 `projectId:null` 且 `additionalDirectories:[]`。
+6. 开启策略时无 `projectId` 的 `prepareSession({draftId})` 在 `<root>/.zcode/conversations` 下分配稳定目录，相同 `draftId` 幂等复用；当已绑定的 `draft-<draftId>` 目录在磁盘上缺失时，`prepareSession({ draftId, reuseDraft: true })` 返回 `project.draft-workspace-missing`，前端先校验当前导航与在途 `commandId` 再通过 `rotateMissingPendingTaskDraft` 换绑，并以 `reuseDraft: Boolean(rotatedDraft.workspacePath)` 幂等重试及核验异步结果所有权，命中当前受管 `pendingDraft` 路径的无项目草稿菜单不绕过 `prepareSession`（真实历史非项目会话快捷路径保留），同时完整保留输入框草稿文字；`reserveCreatedTask` / `resolveDirectories` 允许 `projectId:null` 且 `additionalDirectories:[]`。
 7. 0 目录新建项目保存为 `roots: []`（磁盘未提前建目录、默认名干净），编辑传入 `roots: []` 可清空为 0 目录；首次 `prepareSession({ projectId })` 在 `<root>/.zcode/workspace/<projectId>` 懒创建并登记工作目录；未开启 `allowStandaloneMultiRoot` 时多于 1 目录抛 `project.remote-single-root-required`、改既有 root 抛 `project.remote-root-immutable`。独立 Web 多 root 与移动增补 root 的验收见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
 8. 未开启策略的普通远端 owner 仍抛 `project.remote-project-required` 与 `project.remote-single-root-required`；跨 Host 仍被拒绝。
 9. 既有独立 Web host alias 与连接恢复补丁仍生效；仅替换 ZCode 镜像，AGM、Access checker、Caddy 与其他服务不变。

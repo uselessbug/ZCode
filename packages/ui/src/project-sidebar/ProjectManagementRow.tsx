@@ -13,6 +13,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/components/lib/utils.js";
 import { REMOTE_KIND_PRESENTATION } from "@/remote-connection/RemoteConnectionTags.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+import { useIsServerHostedSettingsScope } from "@/hooks/useFileContextActions.js";
 import {
   formatCountMessage,
   type ProjectManagementRow,
@@ -48,10 +49,13 @@ export function useRelativeTime() {
 
 export function DeviceTag({ host, label }: { host?: RemoteProjectHost; label?: string }) {
   const { intl } = useZCodeIntl();
+  const serverHosted = useIsServerHostedSettingsScope();
   if (!host)
     return (
       <span className="truncate text-ui-sm text-foreground-subtle">
-        {intl.formatMessage({ id: "project.thisComputer" })}
+        {intl.formatMessage({
+          id: serverHosted ? "settings.scope.server" : "project.thisComputer",
+        })}
       </span>
     );
   const presentation = host.kind === "server" ? undefined : REMOTE_KIND_PRESENTATION[host.kind];
@@ -155,6 +159,7 @@ export function ProjectManagementListRow({
   onRemove(): void;
 }) {
   const { intl } = useZCodeIntl();
+  const serverHosted = useIsServerHostedSettingsScope();
   const relative = useRelativeTime();
   const msg = (id: string, values?: Record<string, string | number>) =>
     intl.formatMessage({ id: `projectManagement.${id}` }, values);
@@ -228,7 +233,11 @@ export function ProjectManagementListRow({
             {row.host ? (
               <DeviceTag host={row.host} label={row.deviceLabel} />
             ) : (
-              <span>{intl.formatMessage({ id: "project.thisComputer" })}</span>
+              <span>
+                {intl.formatMessage({
+                  id: serverHosted ? "settings.scope.server" : "project.thisComputer",
+                })}
+              </span>
             )}
             <span aria-hidden="true">·</span>
             <span>

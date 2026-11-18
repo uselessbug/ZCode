@@ -178,11 +178,12 @@ export function createWebPlatform(options?: {
     onWebNotificationStateChanged: notifications.onWebNotificationStateChanged,
     requestWebNotificationPermission: notifications.requestWebNotificationPermission,
     ...(platformProxy ? {} : { setWebPushSubscribed: notifications.setWebPushSubscribed }),
-    // Web 端不需要跨窗口 tab 管理
-    syncWindowTabs: () => {},
+    // Web 端没有跨窗口 tab 管理；这里只把本页的工作区快照交给通知控制器，用于通知点击路由
+    syncWindowTabs: notifications.syncWindowTabs,
     // Web 端没有宿主层 Dock / 任务栏徽标，保持空实现以兼容统一平台接口
     syncWindowUnreadCount: () => {},
-    syncActiveTaskSession: () => {},
+    // 本页正在查看的任务，用于按任务精确判断是否需要打扰
+    syncActiveTaskSession: notifications.syncActiveTaskSession,
     onFocusTab: () => () => {},
     onNewTab: () => () => {},
     onCloseActiveContextRequest: () => () => {},
