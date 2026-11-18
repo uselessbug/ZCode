@@ -1892,6 +1892,33 @@ modules:
     layers:
       adapters: .
     owner: agent
+  # web-push-shared：Web 通知与 Web Push 共享协议、tag 规则与文案格式
+  - id: web-push-shared
+    roots:
+      - packages/shared/src/web-push
+    managed: true
+    requires: []
+    publicEntrypoints:
+      - packages/shared/src/web-push/index.ts
+      - packages/shared/src/web-push/contract.ts
+    layers:
+      domain: .
+    owner: web
+  # web-push：独立 HTTP Host 的 VAPID 与 RFC 8291 加密投递服务
+  - id: web-push
+    roots:
+      - packages/services/src/web-push
+    managed: true
+    requires:
+      - services
+      - shared
+      - web-push-shared
+    publicEntrypoints:
+      - packages/services/src/web-push/index.ts
+      - packages/services/src/web-push/contract.ts
+    layers:
+      adapters: .
+    owner: web
 
 global:
   # 临时时间戳（2026-09-10）：unmanaged-new-file 只约束此日期之后首次入库的文件。

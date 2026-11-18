@@ -25,6 +25,7 @@ export class AutomationPermanentDispatchError extends Error {
 
 export interface AutomationDispatchRequest {
   automationId: string;
+  automationTitle?: string;
   runId: string;
   prompt: string;
   targetTaskId?: string;
@@ -37,6 +38,18 @@ export interface AutomationDispatchRequest {
   additionalDirectories?: string[];
 }
 
+export interface AutomationRunNotificationEvent {
+  kind: "automation_completed" | "automation_failed";
+  runId: string;
+  automationId: string;
+  automationTitle?: string;
+  detail?: string;
+  sessionId?: string;
+  workspacePath: string;
+  workspaceIdentity?: string;
+  occurredAt?: number;
+}
+
 export type AutomationDispatchSettlement =
   | {
       ok: true;
@@ -47,6 +60,7 @@ export type AutomationDispatchSettlement =
       ok: false;
       error: string;
       failureKind?: "transient" | "permanent";
+      sessionId?: string;
     };
 
 export interface AutomationTimersPort {
@@ -131,6 +145,7 @@ export interface AutomationTaskServicePort {
       inputId?: string;
       outcome: "succeeded" | "failed" | "stopped";
       error?: string;
+      interrupted?: boolean;
     }) => void,
   ) => {
     dispose: () => void;
@@ -202,7 +217,7 @@ export interface AutomationRepoPort {
       kind: "transient" | "permanent";
       nextRunAt?: number | null;
     },
-  ) => Promise<void>;
+  ) => Promise<void | { terminal?: boolean }>;
   markRunOutcome: (
     runId: string,
     outcome: ZCodeAutomationRunOutcome,

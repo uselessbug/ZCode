@@ -138,6 +138,7 @@ export * from "./dynamic-workflow-feature.js";
 export * from "./markdown-artifact-images.js";
 export * from "./serviceAuthority.js";
 export * from "./server-remote.js";
+export * from "./web-push/index.js";
 export * from "./source-server/index.js";
 
 export interface ICredentialStore {

@@ -29,7 +29,18 @@ import {
   IManagedWorktreeService,
   IProviderProvisioningTargetService,
   IProjectService,
+  IWebPushService,
+  WebPushValidationError,
 } from "@zcode/services";
+import {
+  WEB_PUSH_API_CONFIG_PATH,
+  WEB_PUSH_API_SUBSCRIPTIONS_PATH,
+  WEB_PUSH_API_UNSUBSCRIBE_PATH,
+  WEB_PUSH_MANIFEST_PATH,
+  WEB_PUSH_SERVICE_WORKER_PATH,
+  webPushSubscribeRequestSchema,
+  webPushUnsubscribeRequestSchema,
+} from "@zcode/shared/web-push";
 import {
   botProviders,
   buildServerRemoteWorkspaceIdentity,
@@ -221,6 +232,10 @@ function setupChannelServer(
       createStandaloneProjectAlias(projectService, ownerHostId),
     );
   }
+  if (services.getOptional(IWebPushService)) {
+    // Web Push 管理只走同源鉴权 HTTP API，不允许 WebSocket RPC 触发内部推送或关闭服务。
+    overrides.set(IWebPushService.channelName, {});
+  }
   services.exposeOnChannelServer(server, overrides);
   socket.onClose(() => {
     peer?.dispose();
@@ -311,6 +326,7 @@ const staticMimeTypes: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".txt": "text/plain; charset=utf-8",
   ".wasm": "application/wasm",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".webp": "image/webp",
   ".woff": "font/woff",
   ".woff2": "font/woff2",
@@ -359,7 +375,72 @@ function isTokenProtectedPath(pathname: string): boolean {
 }
 
 function isStaticFallbackAllowed(pathname: string): boolean {
+  if (pathname === WEB_PUSH_SERVICE_WORKER_PATH || pathname === WEB_PUSH_MANIFEST_PATH) {
+    return false;
+  }
   return !isTokenProtectedPath(pathname);
+}
+
+function isNoCacheStaticAsset(filePath: string): boolean {
+  const fileName = basename(filePath);
+  return (
+    fileName === "index.html" ||
+    fileName === basename(WEB_PUSH_SERVICE_WORKER_PATH) ||
+    fileName === basename(WEB_PUSH_MANIFEST_PATH)
+  );
+}
+
+function isSameOriginRequest(c: Context): boolean {
+  const originHeader = c.req.header("origin")?.trim();
+  if (!originHeader) {
+    return true;
+  }
+  let originUrl: URL;
+  try {
+    originUrl = new URL(originHeader);
+  } catch {
+    return false;
+  }
+  if (
+    (originUrl.protocol !== "http:" && originUrl.protocol !== "https:") ||
+    originUrl.username ||
+    originUrl.password
+  ) {
+    return false;
+  }
+  const reqUrl = new URL(c.req.url);
+  const forwardedProto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
+  let effectiveProtocol: "http:" | "https:";
+  if (forwardedProto) {
+    if (forwardedProto !== "http" && forwardedProto !== "https") {
+      return false;
+    }
+    effectiveProtocol = `${forwardedProto}:`;
+  } else if (reqUrl.protocol === "http:" || reqUrl.protocol === "https:") {
+    effectiveProtocol = reqUrl.protocol;
+  } else {
+    return false;
+  }
+  if (originUrl.protocol !== effectiveProtocol) {
+    return false;
+  }
+  const rawHost = c.req.header("host")?.trim() || reqUrl.host;
+  if (!rawHost || /[\s/@?#]/.test(rawHost)) {
+    return false;
+  }
+  let hostUrl: URL;
+  try {
+    hostUrl = new URL(`${effectiveProtocol}//${rawHost}`);
+  } catch {
+    return false;
+  }
+  if (hostUrl.username || hostUrl.password) {
+    return false;
+  }
+  return (
+    originUrl.hostname.toLowerCase() === hostUrl.hostname.toLowerCase() &&
+    originUrl.port === hostUrl.port
+  );
 }
 
 // 盘符路径（"Z:/x"、"Z:\x"、"Z:x"）在 Windows 的 path.resolve 下会被当作绝对/盘符相对
@@ -542,6 +623,60 @@ export function createHttpServer(
   app.post("/api/bots/:provider", handleBotCallback);
   app.post("/api/bots/:provider/:botId", handleBotCallback);
 
+  app.get(WEB_PUSH_API_CONFIG_PATH, async (c) => {
+    const webPushService = services.getOptional(IWebPushService);
+    if (!webPushService) {
+      return c.json({ enabled: false, vapidPublicKey: null }, 200);
+    }
+    return c.json(await webPushService.getConfig(), 200);
+  });
+
+  app.post(WEB_PUSH_API_SUBSCRIPTIONS_PATH, async (c) => {
+    if (!isSameOriginRequest(c)) {
+      return c.json({ error: "Forbidden cross-origin request" }, 403);
+    }
+    const webPushService = services.getOptional(IWebPushService);
+    if (!webPushService) {
+      return c.json({ error: "Web push service is not available." }, 503);
+    }
+    const rawBody = await c.req.json().catch(() => null);
+    const parsed = webPushSubscribeRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json(
+        { error: "Invalid push subscription request", issues: parsed.error.flatten() },
+        400,
+      );
+    }
+    try {
+      const result = await webPushService.upsertSubscription(parsed.data);
+      return c.json(result, 200);
+    } catch (error) {
+      if (error instanceof WebPushValidationError) {
+        return c.json({ error: error.message }, 400);
+      }
+      throw error;
+    }
+  });
+
+  app.post(WEB_PUSH_API_UNSUBSCRIBE_PATH, async (c) => {
+    if (!isSameOriginRequest(c)) {
+      return c.json({ error: "Forbidden cross-origin request" }, 403);
+    }
+    const webPushService = services.getOptional(IWebPushService);
+    if (!webPushService) {
+      return c.json({ error: "Web push service is not available." }, 503);
+    }
+    const rawBody = await c.req.json().catch(() => null);
+    const parsed = webPushUnsubscribeRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json(
+        { error: "Invalid push unsubscribe request", issues: parsed.error.flatten() },
+        400,
+      );
+    }
+    return c.json(await webPushService.removeSubscription(parsed.data.endpoint), 200);
+  });
+
   // Bug 原因：旧 `/api/connect-remote` + `/ws/remote/:id` 会在 Server 内另起临时 stdio
   // runtime，绕过 R3 的 Window Host → Source Server attachment 主链；两个入口必须一起不可达。
 
@@ -554,7 +689,7 @@ export function createHttpServer(
         return c.notFound();
       }
       return c.body(await readFile(filePath), 200, {
-        "Cache-Control": filePath.endsWith("index.html")
+        "Cache-Control": isNoCacheStaticAsset(filePath)
           ? "no-cache"
           : "public, max-age=31536000, immutable",
         "Content-Type": staticContentType(filePath),

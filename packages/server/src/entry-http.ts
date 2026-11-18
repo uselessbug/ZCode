@@ -64,6 +64,7 @@ async function main(): Promise<void> {
       providerProvisioningTargetEnabled: Boolean(authToken),
       browserControlExecutor: browserControl?.executor,
       automationExecutionEnabled: true,
+      webPushEnabled: true,
     });
     services = created.services;
     server = createHttpServer(services, port, {

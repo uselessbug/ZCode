@@ -15,6 +15,7 @@ import type {
   AutomationLoggerPort,
   AutomationRepoPort,
   AutomationRunExecutorTargetServices,
+  AutomationRunNotificationEvent,
   AutomationTaskServicePort,
   AutomationTimersPort,
 } from "./contract.js";
@@ -103,6 +104,11 @@ export interface CreateAutomationExecutorOptions {
     messageId: TraceId;
     workspaceIdentity?: string;
   }) => void;
+  onTurnDispatched?: (event: { sessionId: string; runId: string }) => void;
+  onTurnCleared?: (event: { sessionId: string; runId: string }) => void;
+  onRunSettled?: (event: AutomationRunNotificationEvent) => void;
+  emitDispatchRunFailureNotification?: boolean;
+  onDispatchSessionResolved?: (event: { runId: string; sessionId: string }) => void;
   onManualClaimReleased?: () => void;
   logger: Pick<AutomationLoggerPort, "info" | "warn">;
   timers?: AutomationTimersPort;
@@ -178,6 +184,7 @@ export function createAutomationExecutor(
     workspaceIdentity?: string;
     runId: string;
     automationId: string;
+    automationTitle?: string;
     workspaceKey: string;
     scheduledAt: number | null;
     trigger: "schedule" | "manual";
@@ -198,6 +205,23 @@ export function createAutomationExecutor(
             onManualClaimReleased: options.onManualClaimReleased,
           }),
         );
+        if (
+          (result.outcome === "succeeded" && !result.interrupted) ||
+          result.outcome === "failed"
+        ) {
+          options.onRunSettled?.({
+            kind: result.outcome === "succeeded" ? "automation_completed" : "automation_failed",
+            runId: params.runId,
+            automationId: params.automationId,
+            ...(params.automationTitle ? { automationTitle: params.automationTitle } : {}),
+            ...(result.error ? { detail: result.error } : {}),
+            sessionId: params.taskId,
+            workspacePath: params.workspacePath,
+            ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+          });
+        } else {
+          options.onTurnCleared?.({ sessionId: params.taskId, runId: params.runId });
+        }
         // 定时任务在后台完成后统一置为未读，真正打开 task 时再由导航链路清除。
         void params.zcodeTaskService.setTaskUnread({
           taskId: params.taskId,
@@ -229,6 +253,10 @@ export function createAutomationExecutor(
 
   const dispatchRunCore = async (
     request: AutomationDispatchRequest,
+    dispatchOptions?: {
+      emitRunFailedOnThrow?: boolean;
+      onSessionResolved?: (sessionId: string) => void;
+    },
   ): Promise<{ taskId: string; sessionId: string }> => {
     if (disposing || disposed) {
       throw new Error("Automation executor is disposed.");
@@ -254,6 +282,8 @@ export function createAutomationExecutor(
       resolvedSubmissionModelSelection,
     );
     let trackedKey: string | null = null;
+    let dispatchedTurnSessionId: string | null = null;
+    let resolvedSessionId: string | undefined = request.targetTaskId;
     const trigger = request.runId.includes(":manual:") ? "manual" : "schedule";
     const scheduledAt = parseCronRunScheduledAt(request.runId, request.automationId);
     try {
@@ -269,6 +299,9 @@ export function createAutomationExecutor(
             thoughtLevel: submissionModelSelection.options?.reasoningLevel,
             automationId: request.automationId,
           });
+      resolvedSessionId = task.taskId;
+      dispatchOptions?.onSessionResolved?.(task.taskId);
+      options.onDispatchSessionResolved?.({ runId: request.runId, sessionId: task.taskId });
       // 建会话 trace 与执行 runId 是两种身份；两条派发路径的 prompt 都必须统一使用 runId。
       const promptTraceId = request.runId as TraceId;
       if (request.targetTaskId) {
@@ -323,10 +356,13 @@ export function createAutomationExecutor(
         workspaceIdentity: request.workspaceIdentity,
         runId: request.runId,
         automationId: request.automationId,
+        automationTitle: request.automationTitle,
         workspaceKey,
         scheduledAt,
         trigger,
       });
+      dispatchedTurnSessionId = task.taskId;
+      options.onTurnDispatched?.({ sessionId: task.taskId, runId: request.runId });
       await zcodeTaskService.sendPrompt({
         taskId: task.taskId,
         traceId: promptTraceId,
@@ -344,6 +380,10 @@ export function createAutomationExecutor(
       return { taskId: task.taskId, sessionId: task.taskId };
     } catch (error) {
       if (trackedKey) disposeCronRunSubscription(trackedKey);
+      if (dispatchedTurnSessionId) {
+        options.onTurnCleared?.({ sessionId: dispatchedTurnSessionId, runId: request.runId });
+      }
+      const errorMessage = error instanceof Error ? error.message : String(error);
       markCronRunOutcome({
         runId: request.runId,
         automationId: request.automationId,
@@ -351,8 +391,24 @@ export function createAutomationExecutor(
         scheduledAt,
         trigger,
         outcome: "failed",
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
       });
+      if (
+        dispatchOptions?.emitRunFailedOnThrow ??
+        options.emitDispatchRunFailureNotification ??
+        true
+      ) {
+        options.onRunSettled?.({
+          kind: "automation_failed",
+          runId: request.runId,
+          automationId: request.automationId,
+          ...(request.automationTitle ? { automationTitle: request.automationTitle } : {}),
+          detail: errorMessage,
+          ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
+          workspacePath: request.workspacePath,
+          ...(request.workspaceIdentity ? { workspaceIdentity: request.workspaceIdentity } : {}),
+        });
+      }
       throw error;
     }
   };
@@ -371,20 +427,30 @@ export function createAutomationExecutor(
         `direct manual automation dispatch started automation=${params.automation.automationId} runId=${params.run.runId}`,
       );
       let result: { taskId: string; sessionId: string };
+      let resolvedSessionId: string | undefined = params.automation.targetTaskId;
       try {
-        result = await dispatchRunCore({
-          automationId: params.automation.automationId,
-          runId: params.run.runId,
-          prompt: params.automation.prompt,
-          targetTaskId: params.automation.targetTaskId,
-          modelSelection: params.run.modelSelection ?? params.automation.modelSelection,
-          mode: params.automation.mode,
-          workspacePath: params.automation.workspacePath,
-          workspaceIdentity: params.automation.workspaceIdentity,
-          projectId: params.automation.projectId,
-          hostId: params.automation.hostId,
-          additionalDirectories: params.automation.additionalDirectories,
-        });
+        result = await dispatchRunCore(
+          {
+            automationId: params.automation.automationId,
+            ...(params.automation.title ? { automationTitle: params.automation.title } : {}),
+            runId: params.run.runId,
+            prompt: params.automation.prompt,
+            targetTaskId: params.automation.targetTaskId,
+            modelSelection: params.run.modelSelection ?? params.automation.modelSelection,
+            mode: params.automation.mode,
+            workspacePath: params.automation.workspacePath,
+            workspaceIdentity: params.automation.workspaceIdentity,
+            projectId: params.automation.projectId,
+            hostId: params.automation.hostId,
+            additionalDirectories: params.automation.additionalDirectories,
+          },
+          {
+            emitRunFailedOnThrow: false,
+            onSessionResolved: (sessionId) => {
+              resolvedSessionId = sessionId;
+            },
+          },
+        );
       } catch (error) {
         logger.warn(
           `direct manual automation dispatch failed automation=${params.automation.automationId} runId=${params.run.runId}:`,
@@ -399,6 +465,18 @@ export function createAutomationExecutor(
           trigger: "manual",
           dispatchError: error,
           logWarn: (message, releaseError) => logger.warn(message, releaseError),
+        });
+        options.onRunSettled?.({
+          kind: "automation_failed",
+          runId: params.run.runId,
+          automationId: params.automation.automationId,
+          ...(params.automation.title ? { automationTitle: params.automation.title } : {}),
+          detail: error instanceof Error ? error.message : String(error),
+          ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
+          workspacePath: params.automation.workspacePath,
+          ...(params.automation.workspaceIdentity
+            ? { workspaceIdentity: params.automation.workspaceIdentity }
+            : {}),
         });
         throw error;
       }

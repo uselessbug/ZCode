@@ -3240,11 +3240,13 @@ export function createZCodeTaskServiceAdapter(
             workspaceIdentity: terminal.target.workspaceIdentity,
           };
           const inputId = activePromptInputIds.get(taskKey(target));
-          listener({
+          const payload: ZCodeTaskTerminalOutcome & { interrupted?: boolean } = {
             taskId,
             ...(inputId ? { inputId } : {}),
             outcome: terminal.kind === "turn.failed" ? "failed" : "succeeded",
-          });
+            ...(terminal.interrupted ? { interrupted: true } : {}),
+          };
+          listener(payload);
         });
     },
 

@@ -58,6 +58,12 @@ import {
 } from "#src/task-groups/index.js";
 import { IGenUiService } from "./gen-ui/contract.js";
 import { createGenUiService } from "./gen-ui/node.js";
+import {
+  IWebPushService,
+  createWebPushService,
+  type CreateWebPushServiceOptions,
+} from "./web-push/index.js";
+export { createWebPushService, type CreateWebPushServiceOptions } from "./web-push/index.js";
 // import { channelReplyHostRequestSchema, channelReplyResultSchema } from "@zcode/shared";
 /* eslint-disable max-lines -- host process 服务注册和启动装配需要集中维护，拆散后会更难追踪依赖注入顺序 */
 // Node.js service implementations — NOT safe to import in browser code
@@ -531,6 +537,7 @@ import { createCredentialService } from "./credential/credentialService.js";
 import { createBroadcastService } from "./broadcast/broadcastService.js";
 import {
   createZCodeAgentService,
+  getInProcessPendingInteractionDetail,
   getInProcessPluginUserOptionsReader,
 } from "./zcode-agent/zcodeAgentService.js";
 import type { PluginUserOptionsReader } from "./zcode-agent/pluginHostQueriesClient.js";
@@ -1437,6 +1444,8 @@ export function createLocalServices(options: {
   cuaOperationStateReporter?: CuaOperationStateReporter;
   /** standalone-server 默认 5 分钟空闲回收插件控制面进程；测试可注入短超时。 */
   pluginManagementIdleTimeoutMs?: number;
+  /** 仅独立 HTTP Host 注入标准 Web Push 服务实例，桌面端保持未注入。 */
+  webPushService?: IWebPushService;
 }): ServiceCollection {
   const isDesktopAttachedRemote = options?.serviceAuthorityMode === "desktop-attached-remote";
   // host / remote server 以前直接沿用当前进程环境启动后续服务。
@@ -2636,6 +2645,12 @@ export function createLocalServices(options: {
     }
   };
   const worktreeRemovalGate = createWorktreeRemovalGate();
+  let resolveSessionSummaryRef:
+    | ((
+        workspace: { workspacePath: string; workspaceIdentity?: string },
+        sessionId: string,
+      ) => ReturnType<ReturnType<typeof createZCodeTaskIndexSyncer>["getSessionSummary"]>)
+    | undefined;
   const zcodeAgentService = createZCodeAgentService({
     credentialCipherProvider,
     runSessionOperation: (target, operation) =>
@@ -2850,6 +2865,15 @@ export function createLocalServices(options: {
           },
         }
       : {}),
+    ...(options?.webPushService
+      ? {
+          webPushService: options.webPushService,
+          resolveSessionSummary: (
+            workspace: { workspacePath: string; workspaceIdentity?: string },
+            sessionId: string,
+          ) => resolveSessionSummaryRef?.(workspace, sessionId),
+        }
+      : {}),
     // 设置页的 HTTP 代理、No Proxy + 自定义 CA 按 spawn 时读取注入 agent 子进程 env，
     // 覆盖模型 API / MCP / Bash 出口流量并信任用户显式配置的证书；改动后下次启动 agent 生效。
     resolveSpawnEnv: async (context) => {
@@ -2970,7 +2994,15 @@ export function createLocalServices(options: {
     agentService: zcodeAgentService,
     taskIndexRepo,
     browserControlExecutor: options?.browserControlExecutor,
+    ...(options?.webPushService
+      ? {
+          webPushService: options.webPushService,
+          resolveInteractionDetail: (interactionId) =>
+            getInProcessPendingInteractionDetail(zcodeAgentService, interactionId),
+        }
+      : {}),
   });
+  resolveSessionSummaryRef = zcodeTaskIndexSyncer.getSessionSummary;
   const autoArchiveLogger = createServiceLogger("task-auto-archive");
   // 自动归档只由这里的定时扫描触发（启动首轮 + 每小时 + 设置变更补扫）；readTree 与任务点击
   // 都不再执行 archiveInactive。判据仍排除 syncer 观察到的非终态会话，不为扫描启动 CLI。
@@ -3667,6 +3699,9 @@ export function createLocalServices(options: {
   services
     .register(IProviderSettingsService, providerRuntime.providerSettings)
     .register(IModelSelectionService, providerRuntime.modelSelection);
+  if (options?.webPushService) {
+    services.register(IWebPushService, options.webPushService);
+  }
   if (isDesktopAttachedRemote || options.providerProvisioningTargetEnabled === true) {
     services.register(
       IProviderProvisioningTargetService,
@@ -3751,6 +3786,19 @@ export function createLocalServices(options: {
         warn: (message, error) => automationRuntimeLogger.warn(undefined, message, { error }),
         error: (message, error) => automationRuntimeLogger.error(undefined, message, { error }),
       },
+      ...(options?.webPushService
+        ? {
+            onTurnDispatched: ({ sessionId, runId }) => {
+              options.webPushService?.markAutomationOwnedSessionTurn?.(sessionId, runId);
+            },
+            onTurnCleared: ({ sessionId, runId }) => {
+              options.webPushService?.clearAutomationOwnedSessionTurn?.(sessionId, runId);
+            },
+            onRunSettled: (event) => {
+              options.webPushService?.notifyAutomationEvent(event);
+            },
+          }
+        : {}),
       ...(options.serviceAuthorityMode === "standalone-server" &&
       options.projectStorageHostId &&
       options.projectStorageHostId !== "local"
@@ -3912,6 +3960,10 @@ export function disposeServiceResources(services: ServiceCollection): void {
   taskAutoArchiveDisposers.get(services)?.();
   taskAutoArchiveDisposers.delete(services);
   managedHostApiNetworkTransports.get(services)?.dispose();
+  const webPush = services.getOptional(IWebPushService);
+  if (webPush) {
+    void webPush.dispose().catch(() => {});
+  }
 }
 
 export async function disposeServiceResourcesAndWait(services: ServiceCollection): Promise<void> {
@@ -3968,6 +4020,10 @@ export async function disposeServiceResourcesAndWait(services: ServiceCollection
     .get(services)
     ?.disposeAndWait()
     .catch(() => {});
+  const webPush = services.getOptional(IWebPushService);
+  if (webPush) {
+    await webPush.dispose().catch(() => {});
+  }
 }
 
 /** 所有应用入口在开放 RPC / 调度器前等待；失败不启动业务写者。 */
@@ -4015,6 +4071,9 @@ export async function createServerHostServices(options: {
   /** 默认 false；仅独立 HTTP 入口开启，避免 Desktop-attached remote 误起第二调度器。 */
   automationExecutionEnabled?: boolean;
   pluginManagementIdleTimeoutMs?: number;
+  /** 默认 false；仅独立 HTTP 入口开启标准 Web Push 服务。 */
+  webPushEnabled?: boolean;
+  webPushOptions?: CreateWebPushServiceOptions;
 }) {
   // 无桌面环境不能等到首次登录或 Provisioning 才发现系统库缺失。
   const credentialCipherProvider =
@@ -4056,6 +4115,8 @@ export async function createServerHostServices(options: {
   const migrationFailedPathCount = await workspaceAliasRepo.getFailedPathCount();
   // 独立云端 Web 兼容开关：只在显式配置时开放非项目工作模式与 0 目录项目自动 root。
   const standaloneWebCompat = process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1";
+  const webPushService =
+    options.webPushEnabled === true ? createWebPushService(options.webPushOptions) : undefined;
   const services = createLocalServices({
     credentialCipherProvider,
     zcodeBuiltinProviderConfigFilePath: options.zcodeBuiltinProviderConfigFilePath,
@@ -4070,6 +4131,7 @@ export async function createServerHostServices(options: {
     allowStandaloneMultiRoot: standaloneWebCompat,
     browserControlExecutor: options.browserControlExecutor,
     automationExecutionEnabled: options.automationExecutionEnabled === true,
+    ...(webPushService ? { webPushService } : {}),
     ...(options.pluginManagementIdleTimeoutMs !== undefined
       ? { pluginManagementIdleTimeoutMs: options.pluginManagementIdleTimeoutMs }
       : {}),

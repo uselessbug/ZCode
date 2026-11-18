@@ -7,6 +7,7 @@ import {
   type AutomationLoggerPort,
   type AutomationRepoPort,
   type AutomationRunExecutorTargetServices,
+  type AutomationRunNotificationEvent,
   type AutomationRuntimeHandle,
   type AutomationTimersPort,
 } from "./contract.js";
@@ -29,6 +30,9 @@ export interface CreateAutomationRuntimeOptions {
     messageId: string;
     workspaceIdentity?: string;
   }) => void;
+  onTurnDispatched?: (event: { sessionId: string; runId: string }) => void;
+  onTurnCleared?: (event: { sessionId: string; runId: string }) => void;
+  onRunSettled?: (event: AutomationRunNotificationEvent) => void;
   /** standalone-server 传入权威 Host 身份解析，开启启动对齐与派发前归属校验。 */
   standaloneAuthority?: {
     projectStorageHostId: string;
@@ -58,11 +62,19 @@ export function createAutomationRuntime(
         })
     : undefined;
 
+  const resolvedSessionIdByRunId = new Map<string, string>();
   const executor = createAutomationExecutor({
     repo,
     resolveTargetServices: options.resolveTargetServices,
     assertAutomationOwned,
     onSessionCreated: options.onSessionCreated,
+    onTurnDispatched: options.onTurnDispatched,
+    onTurnCleared: options.onTurnCleared,
+    onRunSettled: options.onRunSettled,
+    emitDispatchRunFailureNotification: false,
+    onDispatchSessionResolved: ({ runId, sessionId }) => {
+      resolvedSessionIdByRunId.set(runId, sessionId);
+    },
     onManualClaimReleased: () => schedulerRef?.wake(),
     logger,
     timers: options.timers,
@@ -76,14 +88,18 @@ export function createAutomationRuntime(
     misfireGraceMs: options.misfireGraceMs,
     timers: options.timers,
     logger,
+    onDispatchFailed: options.onRunSettled,
     submitDispatch: async (request) => {
       try {
         const result = await executor.dispatchRun(request);
+        resolvedSessionIdByRunId.delete(request.runId);
         return {
           settled: true,
           result: { ok: true, taskId: result.taskId, sessionId: result.sessionId },
         };
       } catch (error) {
+        const sessionId = resolvedSessionIdByRunId.get(request.runId);
+        resolvedSessionIdByRunId.delete(request.runId);
         return {
           settled: true,
           result: {
@@ -91,6 +107,7 @@ export function createAutomationRuntime(
             error: error instanceof Error ? error.message : String(error),
             failureKind:
               error instanceof AutomationPermanentDispatchError ? "permanent" : "transient",
+            ...(sessionId ? { sessionId } : {}),
           },
         };
       }

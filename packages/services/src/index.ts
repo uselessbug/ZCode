@@ -427,3 +427,14 @@ export type {
   GroupNode,
   MoveGroupNode,
 } from "#src/task-groups/contract.js";
+
+export {
+  IWebPushService,
+  WebPushValidationError,
+  type CreateWebPushServiceOptions,
+  type WebPushAutomationEventInput,
+  type WebPushOutboundRequest,
+  type WebPushOutboundResponse,
+  type WebPushSendImpl,
+  type WebPushSessionEventInput,
+} from "./web-push/contract.js";

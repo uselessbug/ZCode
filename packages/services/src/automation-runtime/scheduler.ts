@@ -12,6 +12,7 @@ import {
   type AutomationDispatchSettlement,
   type AutomationLoggerPort,
   type AutomationRepoPort,
+  type AutomationRunNotificationEvent,
   type AutomationSchedulerHandle,
   type AutomationTimersPort,
 } from "./contract.js";
@@ -55,6 +56,7 @@ function buildDispatchRequest(
   const modelSelection = fixedSelection ?? automation.modelSelection;
   return {
     automationId: automation.automationId,
+    ...(automation.title ? { automationTitle: automation.title } : {}),
     runId,
     prompt: automation.prompt,
     ...(automation.targetTaskId ? { targetTaskId: automation.targetTaskId } : {}),
@@ -77,6 +79,7 @@ export interface CreateAutomationSchedulerOptions {
   misfireGraceMs?: number;
   timers?: AutomationTimersPort;
   onAfterAutomationTick?: (now: number) => Promise<void>;
+  onDispatchFailed?: (event: AutomationRunNotificationEvent) => void;
 }
 
 export function createAutomationScheduler(
@@ -93,7 +96,11 @@ export function createAutomationScheduler(
 
   type InFlight = {
     automationId: string;
+    automationTitle?: string;
     workspaceKey: string;
+    workspacePath: string;
+    workspaceIdentity?: string;
+    targetTaskId?: string;
     trigger: ZCodeAutomationTrigger;
   };
   const inFlight = new Map<string, InFlight>();
@@ -176,16 +183,56 @@ export function createAutomationScheduler(
     });
     if (trigger === "manual") {
       await settleManualClaim(false);
+      const automation = context?.automationTitle ? null : await repo.get(automationId);
+      const workspacePath = context?.workspacePath ?? automation?.workspacePath ?? "";
+      const automationTitle = context?.automationTitle ?? automation?.title;
+      const workspaceIdentity = context?.workspaceIdentity ?? automation?.workspaceIdentity;
+      const sessionId = msg.sessionId ?? context?.targetTaskId ?? automation?.targetTaskId;
+      options.onDispatchFailed?.({
+        kind: "automation_failed",
+        runId: msg.runId,
+        automationId,
+        ...(automationTitle ? { automationTitle } : {}),
+        ...(msg.error ? { detail: msg.error } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        workspacePath,
+        ...(workspaceIdentity ? { workspaceIdentity } : {}),
+      });
       return;
     }
     const kind = msg.failureKind ?? "transient";
     const automation = await repo.get(automationId);
     const nextRunAt = automation ? cron.computeNextRunAt(automation, settledAt) : null;
-    await repo.markDispatchFailed(automationId, {
+    const failedOutcome = await repo.markDispatchFailed(automationId, {
       failedAt: settledAt,
       error: msg.error ?? "dispatch failed",
       kind,
       nextRunAt,
+    });
+    const after = failedOutcome?.terminal !== undefined ? null : await repo.get(automationId);
+    const isTerminalFailure =
+      kind === "permanent" ||
+      failedOutcome?.terminal === true ||
+      (failedOutcome?.terminal === undefined &&
+        (after?.lifecycleStatus === "failed" ||
+          (automation?.dispatchStatus === "failed_to_dispatch" &&
+            after?.dispatchStatus === "idle")));
+    if (!isTerminalFailure) {
+      return;
+    }
+    const workspacePath = context?.workspacePath ?? automation?.workspacePath ?? "";
+    const automationTitle = context?.automationTitle ?? automation?.title;
+    const workspaceIdentity = context?.workspaceIdentity ?? automation?.workspaceIdentity;
+    const sessionId = msg.sessionId ?? context?.targetTaskId ?? automation?.targetTaskId;
+    options.onDispatchFailed?.({
+      kind: "automation_failed",
+      runId: msg.runId,
+      automationId,
+      ...(automationTitle ? { automationTitle } : {}),
+      ...(msg.error ? { detail: msg.error } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      workspacePath,
+      ...(workspaceIdentity ? { workspaceIdentity } : {}),
     });
   };
 
@@ -196,7 +243,11 @@ export function createAutomationScheduler(
   ): Promise<void> => {
     inFlight.set(request.runId, {
       automationId: request.automationId,
+      ...(request.automationTitle ? { automationTitle: request.automationTitle } : {}),
       workspaceKey,
+      workspacePath: request.workspacePath,
+      ...(request.workspaceIdentity ? { workspaceIdentity: request.workspaceIdentity } : {}),
+      ...(request.targetTaskId ? { targetTaskId: request.targetTaskId } : {}),
       trigger,
     });
     const dispatchOutcome = await trackWork(submitDispatch(request, trigger));
