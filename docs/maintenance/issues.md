@@ -6,11 +6,13 @@
 
 - **Android Firefox Nightly 自动切换主题时页面重载并出现重连横幅**：主题跟随已恢复；2026-11-16 用户补充确认，切换时伴随页面重载、Firefox 顶部加载条和 ZCode 重连横幅。源码主题回调只更新类名、CSS `color-scheme` 和 `theme-color`，没有刷新或导航调用；下一步用固定主题、其他网站与 Firefox 稳定版作对照，并采集文档生命周期和 WebSocket 事件，定位 Firefox 重载或页面恢复链路的触发原因。Mozilla [Bug 1807095](https://bugzilla.mozilla.org/show_bug.cgi?id=1807095) 有类似报告，当前设备是否同因未确认。
 
-## 已修复待部署复测（基于 `71149de2` 增量，4 项）
+## 已部署待实机复测（`c4a71467`，4 项）
+
+提交 `c4a71467`（完整 SHA：`c4a7146757dbecb1de27d41f6613e688c961a4b9`）已通过 GitHub Actions [`44301991974`](https://github.com/uselessbug/ZCode/actions/runs/44301991974) `success` 发布镜像 `sha-c4a71467`（digest `sha256:3e97d67ef273260f9d7f9ba8849a9dd826156ba5a8065efd7ad9545af8e5d001`），于 `2026-11-18T12:33:09Z` 完成宿主自更新部署并通过 `2026-11-18T12:32:39.368Z` 容器与运行探针校验，待用户在实体浏览器和手机端完成实机复测：
 
 1. **独立 Web 浏览器通知与后台推送（Web Push）、点击通知会话跳转、多标签协同与主动打断静默**
-   - **背景与线上状态**：`71149de2`（完整 SHA：`71149de29744d8b0e5aeb3535e1b78a7b4c673c2`，包含 `7a72f272`、`d20c7f4c`、`71149de2`）经 GitHub Actions [`44247679952`](https://github.com/uselessbug/ZCode/actions/runs/44247679952) `success` 发布镜像 `sha-71149de2`（digest `sha256:63c56d16d39383d1c05a06a2155871e9c5f007231831ec7b9b79bfb2f14194b0`），于 `2026-11-18T06:24:33Z` 完成宿主自更新部署并通过 `2026-11-18T06:24:31.853Z` 容器与运行探针校验。**2026-11-18 用户线上实测确认：PC Firefox 与 Android Firefox 均可正常收到 Web Push 推送（Mozilla Autopush 返回 HTTP 201）**；同时反馈点击通知跳转存在异常（PC 端跳到首页草稿而非对应任务、Android 端未跳转）、多标签页下通知需按任务精确协同，以及用户主动停止或发新消息打断旧回合时不应弹出“任务已完成”通知。
-   - **本地验证**：`standalone-web-push.mjs` 的 47 项检查通过，其中服务端套件 10 项、前端平台与 Service Worker 套件 77 项。
+   - **背景与线上状态**：此前 `71149de2`（完整 SHA：`71149de29744d8b0e5aeb3535e1b78a7b4c673c2`）经 GitHub Actions [`44247679952`](https://github.com/uselessbug/ZCode/actions/runs/44247679952) 部署后，**2026-11-18 用户线上实测确认 PC Firefox 与 Android Firefox 均可正常收到 Web Push 推送（Mozilla Autopush 返回 HTTP 201）**；同时反馈点击通知跳转存在异常（PC 端跳到首页草稿而非对应任务、Android 端未跳转）、多标签页下通知需按任务精确协同，以及用户主动停止或发新消息打断旧回合时不应弹出“任务已完成”通知。上述问题已在 `c4a71467` 修复上线。
+   - **本地验证与部署态**：`standalone-web-push.mjs` 的 47 项检查通过（其中服务端套件 10 项、前端平台与 Service Worker 套件 77 项）；`2026-11-18T12:32:39.368Z` 线上容器探针确认 `/zcode-push-sw.js` 哈希与工作区源码一致、`vapid.json` 指纹未变且 `/api/web-push/config` 正常。待实机验证点击跳转、多标签协同及主动打断静默。
      - **点击通知跳转修复**：移除 `useRootPlatformEffects.ts` 对 V4 下恒为 `null` 的 `workspaceState.taskListCache` 的依赖，改调 `zcodeTaskService.getTaskMeta` 定位会话（断线重连期间自动等待重试），统一经 `requestNotificationTaskNavigation` -> `WorkspaceShellLayout.handleSelectTaskInChat` 切换工作区 Tab、退出设置/自动化/插件页、同步分屏并清除未读；`WebRemoteControlMobileShell` 新增 `revealChatRequestId` 让手机窄屏自动从 `Home` 切入 `Chat`；冷启动深链 `?zcodeTask=...&zcodeWorkspace=...` 直接覆盖 `<Root>` 的 `initialWorkspaceAbsPath`、`initialTaskId` 与 `initialWebRemoteControlMobileNavigationIntent="chat"`；`zcode-push-sw.js` 在 `client.focus()` 抛错或返回不可见客户端时先 `postMessage` 保底再调 `clients.openWindow` 回退拉起；页内通知 `TaskNotificationPayload` 补齐 `workspacePath` / `workspaceIdentity`。
      - **多标签页协同（按任务精确防打扰、单次响铃与精准切回标签页）**：Web 端接通 `syncActiveTaskSession`（设置页、新任务草稿与手机 `Home` 列表态上报 `null`，仅进入具体会话 `Chat` 时上报 `taskId`）与 `syncWindowTabs`；页内通知与后台推送统一由 Service Worker 裁决（跨标签共享 4 秒 `recentTags` 去重、仅首个请求标签页播放一次自定义提示音、仅当前台聚焦标签页正在查看该 `taskId` 时抑制通知，前台看任务 A 时不吞任务 B 的通知；所有工作台窗口最小化时对刚由页内展示过的同 `tag` 推送以 `silent: true, renotify: false` 静默合并，遵守 Chromium `userVisibleOnly` 配额且不重复响铃）；点击通知时 SW 通过 `MessageChannel`（`120ms` 超时）瞬时查询各工作台标签页，按「已打开该 `taskId` > 当前停在该项目工作区 > 已打开该项目 Tab > 兜底窗口」优先级精确聚焦目标标签页，不冲掉其他标签页正在看的任务。
      - **主动停止或发新消息抢占打断静默**：`taskNotificationOrchestrator.ts` 将 `completedInterrupted` 从完成通知中排除（与后端 Web Push 一致保持静默，仅 `completedSuccess` 弹完成、`error` 弹失败）。
@@ -18,7 +20,7 @@
 
 2. **独立 Web 首屏零横幅直出与手机切后台 `0ms` 无感重连**
    - **症状**：独立 Web 首屏加载时在 `resolveWebBootstrap` 请求 `/api/server-info` 后又在建连前重复请求一次 `/api/server-info` 并等待首包 `system.info`，且首屏短暂闪出“正在连接服务器…”横幅；断线重连期间给页面加 `inert` 会锁死滚动、强行 blur 输入框并收起手机软键盘；切后台恢复时首次重连固定等待 `1s` 且 `1500ms` 即弹出重连横幅。
-   - **本轮增量修复（已通过 `standalone-web-push.mjs` 连接恢复套件与 `standalone-desktop-parity-ui.mjs` 回归，待构建部署复测）**：
+   - **已部署待复测（`c4a71467`，本地 `standalone-web-push.mjs` 连接恢复套件与 `standalone-desktop-parity-ui.mjs` 回归通过）**：
      - `packages/web/src/main.tsx`：`resolveWebBootstrap` 已确认鉴权正常（`initialAccessState === "ok"`）时，首连跳过重复 `/api/server-info` 与首包 `system.info` 探活，直接单次 `/ws` 握手挂载 `<Root>`；首连 `3000ms` 内不渲染连接横幅，`#root` 保留 `index.html` 原生居中 Logo 启动动画，连上后一次渲染直出首页。
      - 移除断线期间锁死全页与收起手机软键盘的 `inert` 属性，并清理 `StandaloneFocusRestore*` 焦点快照恢复代码，断线重连期间页面保持可滚动、输入框可继续打字。
      - 后台恢复采用 `2.5s`（`2500ms`）短超时探活，首次断开与切回前台首轮重连延迟改为 `0ms` 单往返（已连上过不重复请求 `/api/server-info`，仅在握手失败后检查一次访问状态区分 `401/403`；连续失败再按 `1s -> 2s -> 4s -> 8s` 退避），重连横幅显示延迟拉长至 `4500ms`（`401/403` 仍立即提示重新验证）。设计见[连接恢复](../standalone-web-recovery.md)与[重连连续性](../standalone-web-reconnect-continuity.md)。
@@ -30,7 +32,7 @@
 
 4. **独立 Web 项目设备名称统一改为“当前服务器”**
    - **症状**：独立 Web 下设置页插件/技能/MCP 范围已显示“当前服务器”，但项目新建/编辑弹窗、项目管理行、目录信任弹窗与输入框项目选择菜单中的本地设备名称仍显示桌面端的“此电脑”（`project.thisComputer`）。
-   - **本轮增量修复（已通过 `standalone-desktop-parity-ui.mjs` 30 项回归，待构建部署复测）**：
+   - **已部署待复测（`c4a71467`，本地 `standalone-desktop-parity-ui.mjs` 30 项回归通过）**：
      - `ProjectEditor.tsx`、`ProjectManagementRow.tsx`、`ProjectFolderTrustDialog.tsx`、`ProjectComposerMenu.tsx` 四处在服务端承载环境（`useIsServerHostedSettingsScope()` 为 `true`）下将本地设备文案从“此电脑”（`project.thisComputer`）统一改为“当前服务器”（`settings.scope.server`），桌面端保持“此电脑”不变。设计见[设置页服务边界与手机布局](../standalone-web-settings.md)与[任务管理与非项目工作模式](../standalone-web-task-and-project-compat.md)。
 
 ## 已部署并完成验收（`5759c882`，2 项）
@@ -133,7 +135,7 @@
   - **状态**：已修复（2026-11-12 实机验证通过：内置官方插件与 `dynamic-workflows` 等内置技能资源齐全可用）。
 - **安装与配置范围“用户 / 本机 / 此电脑”表述歧义**
   - **症状**：插件、技能等配置范围与项目本地设备沿用桌面端“用户 / 本机 / 此电脑”文案，在独立 Web 下易与访问者浏览器所在设备混淆。
-  - **状态**：2026-11-12 用户确认设置页范围文案已改为“当前服务器”。项目弹窗与菜单里的设备名见上方“已修复待部署复测”第 4 项。
+  - **状态**：2026-11-12 用户确认设置页范围文案已改为“当前服务器”。项目弹窗与菜单里的设备名见上方“已部署待实机复测”第 4 项。
 - **归档、取消归档、删除任务失败及旧会话复活（含 3.18.2 归档永久删除）**
   - **症状**：归档、取消归档或删除任务时报 `Unknown channel`，或删除任务后刷新、重新打开页面时旧会话重新出现；3.18.2 升级为官方「归档预检 + 二次确认永久删除」。
   - **状态**：已修复（2026-11-15 用户实机确认永久删除归档任务正常，服务端运行日志同步确认 `zcode-task.previewArchivedTaskDeletion` 与 `zcode-task.permanentlyDeleteArchivedTask` 均 `OK` 完成且无报错）。
@@ -166,7 +168,7 @@
   - **状态**：已修复（触发预填后自动跳转至手机 Chat 页面并保留草稿；2026-11-15 用户确认预填导航正常）。
 - **断线重连闪屏、焦点丢失与设置页跳回工作台**
   - **症状**：短暂断线重连时整页内容卸载闪烁、编辑器焦点丢失，或已打开的设置页在重连后被磁盘标签恢复逻辑切回对话页，以及点击“重试连接”被旧握手阻塞。
-  - **状态**：稳定服务引用、同 Host 标签恢复和手动重试的修复已部署，2026-11-15 用户验证通过。首屏启动和前台恢复的后续调整见上方“已修复待部署复测”第 2 项。
+  - **状态**：稳定服务引用、同 Host 标签恢复和手动重试的修复已部署，2026-11-15 用户验证通过。首屏启动和前台恢复的后续调整见上方“已部署待实机复测”第 2 项。
 - **新建项目目录浏览默认起点**
   - **症状**：独立 Web 新建项目选择目录时未默认定位到工作区根目录。
   - **状态**：已修复（独立 Web 目录浏览器默认起始路径设为 `/workspace`；2026-11-15 用户确认新建项目目录选择正常）。
