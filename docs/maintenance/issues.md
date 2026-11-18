@@ -6,6 +6,16 @@
 
 - **Android Firefox Nightly 自动切换主题时页面重载并出现重连横幅**：主题跟随已恢复；2026-11-16 用户补充确认，切换时伴随页面重载、Firefox 顶部加载条和 ZCode 重连横幅。源码主题回调只更新类名、CSS `color-scheme` 和 `theme-color`，没有刷新或导航调用；下一步用固定主题、其他网站与 Firefox 稳定版作对照，并采集文档生命周期和 WebSocket 事件，定位 Firefox 重载或页面恢复链路的触发原因。Mozilla [Bug 1807095](https://bugzilla.mozilla.org/show_bug.cgi?id=1807095) 有类似报告，当前设备是否同因未确认。
 
+## 已提交待部署与实机验收（1 项）
+
+- **独立 Web 浏览器通知与后台推送（Web Push）**
+  - **背景与缺口**：上游 Web 端缺少 `Notification.requestPermission()` 授权触发，`onTaskNotificationClick` 为空实现，Android 浏览器直接构造 `new Notification()` 不兼容，无多标签与双通道 `tag` 去重，且关闭网页或手机锁屏断连后无法收到任务完成、报错、待审批交互与定时任务终态通知。
+  - **当前状态**：已合入 `main` 并通过本地定向回归 `standalone-web-push.mjs`、架构检查与 `oxlint`，待 GitHub Actions 构建发布镜像、宿主自更新部署及真机浏览器验收。
+  - **实现概要**：
+    - 页内通知与后台推送协同：补齐通知权限请求、Android Service Worker `showNotification` 兼容、4 秒 `tag`/`secondaryTag` 去重窗口、「任务通知」总开关退订联动与「通知声音」/语言偏好同步；遵守 `userVisibleOnly: true`（仅发可见 `show` 推送，前台聚焦或进入会话时本地清理系统通知，iOS/Safari 必展示防订阅吊销）。
+    - 服务端 Web Push：覆盖会话完成/失败（用户主动停止 `completedInterrupted` 静默）、全局会话待审批/`AskUserQuestion`/`ExitPlanMode`（支持 `autoResolution` 转人工补发与已处理交互排队取消）、定时任务终态结算与同回合去重；基于 Node 原生 `crypto` 实现 VAPID（RFC 8292）与 `aes128gcm`（RFC 8291），状态持久化在 `<appConfigDir>/web-push/`，同源 `/api/web-push/*` 接口配合出站 DNS/IP 私网拦截。
+    - PWA 与点击跳转：提供 `manifest.webmanifest`（`crossorigin="use-credentials"` 适配反向代理网关）、iOS 16.4+ 添加到主屏幕指引，以及点击通知聚焦已有窗口或冷启动 `?zcodeTask=...&zcodeWorkspace=...&zcodeWorkspaceIdentity=...` 跨工作区定位会话。设计见[独立 Web 浏览器通知与后台推送](../standalone-web-notifications.md)。
+
 ## 已部署并完成验收（`5759c882`，2 项）
 
 本轮针对线上暴露的“定时生成会话在侧栏/运行历史点击无法打开及同项目双开 `zcode-cli`”与“闲置工作区/草稿/插件管理进程常驻累积导致 OOM”完成源码修复与本地串行回归验收（`standalone-automation-runtime.mjs` 含真实 `createStandaloneProjectAlias` + `readTree` + `ensureTaskNavigationWorkspace` 三路跳转、删光历史记录继续调度、`draft-*` 共享同 PID、0 目录/普通项目独占 PID、`plugin-management` 空闲超时回收与重拉起）。提交 `5759c882`（完整 SHA：`5759c882095668742fc53d2ab857d6dce34ef216`，包含 `b8b71985`、`5759c882`）已通过 GitHub Actions [`44167318739`](https://github.com/uselessbug/ZCode/actions/runs/44167318739) `success` 发布镜像 `sha-5759c882`（digest `sha256:f9c120bc2a66d3dbe83548a1f05a67208911bc245bee44dd41cb5fbabb04378f`），于 `2026-11-17T20:44:37.133Z` 完成宿主自更新部署与容器探针校验（`ai-agent-zcode-1` 状态 `running` / `healthy` / `restarts: 0`，HTTP 首页 `200`、鉴权 `/api/server-info` `200` 含 `capabilities.managedWorktrees: true`、未授权 `401`、WebSocket 握手 `pass`、`credential-secret` 与 `provider_config.json` 指纹不变、首页双值 `color-scheme` meta 为 `true`、`/opt/browser-mcp` 不存在），并于 2026-11-18 完成线上实测与运行日志验收：
@@ -158,6 +168,7 @@
 
 - [独立 Web 实施基线](./standalone-web-baseline.md)
 - [独立 Web 部署与实机验证清单](./standalone-web-deployment-checklist.md)
+- [独立 Web 浏览器通知与后台推送](../standalone-web-notifications.md)
 - [定时任务服务端执行链](../standalone-web-automation-runtime.md)
 - [Browser Use 规格](../standalone-web-browser-use.md)
 - [连接恢复](../standalone-web-recovery.md)
