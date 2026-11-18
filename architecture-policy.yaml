@@ -1418,14 +1418,17 @@ modules:
   - id: web-platform
     roots:
       - packages/web/src/platform
+      - packages/web/public/zcode-push-sw.js
     managed: true
     requires:
       - shared
       - ui
       - web
+      - web-push-shared
     publicEntrypoints:
       - packages/web/src/platform/index.ts
       - packages/web/src/platform/contract.ts
+      - packages/web/public/zcode-push-sw.js
     layers:
       adapters: .
     owner: web

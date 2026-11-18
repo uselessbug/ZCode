@@ -19,7 +19,11 @@ import {
   TID_SETTINGS_TOOL_SEARCH_OPTION,
 } from "@zcode/shared/test-ids";
 import { useState, useCallback, useEffect } from "react";
-import type { IPlatformService } from "@zcode/shared";
+import type {
+  IPlatformService,
+  WebNotificationErrorCode,
+  WebNotificationStateSnapshot,
+} from "@zcode/shared";
 import {
   TID_SETTINGS_LOCALE_SELECT_ITEM,
   TID_SETTINGS_LOCALE_SELECT_TRIGGER,
@@ -135,6 +139,48 @@ export function TaskAutoArchiveSettings({
   );
 }
 
+/** 后台推送失败时只展示固定文案，原始异常由平台层写入 console。 */
+const WEB_PUSH_ERROR_MESSAGE_IDS = {
+  permission_denied: "settings.webPushError.permissionDenied",
+  push_unsupported: "settings.webPushError.pushUnsupported",
+  server_unavailable: "settings.webPushError.serverUnavailable",
+  subscribe_failed: "settings.webPushError.subscribeFailed",
+  unsubscribe_failed: "settings.webPushError.unsubscribeFailed",
+} as const satisfies Record<WebNotificationErrorCode, string>;
+
+/** 浏览器通知权限未就绪时，在“任务通知”下方给出当前状态与可执行的下一步。 */
+function WebNotificationPermissionHint({
+  permission,
+  onRequestPermission,
+}: {
+  permission: WebNotificationStateSnapshot["permission"];
+  onRequestPermission: () => void;
+}) {
+  const { intl } = useZCodeIntl();
+  if (permission === "granted") return null;
+  const messageId = {
+    default: "settings.notificationPermissionDefault",
+    denied: "settings.notificationPermissionDenied",
+    "ios-install-required": "settings.notificationPermissionIosInstall",
+    unsupported: "settings.notificationPermissionUnsupported",
+  }[permission];
+  return (
+    <div
+      role="status"
+      data-testid="settings-web-notification-permission"
+      data-permission={permission}
+      className="flex flex-wrap items-center gap-x-3 gap-y-2 text-ui-base leading-6 text-foreground-subtle"
+    >
+      <span className="min-w-0 flex-1 basis-60">{intl.formatMessage({ id: messageId })}</span>
+      {permission === "default" ? (
+        <Button type="button" variant="outline" size="lg" onClick={onRequestPermission}>
+          {intl.formatMessage({ id: "settings.notificationPermissionRequest" })}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 export function GeneralSectionContent({
   localePreference,
   interfaceMode = "coding",
@@ -153,6 +199,7 @@ export function GeneralSectionContent({
   terminalFontFamily = "",
   integratedTerminalShell = { mode: "auto" },
   integratedTerminalShellOptions = [],
+  platform,
   httpProxy = "",
   httpProxyNoProxy = "",
   httpProxyCaCertPath = "",
@@ -235,8 +282,55 @@ export function GeneralSectionContent({
   onAutoDownloadAndInstallUpdatesChange: (enabled: boolean) => Promise<void>;
   onOpenOnboardingDialog: () => void;
 }) {
-  const { intl } = useZCodeIntl();
+  const { intl, locale } = useZCodeIntl();
   const hasServices = Boolean(useOptionalServices());
+  // 仅 Web 端实现浏览器通知状态；桌面端 platform 没有这些方法，设置项保持原样。
+  const isWebNotificationPlatform = Boolean(platform?.getWebNotificationState);
+  const [webNotificationState, setWebNotificationState] =
+    useState<WebNotificationStateSnapshot | null>(null);
+  useEffect(() => {
+    if (!platform?.getWebNotificationState) return;
+    let active = true;
+    void platform
+      .getWebNotificationState()
+      .then((state) => {
+        if (active) setWebNotificationState(state);
+      })
+      .catch(() => undefined);
+    const dispose = platform.onWebNotificationStateChanged?.((state) => {
+      if (active) setWebNotificationState(state);
+    });
+    return () => {
+      active = false;
+      dispose?.();
+    };
+  }, [platform]);
+  const handleNotificationEnabledChange = (enabled: boolean) => {
+    // 授权弹窗必须在点击手势内发起，不能等设置保存完成后再请求。
+    if (enabled && !notificationEnabled && webNotificationState?.permission === "default") {
+      void platform?.requestWebNotificationPermission?.();
+    }
+    // 关闭总开关时同时退订本设备的后台推送，避免关掉通知后手机仍在响。
+    if (!enabled && webNotificationState?.pushSubscribed) {
+      void platform?.setWebPushSubscribed?.(false);
+    }
+    setNotificationEnabled(enabled);
+  };
+  const handleNotificationSoundEnabledChange = (enabled: boolean) => {
+    // 后台推送由服务端决定是否带提示音，声音偏好变化后静默同步给服务端。
+    if (webNotificationState?.pushSubscribed) {
+      void platform?.setWebPushSubscribed?.(true, { locale, soundEnabled: enabled });
+    }
+    setNotificationSoundEnabled(enabled);
+  };
+  // 远控代理页（pushAvailable 为 false）没有可用的推送服务，不展示永远打不开的开关。
+  const showWebPushRow =
+    !isDesktop &&
+    webNotificationState !== null &&
+    Boolean(platform?.setWebPushSubscribed) &&
+    Boolean(webNotificationState.pushAvailable) &&
+    (webNotificationState.pushSupported ||
+      webNotificationState.permission === "ios-install-required");
   // 部分 SSR 单测会用精简 props 直接渲染本组件，新增终端设置项后旧 helper 未必同步传值。
   // 这里把运行时缺省值兜到“继承系统 profile”，避免 undefined.trim() 把无关测试打断。
   const [localTerminalFontFamily, setLocalTerminalFontFamily] = useState(terminalFontFamily);
@@ -668,10 +762,25 @@ export function GeneralSectionContent({
           searchId="settings.notification"
           label={intl.formatMessage({ id: "settings.notification" })}
           description={intl.formatMessage({
-            id: "settings.notificationDescription",
+            id: isWebNotificationPlatform
+              ? "settings.notificationDescriptionWeb"
+              : "settings.notificationDescription",
           })}
           control={
-            <Switch checked={notificationEnabled} onCheckedChange={setNotificationEnabled} />
+            <Switch
+              checked={notificationEnabled}
+              onCheckedChange={handleNotificationEnabledChange}
+            />
+          }
+          detail={
+            isWebNotificationPlatform && notificationEnabled && webNotificationState ? (
+              <WebNotificationPermissionHint
+                permission={webNotificationState.permission}
+                onRequestPermission={() => {
+                  void platform?.requestWebNotificationPermission?.();
+                }}
+              />
+            ) : undefined
           }
         />
         <SettingsRow
@@ -684,10 +793,43 @@ export function GeneralSectionContent({
             <Switch
               checked={notificationSoundEnabled}
               disabled={!notificationEnabled}
-              onCheckedChange={setNotificationSoundEnabled}
+              onCheckedChange={handleNotificationSoundEnabledChange}
             />
           }
         />
+        {showWebPushRow && webNotificationState ? (
+          <SettingsRow
+            searchId="settings.webPush"
+            label={intl.formatMessage({ id: "settings.webPush" })}
+            description={intl.formatMessage({ id: "settings.webPushDescription" })}
+            control={
+              <Switch
+                aria-label={intl.formatMessage({ id: "settings.webPush" })}
+                data-testid="settings-web-push-switch"
+                checked={notificationEnabled && webNotificationState.pushSubscribed}
+                disabled={
+                  !notificationEnabled ||
+                  Boolean(webNotificationState.busy) ||
+                  webNotificationState.permission === "denied" ||
+                  webNotificationState.permission === "unsupported" ||
+                  webNotificationState.permission === "ios-install-required"
+                }
+                onCheckedChange={(checked) => {
+                  void platform?.setWebPushSubscribed?.(checked, { locale });
+                }}
+              />
+            }
+            detail={
+              webNotificationState.error ? (
+                <p role="alert" className="text-ui-base leading-6 text-destructive">
+                  {intl.formatMessage({
+                    id: WEB_PUSH_ERROR_MESSAGE_IDS[webNotificationState.error],
+                  })}
+                </p>
+              ) : undefined
+            }
+          />
+        ) : null}
         {isDesktop ? (
           <SettingsRow
             searchId="settings.mobilePush"

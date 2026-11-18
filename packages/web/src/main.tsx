@@ -7,7 +7,7 @@
 import "core-js/stable/array/to-sorted";
 import "core-js/stable/array/to-reversed";
 import "core-js/stable/object/group-by";
-import { createWebPlatform } from "#src/platform/index.js";
+import { consumeNotificationDeepLink, createWebPlatform } from "#src/platform/index.js";
 import { mobilePluginDiscoveryTelemetrySchema } from "@zcode/shared";
 import {
   sessionCreateTelemetrySchema,
@@ -74,6 +74,7 @@ import type {
   WebRemoteControlAppPayload,
   WebRemoteControlExternalWorkspaceBridge,
   ServerRemoteInfo,
+  IPlatformService,
 } from "@zcode/shared";
 
 import {
@@ -1548,6 +1549,24 @@ async function bootstrapExternalRelayWebRemoteControl(
     return { bridge: response.bridge, services, relayProtocol };
   };
 
+  // 平台实例持有 Service Worker 与通知监听，整个远控会话只创建一次，避免每次 render 泄漏监听器。
+  let remoteControlPlatform: IPlatformService | undefined;
+  const getRemoteControlPlatform = (): IPlatformService => {
+    remoteControlPlatform ??= createWebPlatform({
+      externalWebRemoteControlProxy: {
+        requestPlatformMethod,
+        reportTelemetryEvent: (event) => {
+          const parsed = sessionCreateTelemetrySchema
+            .or(mobilePluginDiscoveryTelemetrySchema)
+            .safeParse(event);
+          if (parsed.success)
+            transport.sendPayload({ zcode_type: "telemetry-report", event: parsed.data });
+        },
+      },
+    });
+    return remoteControlPlatform;
+  };
+
   const renderExternalRelayRoot = (
     services: Awaited<ReturnType<typeof connectViaProtocol>>,
     bridge: WebRemoteControlExternalWorkspaceBridge,
@@ -1567,18 +1586,7 @@ async function bootstrapExternalRelayWebRemoteControl(
         >
           <Root
             services={services}
-            platform={createWebPlatform({
-              externalWebRemoteControlProxy: {
-                requestPlatformMethod,
-                reportTelemetryEvent: (event) => {
-                  const parsed = sessionCreateTelemetrySchema
-                    .or(mobilePluginDiscoveryTelemetrySchema)
-                    .safeParse(event);
-                  if (parsed.success)
-                    transport.sendPayload({ zcode_type: "telemetry-report", event: parsed.data });
-                },
-              },
-            })}
+            platform={getRemoteControlPlatform()}
             // Bug 原因：手机复用 Desktop Host 中已持久化的 Assistant row，但 Root 默认关闭
             // code-comment 投影，导致 replay hydration 暴露原始 directive。该开关只修正展示能力，
             // 不进入 relay、Host 或 replayable 状态。
@@ -1700,18 +1708,7 @@ async function bootstrapExternalRelayWebRemoteControl(
           <Root
             composerClientNamespace={`mobile:${relayParams.deviceMid ?? relayParams.deviceSid}`}
             services={createHomeOnlyWebRemoteControlServices()}
-            platform={createWebPlatform({
-              externalWebRemoteControlProxy: {
-                requestPlatformMethod,
-                reportTelemetryEvent: (event) => {
-                  const parsed = sessionCreateTelemetrySchema
-                    .or(mobilePluginDiscoveryTelemetrySchema)
-                    .safeParse(event);
-                  if (parsed.success)
-                    transport.sendPayload({ zcode_type: "telemetry-report", event: parsed.data });
-                },
-              },
-            })}
+            platform={getRemoteControlPlatform()}
             initialWorkspaceAbsPath={workspaceKey}
             initialTaskId={taskId}
             initialWebRemoteControlMobileNavigationIntent={undefined}
@@ -2173,7 +2170,10 @@ async function bootstrapWebApp() {
     return;
   }
 
-  const platform = createWebPlatform();
+  // 通知点击冷启动：读取 zcodeTask/zcodeWorkspace 后立即清掉，刷新页面不会再次跳转。
+  const platform = createWebPlatform({
+    initialNotificationTarget: consumeNotificationDeepLink(),
+  });
   document.title = "ZCode - Web + Server";
   let services: RootServices | undefined;
   let state: StandaloneWebConnectionState = "connecting";

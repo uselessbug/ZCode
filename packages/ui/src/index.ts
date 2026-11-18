@@ -92,6 +92,10 @@ export {
   setDefaultFileDisplayBasePath,
 } from "./lib/fileDisplay.js";
 export type { FileDisplayDescriptor, FileDisplayOptions } from "./lib/fileDisplay.js";
+export {
+  isTaskNotificationEnabled,
+  isTaskNotificationSoundEnabled,
+} from "./lib/taskNotificationPreferences.js";
 export { playTaskNotificationSound } from "./lib/taskNotificationSound.js";
 export {
   applyUiFontSizePx,

@@ -7,11 +7,21 @@ import {
   type RemoteTarget,
   type WebRemoteControlStatus,
 } from "@zcode/shared";
-import { playTaskNotificationSound } from "@zcode/ui";
+import {
+  isTaskNotificationEnabled,
+  isTaskNotificationSoundEnabled,
+  playTaskNotificationSound,
+} from "@zcode/ui";
 import { resolveWebCommunityUrl, resolveWebHelpConfig } from "#src/communityUrl.js";
 import type { WebRemoteControlPlatformProxy } from "#src/platform/contract.js";
 import { saveBrowserFile } from "#src/platform/saveBrowserFile.js";
+import {
+  createWebNotificationController,
+  type NotificationClickTarget,
+} from "#src/platform/webNotifications.js";
 export type { WebRemoteControlPlatformProxy } from "#src/platform/contract.js";
+export { consumeNotificationDeepLink } from "#src/platform/webNotifications.js";
+export type { NotificationClickTarget } from "#src/platform/webNotifications.js";
 
 async function resolveFeedbackUrl(): Promise<string | undefined> {
   return (await resolveWebHelpConfig()).feedback_url;
@@ -19,8 +29,18 @@ async function resolveFeedbackUrl(): Promise<string | undefined> {
 
 export function createWebPlatform(options?: {
   externalWebRemoteControlProxy?: WebRemoteControlPlatformProxy;
+  /** 通知深链带来的冷启动目标，Root 注册点击监听后派发。 */
+  initialNotificationTarget?: NotificationClickTarget | null;
 }): IPlatformService {
   const platformProxy = options?.externalWebRemoteControlProxy;
+  // 远控页没有独立 Server 的 /api/web-push，只保留页内通知；独立 Web 由 /api/web-push/config 判断是否可用。
+  const notifications = createWebNotificationController({
+    pushEnabled: !platformProxy,
+    playSound: playTaskNotificationSound,
+    isEnabled: isTaskNotificationEnabled,
+    isSoundEnabled: isTaskNotificationSoundEnabled,
+    initialTarget: options?.initialNotificationTarget,
+  });
 
   return {
     canSelectFilePath: false,
@@ -144,7 +164,7 @@ export function createWebPlatform(options?: {
     onOAuthCallback: () => () => {},
     onPaymentCallback: () => () => {},
     onShareImport: () => () => {},
-    notifyRendererReady: () => {},
+    notifyRendererReady: notifications.notifyRendererReady,
     reportTelemetryEvent: async (event) => {
       // 手机只开放 session_create 和插件发现事件；管理结果仍由 Desktop Host 唯一上报。
       const parsed = sessionCreateTelemetrySchema
@@ -153,28 +173,11 @@ export function createWebPlatform(options?: {
       if (parsed.success) platformProxy?.reportTelemetryEvent?.(parsed.data);
     },
     reportArmsCustomEvent: () => Promise.resolve(),
-    showTaskNotification: (payload) => {
-      if (document.hasFocus()) {
-        return;
-      }
-
-      if (
-        typeof window.Notification === "undefined" ||
-        window.Notification.permission !== "granted"
-      ) {
-        return;
-      }
-
-      try {
-        new window.Notification(payload.title, {
-          body: payload.body,
-          silent: true,
-        });
-        void playTaskNotificationSound();
-      } catch {
-        // 浏览器通知不可用时静默忽略，避免打断主流程
-      }
-    },
+    showTaskNotification: notifications.showTaskNotification,
+    getWebNotificationState: notifications.getWebNotificationState,
+    onWebNotificationStateChanged: notifications.onWebNotificationStateChanged,
+    requestWebNotificationPermission: notifications.requestWebNotificationPermission,
+    ...(platformProxy ? {} : { setWebPushSubscribed: notifications.setWebPushSubscribed }),
     // Web 端不需要跨窗口 tab 管理
     syncWindowTabs: () => {},
     // Web 端没有宿主层 Dock / 任务栏徽标，保持空实现以兼容统一平台接口
@@ -187,7 +190,7 @@ export function createWebPlatform(options?: {
     onNewTask: () => () => {},
     onOpenWorkspace: () => () => {},
     onWindowFullscreenChanged: () => () => {},
-    onTaskNotificationClick: () => () => {},
+    onTaskNotificationClick: notifications.onTaskNotificationClick,
     exportLogs: () => Promise.resolve({ success: false, error: "Not supported in web mode" }),
     captureWindowScreenshot: () => Promise.resolve(null),
     importChromeBrowserData: (_options) =>

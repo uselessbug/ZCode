@@ -8,7 +8,9 @@ import { readV4ComposerDraft, V4_DRAFT_SCOPE_ROOT } from "@/v4/composer/composer
 import { readComposerWorkspaceScope } from "@/v4/composer/composerDraftStore.js";
 import { useComposerClientNamespace } from "@/hooks/useServices.js";
 import { isWorkspaceTab, type TabStoreState, type WindowTabState } from "@/store/tabStore.js";
-import { useTabStore } from "@/store/TabStoreProvider.js";
+import { useTabStore, useTabStoreApi } from "@/store/TabStoreProvider.js";
+import { ensureTaskNavigationWorkspace } from "@/app-shell/taskNavigationWorkspace.js";
+import { notifyTaskNavigationCommitted } from "@/store/zcodeSessionStoreNavigation.js";
 import { logger } from "@/logger.js";
 import { resolveImportedComposerConfig } from "@/v4/composer/newTaskDraft.js";
 import { dismissToast, toast, updateToast } from "@/components/ui/toast.js";
@@ -26,6 +28,114 @@ import {
   resolveShareImportFailurePresentation,
   type ShareImportIntent,
 } from "@/root/shareImportIntent.js";
+
+type NotificationTaskContext = { workspacePath?: string; workspaceIdentity?: string };
+
+/** 冷启动时 workspace 列表可能还在加载，通知点击最多等待这么久再放弃。 */
+const NOTIFICATION_TASK_WAIT_MS = 12_000;
+
+type NotificationNavigationDeps = {
+  activateTabByPath: (workspacePath: string, options?: { workspaceIdentity?: string }) => boolean;
+  addTab: (workspacePath: string) => void;
+  /** 读取当前激活的 workspace tab，用来取得 tab 实际使用的 workspaceIdentity。 */
+  getActiveWorkspaceTab: () => { workspacePath: string; workspaceIdentity?: string } | undefined;
+  /** 独立 Web 才允许在 identity 未命中时退回本地 path 与新建本地 tab。 */
+  allowLocalFallback: boolean;
+  /** 历史 tab 还没恢复完成时不能 addTab，否则会被随后的 restoreTabs 整体替换。 */
+  canOpenTab: boolean;
+};
+
+/**
+ * 激活通知目标 workspace，返回 tab 实际使用的 identity；目标暂不可用时返回 null。
+ *
+ * 独立 Web 的浏览器本地 tab 没有 workspaceIdentity，而服务端通知带的是 canonical identity，
+ * 所以 identity 未命中时先退回纯 path 激活，仍未打开则新建本地 tab。
+ */
+function activateNotificationWorkspace(
+  workspacePath: string,
+  workspaceIdentity: string | undefined,
+  deps: NotificationNavigationDeps,
+): { workspaceIdentity: string | undefined } | null {
+  const resolveIdentity = (fallback: string | undefined) => {
+    const activeTab = deps.getActiveWorkspaceTab();
+    return activeTab?.workspacePath === workspacePath ? activeTab.workspaceIdentity : fallback;
+  };
+  const strict = ensureTaskNavigationWorkspace({
+    workspacePath,
+    workspaceIdentity,
+    activateTabByPath: deps.activateTabByPath,
+    // 本地目录没有 tab 时的新建行为受 canOpenTab 约束，下面统一处理。
+    addLocalWorkspaceTab: (path) => {
+      if (deps.canOpenTab) deps.addTab(path);
+    },
+  });
+  if (strict.accepted) {
+    return deps.canOpenTab || !strict.openedLocalTab
+      ? { workspaceIdentity: resolveIdentity(workspaceIdentity) }
+      : null;
+  }
+  if (!deps.allowLocalFallback) return null;
+  if (deps.activateTabByPath(workspacePath)) {
+    return { workspaceIdentity: resolveIdentity(undefined) };
+  }
+  if (!deps.canOpenTab) return null;
+  deps.addTab(workspacePath);
+  return { workspaceIdentity: resolveIdentity(undefined) };
+}
+
+function commitNotificationTask(
+  workspacePath: string,
+  workspaceIdentity: string | undefined,
+  taskId: string,
+): void {
+  useZCodeSessionStore.getState().setActiveTaskId(workspacePath, taskId, workspaceIdentity);
+  // 与设置页、自动化跳转一致：发布“已查看”事实，让侧栏未读标记随之清除。
+  notifyTaskNavigationCommitted({ workspacePath, workspaceIdentity, taskId });
+}
+
+/**
+ * 尝试把通知对应的任务切到前台。返回 true 表示已处理完成，false 表示目标尚未就绪，需要继续等待。
+ * `state.activated` 记录 workspace 是否已激活过，之后只等任务列表，不再抢用户手动切换的 tab。
+ */
+function tryActivateNotificationTask(
+  taskId: string,
+  context: NotificationTaskContext | undefined,
+  deps: NotificationNavigationDeps,
+  state: { activated: { workspaceIdentity: string | undefined } | null },
+): boolean {
+  const sessionStore = useZCodeSessionStore.getState();
+  // 遍历所有 workspace 找到 taskId 所属的 workspace，然后激活对应 tab 并切换任务
+  for (const [workspacePath, workspaceState] of Object.entries(sessionStore.workspaces)) {
+    const taskMeta = workspaceState.taskListCache?.find((task) => task.taskId === taskId);
+    const hasTask = workspaceState.activeTaskId === taskId || Boolean(taskMeta);
+    if (hasTask) {
+      const targetWorkspacePath = taskMeta?.workspacePath ?? workspacePath;
+      // 通知点击会从全局 workspace store 反查 task。
+      // 远端任务必须用 task meta 自带的 workspaceIdentity 激活和选中，否则会落到 path-only 桶。
+      const activated = activateNotificationWorkspace(
+        targetWorkspacePath,
+        taskMeta?.workspaceIdentity,
+        deps,
+      );
+      if (!activated) return false;
+      commitNotificationTask(targetWorkspacePath, activated.workspaceIdentity, taskId);
+      return true;
+    }
+  }
+
+  // 通知自带 workspace 信息时，目标 workspace 的任务列表一旦加载完成就直接选中，
+  // 不必等任务出现在列表里（冷启动首屏列表可能只含最近任务）。
+  const targetPath = context?.workspacePath;
+  if (!targetPath) return false;
+  state.activated ??= activateNotificationWorkspace(targetPath, context?.workspaceIdentity, deps);
+  if (!state.activated) return false;
+  const identity = state.activated.workspaceIdentity;
+  if (sessionStore.getWorkspaceState(targetPath, identity).taskListCache === null) {
+    return false;
+  }
+  commitNotificationTask(targetPath, identity, taskId);
+  return true;
+}
 
 export function useRootPlatformEffects({
   initialWorkspaceAbsPath,
@@ -108,6 +218,25 @@ export function useRootPlatformEffects({
   const importOperationRef = useRef<string | null>(null);
   const lastImportProgressToastRef = useRef<{ phase: string; at: number } | null>(null);
   const importToastIdRef = useRef<number | null>(null);
+  // 冷启动通知点击等待 workspace 就绪的订阅；独立于平台监听 effect，避免 tabs 变化时被提前取消。
+  const pendingNotificationWaitRef = useRef<(() => void) | null>(null);
+  const tabStoreApi = useTabStoreApi();
+  // 通知点击回调只在平台监听 effect 里注册一次，这里用 ref 读取最新的 tab 恢复状态。
+  const notificationEnvRef = useRef({ addTab, hasCompletedFullTabRestore, isDesktop });
+  notificationEnvRef.current = { addTab, hasCompletedFullTabRestore, isDesktop };
+  const retryPendingNotificationRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    // 历史 tab 恢复完成后，等待中的通知目标可以开始新建 tab。
+    if (hasCompletedFullTabRestore) retryPendingNotificationRef.current?.();
+  }, [hasCompletedFullTabRestore]);
+
+  useEffect(
+    () => () => {
+      pendingNotificationWaitRef.current?.();
+      pendingNotificationWaitRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     // 启动时必须先判断 OAuth 本地会话，再恢复历史/初始 workspace。
@@ -265,30 +394,65 @@ export function useRootPlatformEffects({
           });
         })
       : () => {};
-    const disposeNotificationClick = platform.onTaskNotificationClick((taskId: string) => {
-      logger.info("[Root] onTaskNotificationClick:", taskId);
-      // 遍历所有 workspace 找到 taskId 所属的 workspace，然后激活对应 tab 并切换任务
-      const workspaces = useZCodeSessionStore.getState().workspaces;
-      for (const [workspacePath, workspaceState] of Object.entries(workspaces)) {
-        const taskMeta = workspaceState.taskListCache?.find((task) => task.taskId === taskId);
-        const hasTask = workspaceState.activeTaskId === taskId || Boolean(taskMeta);
-        if (hasTask) {
-          const targetWorkspacePath = taskMeta?.workspacePath ?? workspacePath;
-          const targetWorkspaceIdentity = taskMeta?.workspaceIdentity;
-          // 通知点击会从全局 workspace store 反查 task。
-          // 远端任务必须用 task meta 自带的 workspaceIdentity 激活和选中，否则会落到 path-only 桶。
-          activateTabByPath(
-            targetWorkspacePath,
-            targetWorkspaceIdentity ? { workspaceIdentity: targetWorkspaceIdentity } : undefined,
-          );
-          useZCodeSessionStore
-            .getState()
-            .setActiveTaskId(targetWorkspacePath, taskId, targetWorkspaceIdentity);
-          return;
-        }
-      }
-      logger.warn("[Root] onTaskNotificationClick: task not found in any workspace:", taskId);
-    });
+    const disposeNotificationClick = platform.onTaskNotificationClick(
+      (taskId: string, context?: NotificationTaskContext) => {
+        logger.info("[Root] onTaskNotificationClick:", taskId);
+        pendingNotificationWaitRef.current?.();
+        pendingNotificationWaitRef.current = null;
+        const deps = (): NotificationNavigationDeps => {
+          const env = notificationEnvRef.current;
+          return {
+            activateTabByPath,
+            addTab: (workspacePath) => env.addTab(workspacePath),
+            getActiveWorkspaceTab: () => {
+              const { tabs: currentTabs, activeTabId: currentActiveTabId } = tabStoreApi.getState();
+              const active = currentTabs.find((tab) => tab.id === currentActiveTabId);
+              return active && isWorkspaceTab(active) ? active : undefined;
+            },
+            allowLocalFallback: !env.isDesktop && Boolean(platform.setWebPushSubscribed),
+            canOpenTab: env.hasCompletedFullTabRestore,
+          };
+        };
+        const state: Parameters<typeof tryActivateNotificationTask>[3] = { activated: null };
+        if (tryActivateNotificationTask(taskId, context, deps(), state)) return;
+
+        // 冷启动瞬间 tab 与任务列表可能还没就绪：同时订阅 session store 与 tab store，就绪后再选中。
+        let finished = false;
+        let attempting = false;
+        const unsubscribers: Array<() => void> = [];
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const stop = () => {
+          finished = true;
+          for (const unsubscribe of unsubscribers) unsubscribe();
+          if (timer) clearTimeout(timer);
+          if (pendingNotificationWaitRef.current === stop) {
+            pendingNotificationWaitRef.current = null;
+          }
+          if (retryPendingNotificationRef.current === attempt) {
+            retryPendingNotificationRef.current = null;
+          }
+        };
+        const attempt = () => {
+          // setActiveTaskId / activateTabByPath 自身会触发 store 通知，重入时直接忽略。
+          if (finished || attempting) return;
+          attempting = true;
+          try {
+            if (tryActivateNotificationTask(taskId, context, deps(), state)) stop();
+          } finally {
+            attempting = false;
+          }
+        };
+        unsubscribers.push(useZCodeSessionStore.subscribe(attempt), tabStoreApi.subscribe(attempt));
+        timer = setTimeout(() => {
+          if (finished) return;
+          stop();
+          logger.warn("[Root] onTaskNotificationClick: task not found in any workspace:", taskId);
+          toast(intl.formatMessage({ id: "automations.runs.openSessionFailed" }));
+        }, NOTIFICATION_TASK_WAIT_MS);
+        pendingNotificationWaitRef.current = stop;
+        retryPendingNotificationRef.current = attempt;
+      },
+    );
     const disposeUpdateCheckResult = platform.onUpdateCheckResult
       ? platform.onUpdateCheckResult((payload) => {
           logger.info("[Root] onUpdateCheckResult:", payload.kind);
@@ -349,6 +513,7 @@ export function useRootPlatformEffects({
     activeWorkspacePath,
     platform,
     startNewTaskFromActiveWorkspace,
+    tabStoreApi,
     tabs,
   ]);
 

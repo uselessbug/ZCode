@@ -418,6 +418,34 @@ export function SettingsPage({
           linuxCloseToTrayCapability.gnomeLikeWithoutTray,
       }
     : undefined;
+  const [webPushSearchAvailable, setWebPushSearchAvailable] = useState(false);
+  useEffect(() => {
+    if (isDesktop || !platform.setWebPushSubscribed || !platform.getWebNotificationState) {
+      setWebPushSearchAvailable(false);
+      return;
+    }
+    let cancelled = false;
+    const apply = (state: {
+      pushAvailable?: boolean;
+      pushSupported: boolean;
+      permission: string;
+    }) => {
+      if (cancelled) return;
+      setWebPushSearchAvailable(
+        Boolean(state.pushAvailable) &&
+          (state.pushSupported || state.permission === "ios-install-required"),
+      );
+    };
+    platform
+      .getWebNotificationState()
+      .then(apply)
+      .catch(() => {});
+    const dispose = platform.onWebNotificationStateChanged?.(apply);
+    return () => {
+      cancelled = true;
+      dispose?.();
+    };
+  }, [isDesktop, platform]);
   const marketingRequest = useStore(marketingNavigation, (state) => state.request);
   useEffect(() => {
     if (marketingRequest?.target.page !== "settings") return;
@@ -1572,6 +1600,7 @@ export function SettingsPage({
                     tray: Boolean(isWindowsDesktop || isLinuxDesktop),
                     notWindows: !isWindowsDesktop,
                     macDesktop: Boolean(isDesktop && isMacDesktop),
+                    webPush: !isDesktop && webPushSearchAvailable,
                     computerUse: resolveComputerUseAvailability({
                       isDesktop: Boolean(isDesktop),
                       isMacDesktop: Boolean(isMacDesktop),

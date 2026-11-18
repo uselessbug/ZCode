@@ -3934,6 +3934,28 @@ const enUS: Record<string, string> = {
   "settings.notification": "Task notifications",
   "settings.notificationDescription":
     "Send desktop notifications when a task completes, fails, or needs approval.",
+  "settings.notificationDescriptionWeb":
+    "Send browser notifications when a task completes, fails, or needs your confirmation.",
+  "settings.notificationPermissionDefault": "Browser notifications are not allowed yet.",
+  "settings.notificationPermissionRequest": "Allow notifications",
+  "settings.notificationPermissionDenied":
+    "Notifications are blocked by the browser. Allow them in site settings or system settings.",
+  "settings.notificationPermissionIosInstall":
+    'On iPhone or iPad, tap Share and choose "Add to Home Screen", then open ZCode from the Home Screen to enable notifications.',
+  "settings.notificationPermissionUnsupported":
+    "This browser does not support system notifications.",
+  "settings.webPush": "Background notifications",
+  "settings.webPushDescription":
+    "Keep getting notifications on this device after you close the page or lock the screen.",
+  "settings.webPushError.permissionDenied":
+    "The browser refused the push subscription. Check the notification permission.",
+  "settings.webPushError.pushUnsupported":
+    "This browser or server does not support background notifications.",
+  "settings.webPushError.serverUnavailable": "The server is unavailable. Try again later.",
+  "settings.webPushError.subscribeFailed":
+    "Could not turn on background notifications. Try again later.",
+  "settings.webPushError.unsubscribeFailed":
+    "Could not turn off background notifications. Try again later.",
   "settings.notificationSound": "Notification sound",
   "settings.notificationSoundDescription":
     "When notifications are enabled, you can mute the task notification sound separately.",
