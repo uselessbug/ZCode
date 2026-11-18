@@ -17,7 +17,7 @@
 //       packages/ui/src/lib/taskNotificationOrchestrator.ts（真实 collectTerminalTaskNotificationPayloads：
 //       completedSuccess 完成、error 失败、completedInterrupted 静默）；
 //       packages/web/src/main.tsx（抽取真实 createStandaloneWebConnection 源码段执行：首连单往返、后台恢复 0ms 重连、
-//       退避序列；源码级断言 3000ms / 4500ms 宽限期、首屏不清空 #root 启动动画、无 inert 与 StandaloneFocusRestore 残留）。
+//       退避序列；源码级断言仅首连有 3000ms 提示、保留登录过期入口、首屏不清空 #root 启动动画且不锁屏）。
 //
 // 容器资源纪律：所有 esbuild 构建与子进程严格串行，且 GOMAXPROCS 默认 2（外部已设置则尊重外部值）；
 // 临时打包目录在 finally 中用 fs.rm 清理。
@@ -1442,8 +1442,6 @@ async function runStandaloneConnectionSuite() {
 return {
   createStandaloneWebConnection,
   constants: {
-    initialHint: STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS,
-    reconnectHint: STANDALONE_RECONNECT_HINT_DELAY_MS,
     idlePulse: STANDALONE_IDLE_PULSE_TIMEOUT_MS,
     recoverPulse: STANDALONE_RECOVER_PULSE_TIMEOUT_MS,
   },
@@ -1658,32 +1656,31 @@ return {
     h.connection.dispose();
   });
 
-  await check("main.tsx 源码：3000ms / 4500ms 宽限期，首屏不清空 #root 启动动画", async () => {
-    assert.match(source, /STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS = 3_000/u);
-    assert.match(source, /STANDALONE_RECONNECT_HINT_DELAY_MS = 4_500/u);
-    const bootstrapAt = source.indexOf("async function bootstrapWebApp");
-    const standalone = source.slice(source.indexOf("const coldLaunchTarget", bootstrapAt));
-    // 首连成功前（services 为空且提示未显示）不渲染：createRoot 首次 render 才会替换 #root 里的启动动画。
-    assert.match(standalone, /if \(!services && !showConnectionHint\) return;/u);
-    assert.equal(
-      (standalone.match(/root\.render\(/gu) ?? []).length,
-      1,
-      "独立 Web 只能有一个渲染入口，且位于上述守卫之后",
-    );
-    assert.ok(
-      standalone.indexOf("if (!services && !showConnectionHint) return;") <
-        standalone.indexOf("root.render("),
-    );
-    assert.doesNotMatch(standalone, /root\.(unmount|replaceChildren)|innerHTML\s*=/u);
-    assert.match(
-      standalone,
-      /hasLoadedServices\s*\?\s*STANDALONE_RECONNECT_HINT_DELAY_MS\s*:\s*STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS/u,
-      "首连 3s、曾连上过的重连 4.5s",
-    );
-    // 首屏 auth-required 立即提示；其余待连接状态只在宽限期后才显示。
-    assert.match(standalone, /let showConnectionHint = authRequiredAtStart;/u);
-    assert.match(standalone, /initialAccessVerified: bootstrap\.initialAccessState === "ok"/u);
-  });
+  await check(
+    "main.tsx 源码：仅首连等待 3 秒后提示，登录过期立即提示，普通重连不弹横幅",
+    async () => {
+      assert.match(source, /STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS = 3_000/u);
+      const bootstrapAt = source.indexOf("async function bootstrapWebApp");
+      const standalone = source.slice(source.indexOf("const coldLaunchTarget", bootstrapAt));
+      // 首连成功前（services 为空且提示未显示）不渲染，保留 #root 中的启动动画。
+      assert.match(standalone, /if \(!services && !showConnectionHint\) return;\s*root\.render\(/u);
+      assert.equal((standalone.match(/root\.render\(/gu) ?? []).length, 1);
+      assert.doesNotMatch(standalone, /root\.(unmount|replaceChildren)|innerHTML\s*=/u);
+      assert.equal((standalone.match(/setTimeout\(/gu) ?? []).length, 1);
+      assert.match(
+        standalone,
+        /if \(!authRequiredAtStart\) \{\s*connectionHintTimer = setTimeout\([\s\S]*?STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS\);\s*startConnection\(\);/u,
+        "只在首屏建连前启动提示计时器，不在连接状态变化时重设",
+      );
+      assert.match(standalone, /let showConnectionHint = authRequiredAtStart;/u);
+      assert.match(
+        standalone,
+        /if \(next === "connected" \|\| next === "auth-required"\) \{\s*clearTimeout\(connectionHintTimer\);\s*showConnectionHint = next === "auth-required";/u,
+        "连接成功关闭提示；登录失效立即提示",
+      );
+      assert.match(standalone, /initialAccessVerified: bootstrap\.initialAccessState === "ok"/u);
+    },
+  );
 
   await check(
     "main.tsx 源码：首连不重复请求 /api/server-info，且无 inert 与焦点恢复残留",

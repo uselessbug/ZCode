@@ -18,12 +18,15 @@
      - **主动停止或发新消息抢占打断静默**：`taskNotificationOrchestrator.ts` 将 `completedInterrupted` 从完成通知中排除（与后端 Web Push 一致保持静默，仅 `completedSuccess` 弹完成、`error` 弹失败）。
      - **平台限制**：Firefox Android 若浏览器进程已被系统彻底杀死，GeckoView 存在上游已知问题（Mozilla [Bug 1762032](https://bugzilla.mozilla.org/show_bug.cgi?id=1762032)）会忽略系统通知点击；后台驻留与切换标签场景通过 `openWindow` 回退拉起。设计见[独立 Web 浏览器通知与后台推送](../standalone-web-notifications.md)。
 
-2. **独立 Web 首屏零横幅直出与手机切后台 `0ms` 无感重连**
-   - **症状**：独立 Web 首屏加载时在 `resolveWebBootstrap` 请求 `/api/server-info` 后又在建连前重复请求一次 `/api/server-info` 并等待首包 `system.info`，且首屏短暂闪出“正在连接服务器…”横幅；断线重连期间给页面加 `inert` 会锁死滚动、强行 blur 输入框并收起手机软键盘；切后台恢复时首次重连固定等待 `1s` 且 `1500ms` 即弹出重连横幅。
-   - **已部署待复测（`c4a71467`，本地 `standalone-web-push.mjs` 连接恢复套件与 `standalone-desktop-parity-ui.mjs` 回归通过）**：
-     - `packages/web/src/main.tsx`：`resolveWebBootstrap` 已确认鉴权正常（`initialAccessState === "ok"`）时，首连跳过重复 `/api/server-info` 与首包 `system.info` 探活，直接单次 `/ws` 握手挂载 `<Root>`；首连 `3000ms` 内不渲染连接横幅，`#root` 保留 `index.html` 原生居中 Logo 启动动画，连上后一次渲染直出首页。
+2. **独立 Web 首屏零横幅直出、手机切后台 `0ms` 无感重连与移除已加载工作台重复重连横幅**
+   - **症状与用户反馈**：
+     - 独立 Web 首屏加载时在 `resolveWebBootstrap` 请求 `/api/server-info` 后又在建连前重复请求一次 `/api/server-info` 并等待首包 `system.info`，且首屏短暂闪出“正在连接服务器…”横幅；断线重连期间给页面加 `inert` 会锁死滚动、强行 blur 输入框并收起手机软键盘；切后台恢复时首次重连固定等待 `1s` 且 `1500ms` 即弹出重连横幅。
+     - `c4a71467` 将已加载工作台后的重连横幅延迟拉长至 `4500ms` 部署上线后，**用户反馈在工作台已加载状态下断线重连时，先看到上游自身的重连/反馈提示，随后又叠加上独立 Web 顶部的额外重连横幅**。
+   - **当前状态（`c4a71467` 已部署首屏直出、去 `inert` 与 `0ms` 重连；移除已加载工作台通用重连横幅跟进修改已完成本地定向回归，待部署复测）**：
+     - `packages/web/src/main.tsx`：`resolveWebBootstrap` 已确认鉴权正常（`initialAccessState === "ok"`）时，首连跳过重复 `/api/server-info` 与首包 `system.info` 探活，直接单次 `/ws` 握手挂载 `<Root>`；仅在启动首连阶段设置一次 `3000ms` 延迟计时，首连 `3000ms` 内不渲染连接横幅，`#root` 保留 `index.html` 原生居中 Logo 启动动画，连上后一次渲染直出首页（首连超 `3000ms` 才显示“正在连接服务器…”与手动重试）。
      - 移除断线期间锁死全页与收起手机软键盘的 `inert` 属性，并清理 `StandaloneFocusRestore*` 焦点快照恢复代码，断线重连期间页面保持可滚动、输入框可继续打字。
-     - 后台恢复采用 `2.5s`（`2500ms`）短超时探活，首次断开与切回前台首轮重连延迟改为 `0ms` 单往返（已连上过不重复请求 `/api/server-info`，仅在握手失败后检查一次访问状态区分 `401/403`；连续失败再按 `1s -> 2s -> 4s -> 8s` 退避），重连横幅显示延迟拉长至 `4500ms`（`401/403` 仍立即提示重新验证）。设计见[连接恢复](../standalone-web-recovery.md)与[重连连续性](../standalone-web-reconnect-continuity.md)。
+     - 后台恢复采用 `2.5s`（`2500ms`）短超时探活，首次断开与切回前台首轮重连延迟改为 `0ms` 单往返（已连上过不重复请求 `/api/server-info`，仅在握手失败后检查一次访问状态区分 `401/403`；连续失败再按 `1s -> 2s -> 4s -> 8s` 退避）。
+     - **移除已加载工作台后的独立 Web 通用重连横幅（跟进修改，本地定向回归通过，待部署复测）**：工作台一旦加载完成，普通断线重连无论持续多久均不再显示独立 Web 顶部通用重连横幅（移除 `4500ms` 重连计时与断线后通用重连横幅文案）。已打开的会话视图直接沿用上游挂载的会话订阅重连/反馈面板（面板内“重新连接”仅调用 `lease.store.retry()` 重试会话订阅，底层 `/ws` 由连接控制器在后台独立自动恢复；未挂载该面板的设置页或首页不新增额外提示）。首连与重连遇到 `auth-required`（`401/403/302`）仍立即显示重新验证横幅，点击其中重试时同一横幅暂态显示“正在连接服务器…”直至恢复或再次触发 `auth-required`。设计见[连接恢复](../standalone-web-recovery.md)与[重连连续性](../standalone-web-reconnect-continuity.md)。
 
 3. **无项目新建任务失效草稿目录自动换绑恢复（解决首页新建任务 `ENOENT`）**
    - **症状**：浏览器本地缓存的无项目草稿 `draftId` 对应磁盘目录（`/workspace/.zcode/conversations/draft-<id>`）被清理或移走后，从首页或会话区新建无项目任务时 `prepareSession({ draftId, reuseDraft: true })` 因磁盘目录 `ENOENT` 报错失败。

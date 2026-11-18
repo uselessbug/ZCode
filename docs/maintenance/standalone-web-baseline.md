@@ -23,9 +23,9 @@
 
 ### 1.1 升级保护能力范围
 
-以下能力均已集成到 `main` 并随 `c4a71467` 镜像部署上线；其中 `c4a71467` 新增的 4 项修复待实体设备复测。
+以下能力均已集成到 `main`（线上当前运行镜像为 `c4a71467`；针对用户在线上观察到“工作台加载后断线先出现上游重连/反馈提示、随后又弹出独立 Web 额外重连横幅”的跟进收敛修改已通过本地定向回归，待部署复测）。
 
-1. **连接恢复与重连连续性**：独立 Web 首屏单往返握手（`3000ms` 保留 `index.html` 启动动画）、切后台恢复 `2.5s` 快速探活与 `0ms -> 1s -> 2s -> 4s -> 8s` 退避重连（`4500ms` 重连横幅宽限期）、断线期间无 `inert` 锁页保持设置页/草稿/原生焦点、过期 RPC 清理、服务端项目 Host 别名解析。
+1. **连接恢复与重连连续性**：独立 Web 首屏单往返握手（仅首连设置一次 `3000ms` 延迟保留 `index.html` 启动动画，超时才显示首连提示与手动重试）、切后台恢复 `2.5s` 快速探活与 `0ms -> 1s -> 2s -> 4s -> 8s` 退避重连、工作台已加载后普通断线重连不再弹出独立 Web 顶部通用重连横幅（打开的会话视图沿用上游会话订阅重连/反馈面板，其“重新连接”重试 `lease.store.retry()`，设置页/首页不新增额外提示，底层 `/ws` 后台独立自动重连；首连与重连遇到 `auth-required` 仍立即显示重新验证横幅，点击重试在同一横幅暂态显示“正在连接服务器…”直至恢复或再次要求验证）、断线期间无 `inert` 锁页保持设置页/草稿/原生焦点、过期 RPC 清理、服务端项目 Host 别名解析。
 2. **任务、多 root 项目、受管 Worktree、定时任务与共享进程池**：独立 Web 任务归档/取消归档、侧栏任务菜单「显示文件树」（隐藏无效「前往 Provider 配置」）、无项目会话草稿（`/workspace/.zcode/conversations/draft-<id>`，目录缺失时返回 `project.draft-workspace-missing` 并由 `rotateMissingPendingTaskDraft` 自动换绑重建且保留草稿正文）与非项目目录共用 `SHARED_TASK_RUNTIME_KEY` 进程、0 目录新建与编辑清空目录（首次 `prepareSession` 懒创建 `/workspace/.zcode/workspace/<projectId>` 并独占项目进程）、多 root 项目目录增删与任务跨项目移入/移动、当前服务器本地 Git 受管 Worktree（`/workspace/.zcode/worktrees`）、独立 Web 定时任务 path-only 工作区身份（`workspaceIdentity: undefined`、`hostId = projectStorageHostId`，纯只读 `workspace_alias` 入站校验与冻结目录快照放行）、任务分组排序与移出分组。
    - **归档任务删除（3.18.2 用户可见变化）**：采用上游 3.18.2 官方「归档预检 + 二次确认永久删除」及同 Host 归档删除 carrier 路由（含受管 Worktree 归档任务主工作区路径对齐），不再保留旧版软删除 guard helper，不自动清理既有历史数据（2026-11-15 已实机确认）。
 3. **移动端、输入、消息渲染与浏览器通知/Web Push 适配**：手机 Home/Chat 单栏导航与设置页官方 `compact-web` 横向导航布局、子代理颜色选中居中与模型菜单 44px 触控尺寸、权限弹窗子代理来源完整换行与有界滚动、新建技能/插件试用预填自动跳转聊天页、独立 Web 开启 `assistantCodeCommentCardsEnabled` 代码批注卡片、普通文件与长粘贴 `<artifactId>/<安全化原文件名>` 具名子目录落盘并复用桌面 `readTextFileForModel` 预读、独立 Web 页内浏览器通知与标准 Web Push 后台推送（VAPID + `aes128gcm`、`<appConfigDir>/web-push/` 持久化、Service Worker 多标签去重/单次响铃/按 `taskId` 精确防打扰与最小化静音合并、主动打断 `completedInterrupted` 静默、PWA `manifest.webmanifest` 与点击通知按标签页优先级聚焦/冷启动跨工作区会话定位，详见 [`standalone-web-notifications.md`](../standalone-web-notifications.md)）。

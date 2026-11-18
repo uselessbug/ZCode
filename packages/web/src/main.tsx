@@ -1853,8 +1853,6 @@ type StandaloneWebConnectionState = "connecting" | "reconnecting" | "connected" 
 
 // 首次连接超过该时间仍未连上才显示连接提示；之前保留 index.html 的启动动画，避免先闪一下横幅。
 const STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS = 3_000;
-// 曾成功加载过 services 后的重连提示延迟；页面一直可读可写，后台静默重连期间不打扰用户。
-const STANDALONE_RECONNECT_HINT_DELAY_MS = 4_500;
 // 空闲周期心跳的超时；后台恢复时探活要更快失败以便立即重连。
 const STANDALONE_IDLE_PULSE_TIMEOUT_MS = 10_000;
 const STANDALONE_RECOVER_PULSE_TIMEOUT_MS = 2_500;
@@ -2129,18 +2127,10 @@ async function bootstrapWebApp() {
   const authRequiredAtStart = bootstrap.initialAccessState === "auth-required";
   let state: StandaloneWebConnectionState = authRequiredAtStart ? "auth-required" : "connecting";
   let connection: ReturnType<typeof createStandaloneWebConnection> | undefined;
-  let hasLoadedServices = false;
-  // 连接提示有宽限期：首连 3 秒、重连 4.5 秒内悄悄进行，不闪横幅；auth-required 立即提示。
-  // 首连成功前提示不显示时不渲染，#root 保留 index.html 的启动动画，连上后一次渲染直出首页。
+  // 只在首连超时或需要重新验证时显示横幅，避免与会话内已有的重连提示重复。
   let showConnectionHint = authRequiredAtStart;
   let connectionHintTimer: ReturnType<typeof setTimeout> | undefined;
   const zh = isZhLocale();
-  const isPending = (value: StandaloneWebConnectionState) =>
-    value === "connecting" || value === "reconnecting";
-  const clearConnectionHintTimer = () => {
-    if (connectionHintTimer) clearTimeout(connectionHintTimer);
-    connectionHintTimer = undefined;
-  };
   const render = () => {
     if (!services && !showConnectionHint) return;
     root.render(
@@ -2197,13 +2187,9 @@ async function bootstrapWebApp() {
                 ? zh
                   ? "登录验证已过期，请重新验证。当前页面已保留。"
                   : "Authentication required. Your page is preserved."
-                : hasLoadedServices
-                  ? zh
-                    ? "连接已断开，正在重新连接。当前页面已保留。"
-                    : "Reconnecting. Your page is preserved."
-                  : zh
-                    ? "正在连接服务器…"
-                    : "Connecting to the server…"}
+                : zh
+                  ? "正在连接服务器…"
+                  : "Connecting to the server…"}
             </span>
             {state === "auth-required" ? (
               <a className="underline" href={window.location.pathname}>
@@ -2223,34 +2209,6 @@ async function bootstrapWebApp() {
         ) : null}
       </>,
     );
-  };
-  const armConnectionHintTimer = () => {
-    clearConnectionHintTimer();
-    connectionHintTimer = setTimeout(
-      () => {
-        connectionHintTimer = undefined;
-        if (!isPending(state)) return;
-        showConnectionHint = true;
-        render();
-      },
-      hasLoadedServices
-        ? STANDALONE_RECONNECT_HINT_DELAY_MS
-        : STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS,
-    );
-  };
-  const applyState = (next: StandaloneWebConnectionState) => {
-    // controller 在 schedule 与每次 attempt 都会重复 publish connecting/reconnecting；
-    // 同一次离线期间不能重置宽限计时，也不能收起已经显示的提示。
-    const wasPending = isPending(state);
-    state = next;
-    if (isPending(next)) {
-      // 从 connected 或 auth-required 进入新的待连接阶段；已显示的提示（如点击重试）保持不动。
-      if (!wasPending && !showConnectionHint) armConnectionHintTimer();
-    } else {
-      clearConnectionHintTimer();
-      showConnectionHint = next === "auth-required";
-    }
-    render();
   };
   const startConnection = () => {
     connection = createStandaloneWebConnection({
@@ -2278,11 +2236,15 @@ async function bootstrapWebApp() {
       },
       onReady(next) {
         services = next;
-        hasLoadedServices = true;
         render();
       },
       onState(next) {
-        applyState(next);
+        state = next;
+        if (next === "connected" || next === "auth-required") {
+          clearTimeout(connectionHintTimer);
+          showConnectionHint = next === "auth-required";
+        }
+        render();
       },
       windowTarget: window,
       documentTarget: document,
@@ -2290,7 +2252,10 @@ async function bootstrapWebApp() {
   };
   // 登录态已确认失效时只显示重新验证入口，由用户点“重试连接”再建连；否则立即建连并开始宽限计时。
   if (!authRequiredAtStart) {
-    armConnectionHintTimer();
+    connectionHintTimer = setTimeout(() => {
+      showConnectionHint = true;
+      render();
+    }, STANDALONE_INITIAL_CONNECT_HINT_DELAY_MS);
     startConnection();
   } else {
     render();
@@ -2299,7 +2264,7 @@ async function bootstrapWebApp() {
     // BFCache 恢复（persisted）继续走既有 lifecycle 恢复路径，不做整页刷新；
     // 真实退出时释放连接并清理提示计时器。
     if (!event.persisted) {
-      clearConnectionHintTimer();
+      clearTimeout(connectionHintTimer);
       connection?.dispose();
     }
   });
