@@ -6,16 +6,16 @@
 
 - **Android Firefox Nightly 自动切换主题时页面重载并出现重连横幅**：主题跟随已恢复；2026-11-16 用户补充确认，切换时伴随页面重载、Firefox 顶部加载条和 ZCode 重连横幅。源码主题回调只更新类名、CSS `color-scheme` 和 `theme-color`，没有刷新或导航调用；下一步用固定主题、其他网站与 Firefox 稳定版作对照，并采集文档生命周期和 WebSocket 事件，定位 Firefox 重载或页面恢复链路的触发原因。Mozilla [Bug 1807095](https://bugzilla.mozilla.org/show_bug.cgi?id=1807095) 有类似报告，当前设备是否同因未确认。
 
-## 本轮已部署（`5759c882`，容器探针已通过，2 项）
+## 已部署并完成验收（`5759c882`，2 项）
 
-本轮针对线上暴露的“定时生成会话在侧栏/运行历史点击无法打开及同项目双开 `zcode-cli`”与“闲置工作区/草稿/插件管理进程常驻累积导致 OOM”完成源码修复与本地串行回归验收（`standalone-automation-runtime.mjs` 含真实 `createStandaloneProjectAlias` + `readTree` + `ensureTaskNavigationWorkspace` 三路跳转、删光历史记录继续调度、`draft-*` 共享同 PID、0 目录/普通项目独占 PID、`plugin-management` 空闲超时回收与重拉起）。提交 `5759c882`（完整 SHA：`5759c882095668742fc53d2ab857d6dce34ef216`，包含 `b8b71985`、`5759c882`）已通过 GitHub Actions [`44167318739`](https://github.com/uselessbug/ZCode/actions/runs/44167318739) `success` 发布镜像 `sha-5759c882`（digest `sha256:f9c120bc2a66d3dbe83548a1f05a67208911bc245bee44dd41cb5fbabb04378f`），并于 `2026-11-17T20:44:37.133Z` 完成宿主自更新部署与容器探针校验（`ai-agent-zcode-1` 状态 `running` / `healthy` / `restarts: 0`，HTTP 首页 `200`、鉴权 `/api/server-info` `200` 含 `capabilities.managedWorktrees: true`、未授权 `401`、WebSocket 握手 `pass`、`credential-secret` 与 `provider_config.json` 指纹不变、首页双值 `color-scheme` meta 为 `true`、`/opt/browser-mcp` 不存在）：
+本轮针对线上暴露的“定时生成会话在侧栏/运行历史点击无法打开及同项目双开 `zcode-cli`”与“闲置工作区/草稿/插件管理进程常驻累积导致 OOM”完成源码修复与本地串行回归验收（`standalone-automation-runtime.mjs` 含真实 `createStandaloneProjectAlias` + `readTree` + `ensureTaskNavigationWorkspace` 三路跳转、删光历史记录继续调度、`draft-*` 共享同 PID、0 目录/普通项目独占 PID、`plugin-management` 空闲超时回收与重拉起）。提交 `5759c882`（完整 SHA：`5759c882095668742fc53d2ab857d6dce34ef216`，包含 `b8b71985`、`5759c882`）已通过 GitHub Actions [`44167318739`](https://github.com/uselessbug/ZCode/actions/runs/44167318739) `success` 发布镜像 `sha-5759c882`（digest `sha256:f9c120bc2a66d3dbe83548a1f05a67208911bc245bee44dd41cb5fbabb04378f`），于 `2026-11-17T20:44:37.133Z` 完成宿主自更新部署与容器探针校验（`ai-agent-zcode-1` 状态 `running` / `healthy` / `restarts: 0`，HTTP 首页 `200`、鉴权 `/api/server-info` `200` 含 `capabilities.managedWorktrees: true`、未授权 `401`、WebSocket 握手 `pass`、`credential-secret` 与 `provider_config.json` 指纹不变、首页双值 `color-scheme` meta 为 `true`、`/opt/browser-mcp` 不存在），并于 2026-11-18 完成线上实测与运行日志验收：
 
 1. **独立 Web 定时任务回归官方 path-only 工作区身份（解决定时生成会话在侧栏/运行历史点击报“目标项目当前未连接”及同项目双开 `zcode-cli` 问题）**
    - **症状**：定时任务运行记录为 `succeeded`，但此前生成的会话携带 canonical `remote:server:oci-ai-agent:*` 身份，从侧栏或运行历史点击时 `ensureTaskNavigationWorkspace` 因无法匹配页面 path-only 标签按 `remote_attachment_missing` 拒绝并提示“目标项目当前未连接，无法打开该会话”，且与普通交互会话因 `workspaceKey` 不同在同项目下双开 `zcode-cli`。
-   - **修复与部署状态**：已部署（`5759c882`），容器探针已通过（`2026-11-17T20:44:37.133Z`）。`standalone-server` 开启 `allowStandaloneCloudWorkspaces` 时，新建项目定时任务、无项目定时任务与独立 Web path-only 会话内 `CronCreate` 保持 `workspaceIdentity: undefined`（`workspaceKey = workspacePath`），以 `hostId = projectStorageHostId` 表达服务器归属；入站非空身份先经纯只读 `workspace_alias` 校验拒绝异域请求（零写副作用）；关联既有 canonical 会话的定义保留本机 canonical 坐标且删除运行历史不影响继续派发；纯远端模式保持 `canonicalWorkspaceKey` 不变。
+   - **本地修改与线上验收**：已部署并完成验收（`5759c882`）。`standalone-server` 开启 `allowStandaloneCloudWorkspaces` 时，新建项目定时任务、无项目定时任务与独立 Web path-only 会话内 `CronCreate` 保持 `workspaceIdentity: undefined`（`workspaceKey = workspacePath`），以 `hostId = projectStorageHostId` 表达服务器归属；入站非空身份先经纯只读 `workspace_alias` 校验拒绝异域请求（零写副作用）；关联既有 canonical 会话的定义保留本机 canonical 坐标且删除运行历史不影响继续派发；纯远端模式保持 `canonicalWorkspaceKey` 不变。2026-11-18 用户实测“立即运行”正常，改为 1 分钟间隔（`* * * * *`）实测到期自动触发执行返回 `succeeded`（生成会话 `workspace_identity: null`），且与同项目交互对话共用同一顶层 `zcode-cli` 进程。
 2. **独立 Web 接通官方 `useSharedTaskRuntime` 非项目/`draft-*` 共享进程池与 `pluginProcessManager` 5 分钟空闲回收（缓解闲置工作区进程常驻累积 OOM）**
    - **症状**：2026-11-17 容器在 8 GiB 内存、512 进程/线程上限下，因多个无项目/`draft-*` 草稿工作区各自独占 `zcode-cli` 进程且 `pluginProcessManager` 常驻不回收，叠加活跃工作区与浏览器运行触发 OOM。
-   - **修复与部署状态**：已部署（`5759c882`），容器探针已通过（`2026-11-17T20:44:37.133Z`）。`allowStandaloneCloudWorkspaces` 开启且无 `workspaceIdentity` 时委托 `hasProjectWorkspace` 让所有无项目目录与 `draft-*` 草稿共用单个 `SHARED_TASK_RUNTIME_KEY` 进程（项目目录与 0 目录项目首次 `prepareSession` 目录仍独占项目进程）；`standalone-server` 为 `pluginProcessManager`（`plugin-management` lane）注入默认 5 分钟 `idleTimeoutMs` 自动回收并支持按需重新拉起（桌面端默认行为不变）。
+   - **本地修改与线上验收**：已部署并完成验收（`5759c882`）。`allowStandaloneCloudWorkspaces` 开启且无 `workspaceIdentity` 时委托 `hasProjectWorkspace` 让所有无项目目录与 `draft-*` 草稿共用单个 `SHARED_TASK_RUNTIME_KEY` 进程（项目目录与 0 目录项目首次 `prepareSession` 目录仍独占项目进程）；`standalone-server` 为 `pluginProcessManager`（`plugin-management` lane）注入默认 5 分钟 `idleTimeoutMs` 自动回收并支持按需重新拉起（桌面端默认行为不变）。2026-11-18 线上运行日志核实 `plugin-management` 进程在最后一次调用满 5 分钟（`07:37:38.181` → `07:42:38.181`）准时触发 `idle timeout; reclaiming` 自动退出，顶层仅保留当前活跃项目与 `/home/agent/.zcode` 无项目共享池两个进程。
 
 ## 已部署并完成验收（`5d682dfd`，桌面行为对齐 8 项）
 
@@ -28,7 +28,7 @@
 3. **独立 Web 开启代码批注卡片（`::code-comment`）**
    - **本地修改与线上验收**：`packages/web/src/main.tsx` `<Root>` 补传 `assistantCodeCommentCardsEnabled`，使独立 Web 与桌面、手机远控一致渲染结构化代码审查卡片。2026-11-17 线上验证代码批注卡片展开及点击跳转至文件第 1 行通过。
 4. **定时任务已冻结目录快照放行**
-   - **本地修改与线上验收**：进程内私有 `Symbol` 可信标记放行已持久化的定时任务目录快照，项目编辑或清空 `roots` 后仍按创建时冻结的目录快照创建会话。本地 `standalone-automation-runtime.mjs` 回归通过；2026-11-17 线上验证清空项目 `roots` 后按冻结目录立即运行状态为 `succeeded`（定时生成会话的工作区身份与侧栏打开问题已在 `5759c882` 修复并部署，见上方“本轮已部署”第 1 项）。
+   - **本地修改与线上验收**：进程内私有 `Symbol` 可信标记放行已持久化的定时任务目录快照，项目编辑或清空 `roots` 后仍按创建时冻结的目录快照创建会话。本地 `standalone-automation-runtime.mjs` 回归通过；2026-11-17 线上验证清空项目 `roots` 后按冻结目录立即运行状态为 `succeeded`（定时生成会话的工作区身份与侧栏打开问题已在 `5759c882` 修复并部署，见上方“已部署并完成验收（`5759c882`）”第 1 项）。
 5. **Browser Use 普通释放保留上下文与归档/删除生命周期清理**
    - **本地修改与线上验收**：普通 `closeSession` 仅释放租约并将 `BrowserContext`/页面/Cookie 保存在有界空闲池供后续恢复；归档、自动归档、删除、永久删除及项目数据清理（含已删 `owned` 子会话）统一经 per-`sessionKey` 串行队列触发 `closeTaskSessions` 彻底销毁上下文。2026-11-17 线上复跑真实 Chromium `verify-standalone-browser-use.mjs` 18/18 通过（含上下文/Cookie 保留、归档/删除/清理回收与并发保护）。
 6. **0 目录新建与清空目录对齐桌面生命周期**
@@ -51,7 +51,7 @@
    - **本地修改与线上验收**：前端对无 `localPath` 的普通文件统一按真实字节走 V4 `begin/chunk/commit` 分块上传（上限 20 MiB，支持 0 字节文件，超限抛 `OversizedInlineFileAttachmentError` 提供 5 语言提示并补齐图片超限本地化，移除前端 64K 字符截断）；用户实测 `.docx` 与 `.pdf` 附件上传通过，`5d682dfd` 进一步完成具名子目录落盘与桌面 `readTextFileForModel` 预读统一，2026-11-17 线上验证大文本、ZIP 与 20 MiB 超限提示通过。
 3. **独立 HTTP 服务端定时任务缺少到期调度与立即运行执行链**
    - **症状**：独立 HTTP Server 原先仅有 `AutomationService` 读写接口，未挂载进程内到期调度器与 `runAutomationNow` 执行派发器，导致定时任务到期不触发、点击「立即运行」报错。
-   - **本地修改与线上验收**：新增受管模块 `packages/services/src/automation-runtime`，提取并由 Desktop 与独立 HTTP 共享 20s 到期轮询、5min misfire 跳过、按 `runId` 幂等结算、单飞 manual claim 与 60s 心跳续租、统一变更 `wake` 及先排空在途派发再关库的优雅关闭；放行已持久化定时任务的冻结目录快照，仅在 `entry-http.ts` 显式启用执行链。本地 `standalone-automation-runtime.mjs` 回归通过；2026-11-17 线上排查确认此前两次失败源于所选模型供应商返回 HTTP 402（`insufficient_credits`），改用可用模型后到期运行与清空 `roots` 后按冻结目录立即运行均为 `succeeded`；后续 `5759c882` 进一步将独立 Web 定时任务回归官方 path-only 工作区身份（见上方“本轮已部署”第 1 项）。设计见[定时任务服务端执行链](../standalone-web-automation-runtime.md)。
+   - **本地修改与线上验收**：新增受管模块 `packages/services/src/automation-runtime`，提取并由 Desktop 与独立 HTTP 共享 20s 到期轮询、5min misfire 跳过、按 `runId` 幂等结算、单飞 manual claim 与 60s 心跳续租、统一变更 `wake` 及先排空在途派发再关库的优雅关闭；放行已持久化定时任务的冻结目录快照，仅在 `entry-http.ts` 显式启用执行链。本地 `standalone-automation-runtime.mjs` 回归通过；2026-11-17 线上排查确认此前两次失败源于所选模型供应商返回 HTTP 402（`insufficient_credits`），改用可用模型后到期运行与清空 `roots` 后按冻结目录立即运行均为 `succeeded`；后续 `5759c882` 进一步将独立 Web 定时任务回归官方 path-only 工作区身份（见上方“已部署并完成验收（`5759c882`）”第 1 项）。设计见[定时任务服务端执行链](../standalone-web-automation-runtime.md)。
 4. **非桌面 Web 停用 Z.ai 营销／活动轮询（冗余清理）**
    - **症状**：非桌面 Web 入口挂载了仅用于桌面端的 Z.ai 营销轮询，产生无用请求与重复 `ZodError` 日志。
    - **本地修改与线上验收**：`MarketingTouchProvider` 在非桌面入口（`!desktop`）直接返回空上下文，不创建营销 runtime/poller、不挂载 `MutationObserver`、不发起 `marketing-touch.query` 请求，消除自托管 Web 下的无用轮询与重复 `ZodError` 日志。本地 `standalone-attachment-upload.mjs` 挂载对照与线上验证通过。
