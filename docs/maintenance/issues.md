@@ -6,11 +6,11 @@
 
 - **Android Firefox Nightly 自动切换主题时页面重载并出现重连横幅**：主题跟随已恢复；2026-11-16 用户补充确认，切换时伴随页面重载、Firefox 顶部加载条和 ZCode 重连横幅。源码主题回调只更新类名、CSS `color-scheme` 和 `theme-color`，没有刷新或导航调用；下一步用固定主题、其他网站与 Firefox 稳定版作对照，并采集文档生命周期和 WebSocket 事件，定位 Firefox 重载或页面恢复链路的触发原因。Mozilla [Bug 1807095](https://bugzilla.mozilla.org/show_bug.cgi?id=1807095) 有类似报告，当前设备是否同因未确认。
 
-## 已提交待部署与实机验收（1 项）
+## 已部署待实机验收（`71149de2`，1 项）
 
 - **独立 Web 浏览器通知与后台推送（Web Push）**
   - **背景与缺口**：上游 Web 端缺少 `Notification.requestPermission()` 授权触发，`onTaskNotificationClick` 为空实现，Android 浏览器直接构造 `new Notification()` 不兼容，无多标签与双通道 `tag` 去重，且关闭网页或手机锁屏断连后无法收到任务完成、报错、待审批交互与定时任务终态通知。
-  - **当前状态**：已合入 `main` 并通过本地定向回归 `standalone-web-push.mjs`、架构检查与 `oxlint`，待 GitHub Actions 构建发布镜像、宿主自更新部署及真机浏览器验收。
+  - **当前状态**：已部署待实机验收（`71149de2`，完整 SHA：`71149de29744d8b0e5aeb3535e1b78a7b4c673c2`，包含 `7a72f272`、`d20c7f4c`、`71149de2`）。本地定向回归 `standalone-web-push.mjs`、架构检查与 `oxlint` 通过，经 GitHub Actions [`44247679952`](https://github.com/uselessbug/ZCode/actions/runs/44247679952) `success` 发布镜像 `sha-71149de2`（digest `sha256:63c56d16d39383d1c05a06a2155871e9c5f007231831ec7b9b79bfb2f14194b0`），于 `2026-11-18T06:24:33Z` 完成宿主自更新部署，并通过 `2026-11-18T06:24:31.853Z` 容器与运行探针校验（`ai-agent-zcode-1` 状态 `running` / `healthy` / `restarts: 0`；`GET /` `200` 含双值 `color-scheme` meta 与 `manifest` `crossorigin="use-credentials"`；`GET /manifest.webmanifest` `200` `application/manifest+json; charset=utf-8`、`Cache-Control: no-cache`；`GET /zcode-push-sw.js` `200` `text/javascript; charset=utf-8`、`Cache-Control: no-cache`；`GET /api/server-info` 鉴权 `200` 含 `capabilities.managedWorktrees: true`、未授权 `401`；`GET /api/web-push/config` 鉴权 `200` 含 `enabled: true` 与 87 字符 `vapidPublicKey`、未授权 `401`；`/home/agent/.zcode/v2/web-push/vapid.json` 已生成且权限 `0600`、目录 `0700`；WebSocket `/ws` 握手 `pass`；`credential-secret` 与 `provider_config.json` SHA-256 指纹不变；`/opt/browser-mcp` 不存在）。待实体桌面浏览器、Android 浏览器与 iOS 主屏幕 Web App 完成用户真机推送与点击回跳验收。
   - **实现概要**：
     - 页内通知与后台推送协同：补齐通知权限请求、Android Service Worker `showNotification` 兼容、4 秒 `tag`/`secondaryTag` 去重窗口、「任务通知」总开关退订联动与「通知声音」/语言偏好同步；遵守 `userVisibleOnly: true`（仅发可见 `show` 推送，前台聚焦或进入会话时本地清理系统通知，iOS/Safari 必展示防订阅吊销）。
     - 服务端 Web Push：覆盖会话完成/失败（用户主动停止 `completedInterrupted` 静默）、全局会话待审批/`AskUserQuestion`/`ExitPlanMode`（支持 `autoResolution` 转人工补发与已处理交互排队取消）、定时任务终态结算与同回合去重；基于 Node 原生 `crypto` 实现 VAPID（RFC 8292）与 `aes128gcm`（RFC 8291），状态持久化在 `<appConfigDir>/web-push/`，同源 `/api/web-push/*` 接口配合出站 DNS/IP 私网拦截。
