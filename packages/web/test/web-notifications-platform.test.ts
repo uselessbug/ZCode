@@ -1294,14 +1294,29 @@ const plain = (value: unknown) => JSON.parse(JSON.stringify(value));
 describe("push service worker script", () => {
   const scriptPath = new URL("../public/zcode-push-sw.js", import.meta.url);
 
+  /** 内存版 Cache Storage；同一个实例传给多次 loadWorker 即模拟 Service Worker 重启后读回持久记录。 */
+  function createFakeCaches() {
+    const entries = new Map<string, string>();
+    return {
+      open: async () => ({
+        match: async (url: string) =>
+          entries.has(url) ? new Response(entries.get(url)) : undefined,
+        put: async (url: string, response: Response) =>
+          void entries.set(url, await response.text()),
+      }),
+    };
+  }
+
   async function loadWorker(
     windowClients: Array<Record<string, unknown>>,
     userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36",
+    caches?: ReturnType<typeof createFakeCaches>,
   ) {
     const { readFile } = await import("node:fs/promises");
     const vm = await import("node:vm");
     const handlers = new Map<string, (event: any) => void>();
     let showFails = false;
+    let openWindowFails = false;
     let beforeShow: (() => Promise<void>) | undefined;
     const calls = {
       shown: [] as Array<{ title: string; options: any }>,
@@ -1319,8 +1334,14 @@ describe("push service worker script", () => {
       clients: {
         claim: async () => void (calls.claimed += 1),
         matchAll: async () => windowClients,
-        openWindow: async (url: string) => void calls.opened.push(url),
+        get: async (id: string) => windowClients.find((client) => client.id === id),
+        openWindow: async (url: string) => {
+          if (openWindowFails) throw new Error("InvalidAccessError");
+          calls.opened.push(url);
+          return { url };
+        },
       },
+      ...(caches ? { caches } : {}),
       registration: {
         showNotification: async (title: string, options: any) => {
           if (showFails) throw new TypeError("Illegal constructor");
@@ -1339,6 +1360,7 @@ describe("push service worker script", () => {
       console,
       Date,
       MessageChannel,
+      Response,
       setTimeout,
       clearTimeout,
     });
@@ -1355,6 +1377,9 @@ describe("push service worker script", () => {
       },
       setShowFails: (value: boolean) => {
         showFails = value;
+      },
+      setOpenWindowFails: (value: boolean) => {
+        openWindowFails = value;
       },
     };
   }
@@ -1425,6 +1450,8 @@ describe("push service worker script", () => {
   };
 
   const WORKBENCH_URL = "https://zcode.example/";
+  /** 点击只复用已经打开着该任务的标签页，下列单窗口用例都让窗口回报正在展示 t1。 */
+  const SHOWING_T1: PageState = { focused: false, activeTaskId: "t1" };
 
   it("shows a notification and tells background tabs", async () => {
     const posted: unknown[] = [];
@@ -1611,6 +1638,7 @@ describe("push service worker script", () => {
       makeWindowClient("https://zcode.example/?foo=1", {
         onFocus: () => void (focused += 1),
         onMessage: (message) => messages.push(message),
+        pageState: SHOWING_T1,
       }),
     ]);
     let closed = false;
@@ -1640,6 +1668,7 @@ describe("push service worker script", () => {
         visibilityState: "hidden",
         onMessage: (message) => messages.push(["original", message]),
         focusResult: { focused: true, visibilityState: "visible" },
+        pageState: SHOWING_T1,
       }),
     ]);
     await dispatch("notificationclick", {
@@ -1649,13 +1678,14 @@ describe("push service worker script", () => {
     assert.deepEqual(calls.opened, []);
   });
 
-  it("opens the deep link when focus() rejects, e.g. Android browsers in the background", async () => {
+  it("opens the deep link without navigating the hidden client when focus() rejects", async () => {
     const messages: unknown[] = [];
-    const { calls, dispatch } = await loadWorker([
+    const { calls, dispatch, setOpenWindowFails } = await loadWorker([
       makeWindowClient("https://zcode.example/", {
         visibilityState: "hidden",
         focusResult: "throw",
         onMessage: (message) => messages.push(message),
+        pageState: SHOWING_T1,
       }),
     ]);
     await dispatch("notificationclick", {
@@ -1664,25 +1694,36 @@ describe("push service worker script", () => {
         data: { taskId: "t1", workspacePath: "/repo", workspaceIdentity: "id-1" },
       },
     });
-    assert.equal(messages.length, 1);
+    assert.equal(messages.length, 0);
     assert.deepEqual(calls.opened, [
       "https://zcode.example/?zcodeTask=t1&zcodeWorkspace=%2Frepo&zcodeWorkspaceIdentity=id-1",
     ]);
+
+    // 仅当 openWindow 也拒绝（如 Chromium 交互令牌被 focus() 消耗）才回退发消息给已选目标窗口。
+    setOpenWindowFails(true);
+    await dispatch("notificationclick", {
+      notification: {
+        close: () => {},
+        data: { taskId: "t1", workspacePath: "/repo", workspaceIdentity: "id-1" },
+      },
+    });
+    assert.equal(messages.length, 1);
   });
 
-  it("opens the deep link when focus() resolves a client that is neither focused nor visible", async () => {
+  it("opens the deep link without navigating a hidden client when focus() resolves non-foreground", async () => {
     const messages: unknown[] = [];
     const { calls, dispatch } = await loadWorker([
       makeWindowClient("https://zcode.example/", {
         visibilityState: "hidden",
         onMessage: (message) => messages.push(message),
         focusResult: { focused: false, visibilityState: "hidden" },
+        pageState: SHOWING_T1,
       }),
     ]);
     await dispatch("notificationclick", {
       notification: { close: () => {}, data: { taskId: "t1", workspacePath: "/repo" } },
     });
-    assert.equal(messages.length, 1);
+    assert.equal(messages.length, 0);
     assert.deepEqual(calls.opened, ["https://zcode.example/?zcodeTask=t1&zcodeWorkspace=%2Frepo"]);
   });
 
@@ -1706,6 +1747,7 @@ describe("push service worker script", () => {
     const named = (name: string, extra: Record<string, unknown>) =>
       makeWindowClient("https://zcode.example/", {
         onMessage: () => messages.push(name),
+        pageState: SHOWING_T1,
         ...extra,
       });
     const { dispatch } = await loadWorker([
@@ -2017,7 +2059,7 @@ describe("push service worker script", () => {
       assert.deepEqual(log, ["focus:2", "message:2:zcode:notification-click"]);
     });
 
-    it("falls back from task to active workspace, open workspace, then any focused tab", async () => {
+    it("opens a deep link for a pure push instead of taking over tabs on other tasks or settings", async () => {
       const states: PageState[] = [
         {
           focused: false,
@@ -2025,29 +2067,90 @@ describe("push service worker script", () => {
           activeWorkspacePath: "/one",
           openWorkspacePaths: ["/one", "/three"],
         },
-        {
-          focused: false,
-          activeTaskId: "y",
-          activeWorkspacePath: "/two",
-          openWorkspacePaths: ["/two"],
-        },
+        { focused: true, activeTaskId: null, activeWorkspacePath: "", openWorkspacePaths: [] },
       ];
-      const route = async (
-        data: Record<string, unknown>,
-        extras: Array<Record<string, unknown>> = [],
-      ) => {
-        const { log, clients } = openTabs(states, extras);
-        const { dispatch } = await loadWorker(clients);
+      // 同工作区、已打开工作区或聚焦的设置页都不复用：只认正在展示该任务的标签页。
+      for (const data of [
+        { taskId: "unknown", workspacePath: "/one" },
+        { taskId: "unknown", workspacePath: "/three" },
+        { taskId: "unknown" },
+      ]) {
+        const { log, clients } = openTabs(states, [{}, { focused: true }]);
+        const { calls, dispatch } = await loadWorker(clients);
         await dispatch("notificationclick", click(data));
-        return log.filter((entry) => entry.startsWith("focus:"));
-      };
-      assert.deepEqual(await route({ taskId: "unknown", workspacePath: "/two" }), ["focus:1"]);
-      assert.deepEqual(await route({ taskId: "unknown", workspacePath: "/three" }), ["focus:0"]);
-      assert.deepEqual(
-        await route({ taskId: "unknown", workspacePath: "/nowhere" }, [{}, { focused: true }]),
-        ["focus:1"],
+        assert.deepEqual(log, [], JSON.stringify(data));
+        assert.equal(calls.opened.length, 1);
+      }
+      // 没有任务归属的通用通知只需拉起工作台，取聚焦的标签页。
+      const { log, clients } = openTabs(states, [{}, { focused: true }]);
+      const { dispatch } = await loadWorker(clients);
+      await dispatch("notificationclick", click({}));
+      assert.deepEqual(log, ["focus:1", "message:1:zcode:notification-click"]);
+    });
+
+    it("merges a late push and the page notification for one turn, keeps the origin tab across restarts, and still rings for the next turn", async () => {
+      const caches = createFakeCaches();
+      const turn1 = "zcode:event:turn:t1:1000";
+      const { log, clients } = openTabs(
+        [
+          { focused: false, activeTaskId: "other" },
+          { focused: false, activeTaskId: "x" },
+        ],
+        [
+          {
+            id: "origin",
+            visibilityState: "hidden",
+            focusResult: { focused: true, visibilityState: "visible" },
+          },
+          { id: "tab-2", visibilityState: "hidden" },
+        ],
       );
-      assert.deepEqual(await route({ taskId: "unknown" }, [{ focused: true }, {}]), ["focus:0"]);
+
+      // 推送先到（标签页都在后台）：展示并提醒。
+      const first = await loadWorker(clients, undefined, caches);
+      await first.dispatch("push", pushEvent({ ...showPayload, eventKey: turn1 }));
+      assert.equal(first.calls.shown.length, 1);
+      assert.equal(first.calls.shown[0]?.options.renotify, true);
+      assert.equal(first.calls.shown[0]?.options.data.eventKey, turn1);
+
+      // 随后同一事件的页内请求：不再展示、不响铃，只登记发起页。
+      const channel = new MessageChannel();
+      const reply = new Promise((resolve) => {
+        channel.port1.onmessage = (event) => resolve(event.data);
+      });
+      await first.dispatch("message", {
+        data: taskRequest({ eventKey: turn1 }),
+        ports: [channel.port2],
+        source: clients[0],
+      });
+      assert.deepEqual(plain(await reply), { shown: false, playSound: false });
+      channel.port1.close();
+      assert.equal(first.calls.shown.length, 1);
+
+      // Service Worker 重启后：重复投递在 userVisibleOnly 下静默替换原槽位，不再提醒。
+      const restarted = await loadWorker(clients, undefined, caches);
+      await restarted.dispatch("push", pushEvent({ ...showPayload, eventKey: turn1 }));
+      assert.equal(restarted.calls.shown.length, 1);
+      assert.equal(restarted.calls.shown[0]?.options.silent, true);
+      assert.equal(restarted.calls.shown[0]?.options.renotify, false);
+
+      // 点击回到登记的发起页，即使它此刻停在别的任务上。
+      log.length = 0;
+      await restarted.dispatch(
+        "notificationclick",
+        click({ taskId: "t1", eventKey: turn1, workspacePath: "/repo" }),
+      );
+      assert.deepEqual(log, ["focus:0", "message:0:zcode:notification-click"]);
+      assert.deepEqual(restarted.calls.opened, []);
+
+      // 同一会话的下一轮回合是新事件：照常展示并提醒。
+      await restarted.dispatch(
+        "push",
+        pushEvent({ ...showPayload, eventKey: "zcode:event:turn:t1:2000" }),
+      );
+      assert.equal(restarted.calls.shown.length, 2);
+      assert.equal(restarted.calls.shown[1]?.options.silent, false);
+      assert.equal(restarted.calls.shown[1]?.options.renotify, true);
     });
 
     it("treats unresponsive tabs as unknown and still picks the best answering tab", async () => {
@@ -2197,7 +2300,103 @@ describe("push service worker script", () => {
       assert.deepEqual([tab1.sounds, tab2.sounds], [1, 0]);
     });
 
-    it("falls back to the page when the service worker does not answer in time", async () => {
+    it("retains originClientId in data for non-keyed page notifications and across silent push merges", async () => {
+      const log: string[] = [];
+      const clients = [
+        makeWindowClient(WORKBENCH_URL, {
+          id: "origin-nonkeyed",
+          visibilityState: "hidden",
+          focusResult: { focused: true, visibilityState: "visible" },
+          pageState: { focused: false, activeTaskId: "other" },
+          onFocus: () => log.push("focus:0"),
+          onMessage: (message) => log.push(`message:0:${(message as { type: string }).type}`),
+        }),
+        makeWindowClient(WORKBENCH_URL, {
+          id: "tab-2",
+          visibilityState: "hidden",
+          pageState: { focused: false, activeTaskId: "t1" },
+          onFocus: () => log.push("focus:1"),
+          onMessage: (message) => log.push(`message:1:${(message as { type: string }).type}`),
+        }),
+      ];
+      const worker = await loadWorker(clients);
+      const channel = new MessageChannel();
+      const reply = new Promise((resolve) => {
+        channel.port1.onmessage = (event) => resolve(event.data);
+      });
+      await worker.dispatch("message", {
+        data: taskRequest(),
+        ports: [channel.port2],
+        source: clients[0],
+      });
+      assert.deepEqual(plain(await reply), { shown: true, playSound: true });
+      channel.port1.close();
+      assert.equal(worker.calls.shown[0]?.options.data.originClientId, "origin-nonkeyed");
+
+      // 隐藏窗口收到非 keyed 静默合并推送后，仍保留 originClientId；点击回到原发起页。
+      await worker.dispatch("push", pushEvent(showPayload));
+      assert.equal(worker.calls.shown.length, 2);
+      assert.equal(worker.calls.shown[1]?.options.silent, true);
+      assert.equal(worker.calls.shown[1]?.options.data.originClientId, "origin-nonkeyed");
+      log.length = 0;
+      await worker.dispatch("notificationclick", {
+        notification: { close: () => {}, data: worker.calls.shown[1]?.options.data },
+      });
+      assert.deepEqual(log, ["focus:0", "message:0:zcode:notification-click"]);
+      assert.deepEqual(worker.calls.opened, []);
+    });
+
+    it("marks keyed foreground-suppressed events as handled so late push after blur is skipped or silent", async () => {
+      const caches = createFakeCaches();
+      const turnKey = "zcode:event:turn:t1:5000";
+      const tab1Foreground = makeWindowClient(WORKBENCH_URL, {
+        id: "fg-tab",
+        focused: true,
+        visibilityState: "visible",
+        pageState: { focused: true, activeTaskId: "t1" },
+      });
+      const worker = await loadWorker([tab1Foreground], undefined, caches);
+
+      // 单页前台查看任务时，页面发送 zcode:mark-task-notification-handled 登记该 eventKey。
+      await worker.dispatch("message", {
+        data: {
+          type: "zcode:mark-task-notification-handled",
+          eventKey: turnKey,
+          tag: "zcode:task:t1:terminal",
+        },
+        source: tab1Foreground,
+      });
+
+      // 失焦/隐藏后晚到的推送（userVisibleOnly 需展示）必须保持 silent 且 renotify=false。
+      const tab1Hidden = makeWindowClient(WORKBENCH_URL, {
+        id: "fg-tab",
+        focused: false,
+        visibilityState: "hidden",
+        pageState: { focused: false, activeTaskId: "t1" },
+      });
+      const restarted = await loadWorker([tab1Hidden], undefined, caches);
+      await restarted.dispatch("push", pushEvent({ ...showPayload, eventKey: turnKey }));
+      assert.equal(restarted.calls.shown.length, 1);
+      assert.equal(restarted.calls.shown[0]?.options.silent, true);
+      assert.equal(restarted.calls.shown[0]?.options.renotify, false);
+
+      // 若此时仍有可见同源窗口（Chromium 豁免），晚到推送直接跳过。
+      const visibleWorker = await loadWorker(
+        [
+          makeWindowClient(WORKBENCH_URL, {
+            id: "visible-other",
+            visibilityState: "visible",
+            pageState: { focused: true, activeTaskId: "other" },
+          }),
+        ],
+        undefined,
+        caches,
+      );
+      await visibleWorker.dispatch("push", pushEvent({ ...showPayload, eventKey: turnKey }));
+      assert.equal(visibleWorker.calls.shown.length, 0);
+    });
+
+    it("does not duplicate page notification when active SW accepts postMessage but times out", async () => {
       const env = createEnv({ permission: "granted", existingSubscription: true });
       let sounds = 0;
       const controller = createWebNotificationController({
@@ -2208,14 +2407,64 @@ describe("push service worker script", () => {
       });
       const registration = await (
         env.host.navigator.serviceWorker as unknown as {
-          getRegistration(): Promise<{ active: unknown }>;
+          getRegistration(): Promise<{ active: unknown; showNotification: () => Promise<void> }>;
         }
       ).getRegistration();
+      // postMessage 成功交接但 SW 超时未回包：不得回退到本页展示或响铃。
       registration.active = { postMessage: () => {} };
       controller.showTaskNotification(payloadFor("task-a"));
       await new Promise((resolve) => setTimeout(resolve, 450));
-      assert.equal(env.shown.length, 1);
+      assert.equal(env.shown.length, 0);
+      assert.equal(env.legacyNotifications.length, 0);
+      assert.equal(sounds, 0);
+
+      // postMessage 抛出未交接且 registration.showNotification 不可用时，保留 new Notification 回退。
+      registration.active = {
+        postMessage: () => {
+          throw new Error("worker unavailable");
+        },
+      };
+      registration.showNotification = async () => {
+        throw new TypeError("not available");
+      };
+      controller.showTaskNotification(payloadFor("task-b"));
+      await flush();
+      assert.equal(env.legacyNotifications.length, 1);
       assert.equal(sounds, 1);
+    });
+
+    it("marks foreground-suppressed keyed notifications via active SW in controller", async () => {
+      const env = createEnv({ permission: "granted", existingSubscription: true });
+      env.setFocused(true);
+      let sounds = 0;
+      const controller = createWebNotificationController({
+        pushEnabled: true,
+        host: env.host,
+        reconcileOnStart: false,
+        playSound: () => void (sounds += 1),
+      });
+      const posted: unknown[] = [];
+      const registration = await (
+        env.host.navigator.serviceWorker as unknown as {
+          getRegistration(): Promise<{ active: unknown }>;
+        }
+      ).getRegistration();
+      registration.active = { postMessage: (message: unknown) => posted.push(message) };
+      controller.syncActiveTaskSession("task-a");
+      controller.showTaskNotification({
+        ...payloadFor("task-a"),
+        eventKey: "zcode:event:turn:task-a:1000",
+      });
+      await flush();
+      assert.deepEqual(posted, [
+        {
+          type: "zcode:mark-task-notification-handled",
+          eventKey: "zcode:event:turn:task-a:1000",
+          tag: "zcode:task:task-a:terminal",
+        },
+      ]);
+      assert.equal(env.shown.length, 0);
+      assert.equal(sounds, 0);
     });
 
     it("routes a click on task B to tab 2, leaving tab 1 on task A untouched", async () => {

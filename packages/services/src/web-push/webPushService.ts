@@ -1,8 +1,11 @@
 import { join } from "node:path";
 import {
   buildAutomationNotificationTag,
+  buildAutomationRunEventKey,
+  buildInteractionEventKey,
   buildInteractionNotificationTag,
   buildTerminalTaskNotificationTag,
+  buildTerminalTurnEventKey,
   formatWebPushNotificationCopy,
   type WebPushConfigResponse,
   type WebPushNotificationMessage,
@@ -375,6 +378,14 @@ export function createWebPushService(options: CreateWebPushServiceOptions = {}):
       const tag = isInteraction
         ? buildInteractionNotificationTag(interactionId!)
         : buildTerminalTaskNotificationTag(event.sessionId);
+      // 终态事件键只认调用方给出的稳定终态时间（terminalAt / occurredAt）；
+      // 缺失时不能拿当前时间冒充，保留旧的按 tag 去重。
+      const terminalAt = event.terminalAt ?? event.occurredAt;
+      const eventKey = isInteraction
+        ? buildInteractionEventKey(interactionId!)
+        : terminalAt !== undefined
+          ? buildTerminalTurnEventKey(event.sessionId, terminalAt)
+          : undefined;
       const ttlSeconds = isInteraction ? INTERACTION_TTL_SECONDS : TERMINAL_TTL_SECONDS;
 
       let token: PendingInteractionToken | undefined;
@@ -402,6 +413,7 @@ export function createWebPushService(options: CreateWebPushServiceOptions = {}):
                 version: 1,
                 action: "show",
                 eventId: event.eventId,
+                ...(eventKey ? { eventKey } : {}),
                 tag,
                 kind: event.kind,
                 title: copy.title,
@@ -450,6 +462,12 @@ export function createWebPushService(options: CreateWebPushServiceOptions = {}):
       const secondaryTag = event.sessionId
         ? buildTerminalTaskNotificationTag(event.sessionId)
         : undefined;
+      // 定时任务回合结算由同一次 syncer 终态迁移派生，沿用那一帧的时间即与会话终态、页内通知同一事件；
+      // 派发失败等没有会话终态的结算归属于 runId。
+      const eventKey =
+        event.sessionId && event.sessionTerminalAt !== undefined
+          ? buildTerminalTurnEventKey(event.sessionId, event.sessionTerminalAt)
+          : buildAutomationRunEventKey(event.runId);
 
       enqueueDelivery(() =>
         broadcastMessage((locale) => {
@@ -463,6 +481,7 @@ export function createWebPushService(options: CreateWebPushServiceOptions = {}):
             version: 1,
             action: "show",
             eventId,
+            eventKey,
             tag,
             ...(secondaryTag ? { secondaryTag } : {}),
             kind: event.kind,

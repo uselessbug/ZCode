@@ -55,6 +55,8 @@ export interface WebPushSessionEventInput {
   workspacePath?: string;
   workspaceIdentity?: string;
   occurredAt?: number;
+  /** 会话进入当前终态的稳定时间戳；优先于 occurredAt 构造终态事件键，避免受后续活动时间漂移影响。 */
+  terminalAt?: number;
   /** 当调用方已同步消费过自动化回合归属时置为 true，避免异步回调时误消费后续新 run。 */
   skipAutomationTurnCheck?: boolean;
 }
@@ -68,6 +70,8 @@ export interface WebPushAutomationEventInput {
   workspacePath?: string;
   workspaceIdentity?: string;
   occurredAt?: number;
+  /** 关联会话本回合的稳定终态时间戳（summary.terminalAt ?? 终态帧 lastActivityAt）；有它时事件键与该会话终态一致，否则按 runId 归属。 */
+  sessionTerminalAt?: number;
 }
 
 export interface IWebPushService {

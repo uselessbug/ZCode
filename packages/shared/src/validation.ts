@@ -663,6 +663,7 @@ export const taskNotificationPayloadSchema = z.object({
     "feedback_update",
   ]),
   requestId: nonEmptyStringSchema.optional(),
+  eventKey: nonEmptyStringSchema.optional(),
   workspacePath: nonEmptyStringSchema.optional(),
   workspaceIdentity: nonEmptyStringSchema.optional(),
   title: z.string(),

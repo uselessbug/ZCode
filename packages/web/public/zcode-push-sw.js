@@ -6,6 +6,11 @@
  * 多个工作台标签页各自知道自己正在查看的任务与工作区；需要决策时，Service Worker 通过
  * MessageChannel 向每个标签页发 zcode:query-client-state 取快照，超时的标签页按“未知”处理。
  *
+ * 同一事实（会话某一回合的终态、某个待处理交互、某次定时任务结算）带共享的 eventKey。
+ * 页内代展示请求与 push 事件串行裁决，已展示事件写入有界的持久记录（Cache Storage），
+ * 双通道先后到达、多标签并发、Service Worker 重启或晚到投递都合并为一次提醒，并保留发起页来源。
+ * 没有 eventKey 的旧载荷沿用按 tag 的 4 秒内存窗口。
+ *
  * 订阅使用 userVisibleOnly: true，每条 push 都必须对应一次可见通知，
  * 否则 iOS WebKit 会吊销订阅，Chrome 会弹出“此网站已在后台更新”。
  */
@@ -17,14 +22,22 @@ const WORKBENCH_PATHNAMES = new Set(["/", "/index.html"]);
 const QUERY_TASK_KEY = "zcodeTask";
 const QUERY_WORKSPACE_KEY = "zcodeWorkspace";
 const QUERY_WORKSPACE_IDENTITY_KEY = "zcodeWorkspaceIdentity";
-/** 与页面侧 WEB_NOTIFICATION_DEDUPE_WINDOW_MS 一致：同一个 tag 在该窗口内只提示一次。 */
+/** 与页面侧 WEB_NOTIFICATION_DEDUPE_WINDOW_MS 一致：没有 eventKey 的旧载荷按 tag 在该窗口内只提示一次。 */
 const DEDUPE_WINDOW_MS = 4_000;
 /** 等待单个标签页回报状态的上限，避免挂起的标签页拖住通知。 */
 const CLIENT_STATE_QUERY_TIMEOUT_MS = 120;
+/** 已展示事件的持久记录：容量与寿命都有上限，寿命覆盖服务端终态推送 TTL（24h）加投递余量。 */
+const EVENT_STORE_CACHE = "zcode-notification-events-v1";
+const EVENT_STORE_PATH = "/__zcode/notification-events.json";
+const EVENT_RECORD_LIMIT = 256;
+const EVENT_RECORD_TTL_MS = 25 * 60 * 60 * 1000;
 
-/** 跨标签共享：推送与页内通知代展示都记入同一张表。 */
+/** 旧载荷（无 eventKey）的跨标签内存去重表：推送与页内代展示共用。 */
 const recentTags = new Map();
-const pendingPageNotifications = new Map();
+/** eventKey → 记录；首次使用时从 Cache Storage 载入，之后以内存为准并写回。 */
+let eventRecords = null;
+/** 页内请求与 push 共用的串行队列，保证“查记录 → 展示 → 写记录”不被并发打断。 */
+let decisionQueue = Promise.resolve();
 
 self.addEventListener("install", () => {
   self.skipWaiting();
@@ -36,6 +49,13 @@ self.addEventListener("activate", (event) => {
 
 function readString(value) {
   return typeof value === "string" && value ? value : undefined;
+}
+
+function serial(task) {
+  const run = decisionQueue.then(task);
+  // 单个任务失败不能卡住后续裁决。
+  decisionQueue = run.catch(() => undefined);
+  return run;
 }
 
 /** 解析失败或缺字段时回落为通用通知，保证每条 push 都有可见通知。 */
@@ -53,11 +73,91 @@ function normalizePushPayload(event) {
     tag: readString(payload.tag) || GENERIC_TAG,
     secondaryTag: readString(payload.secondaryTag),
     eventId: readString(payload.eventId),
+    eventKey: readString(payload.eventKey),
     silent: Boolean(payload.silent),
     taskId: readString(payload.taskId),
     workspacePath: readString(payload.workspacePath),
     workspaceIdentity: readString(payload.workspaceIdentity),
   };
+}
+
+function eventStoreUrl() {
+  return new URL(EVENT_STORE_PATH, self.location.origin).href;
+}
+
+function sanitizeRecord(value) {
+  if (!value || typeof value !== "object") return null;
+  const key = readString(value.key);
+  const tag = readString(value.tag);
+  if (!key || !tag || typeof value.at !== "number") return null;
+  const originClientId = readString(value.originClientId);
+  return {
+    key,
+    tag,
+    at: value.at,
+    ...(originClientId ? { originClientId } : {}),
+    ...(value.suppressed === true ? { suppressed: true } : {}),
+  };
+}
+
+async function loadEventRecords() {
+  if (eventRecords) return eventRecords;
+  const records = new Map();
+  try {
+    const cache = await self.caches.open(EVENT_STORE_CACHE);
+    const response = await cache.match(eventStoreUrl());
+    const stored = response ? await response.json() : null;
+    const list = stored && Array.isArray(stored.records) ? stored.records : [];
+    for (const item of list) {
+      const record = sanitizeRecord(item);
+      if (record) records.set(record.key, record);
+    }
+  } catch {
+    // Cache Storage 不可用或数据损坏时只退化为本次生命周期内的内存记录。
+  }
+  // 并发的首次载入以先完成者为准，避免互相覆盖。
+  if (!eventRecords) eventRecords = records;
+  return eventRecords;
+}
+
+function pruneEventRecords(records) {
+  const current = Date.now();
+  for (const [key, record] of records) {
+    if (current - record.at >= EVENT_RECORD_TTL_MS) records.delete(key);
+  }
+  // Map 按插入顺序迭代，新记录总在末尾，超出容量时从最旧的开始淘汰。
+  for (const key of records.keys()) {
+    if (records.size <= EVENT_RECORD_LIMIT) break;
+    records.delete(key);
+  }
+}
+
+async function saveEventRecords(records) {
+  pruneEventRecords(records);
+  try {
+    const cache = await self.caches.open(EVENT_STORE_CACHE);
+    await cache.put(
+      eventStoreUrl(),
+      new Response(JSON.stringify({ version: 1, records: Array.from(records.values()) }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  } catch {
+    // 写入失败只影响 Service Worker 重启后的去重。
+  }
+}
+
+async function readEventRecord(eventKey) {
+  const records = await loadEventRecords();
+  pruneEventRecords(records);
+  return records.get(eventKey);
+}
+
+async function writeEventRecord(record) {
+  const records = await loadEventRecords();
+  records.delete(record.key);
+  records.set(record.key, record);
+  await saveEventRecords(records);
 }
 
 function listWindowClients() {
@@ -88,18 +188,29 @@ function readStringList(value) {
 }
 
 /** 去重窗口内是否记录过该 tag；传 source 时只认该来源（"page" 页内代展示 / "push" 推送）。 */
-function isRecentTag(tag, source) {
+function getRecentTagEntry(tag) {
   const current = Date.now();
   for (const [key, entry] of recentTags) {
     if (current - entry.at >= DEDUPE_WINDOW_MS) recentTags.delete(key);
   }
-  const entry = recentTags.get(tag);
+  return recentTags.get(tag);
+}
+
+function isRecentTag(tag, source) {
+  const entry = getRecentTagEntry(tag);
   return Boolean(entry) && (!source || entry.source === source);
 }
 
-function markTags(source, ...tags) {
+function markTags(source, tags, originClientId) {
   const current = Date.now();
-  for (const tag of tags) if (tag) recentTags.set(tag, { at: current, source });
+  for (const tag of tags) {
+    if (!tag) continue;
+    recentTags.set(tag, {
+      at: current,
+      source,
+      ...(originClientId ? { originClientId } : {}),
+    });
+  }
 }
 
 /** 向单个工作台标签页查询其状态；超时、不支持或出错返回 null。 */
@@ -154,6 +265,21 @@ function clickTargetData({ taskId, workspacePath, workspaceIdentity }) {
   return { taskId, workspacePath, workspaceIdentity };
 }
 
+function broadcastPushShown(workbenches, payload, tag) {
+  // 告知工作台标签页：这条通知已由推送展示，页内通知不要再响一次；
+  // 页面据 taskId 判断自己是不是正看着该任务，决定要不要立即收回（Apple WebKit 无法跳过展示）。
+  for (const client of workbenches) {
+    client.postMessage({
+      type: "zcode:web-push-shown",
+      tag,
+      secondaryTag: tag === payload.tag ? payload.secondaryTag : payload.tag,
+      eventId: payload.eventId,
+      eventKey: payload.eventKey,
+      taskId: payload.taskId,
+    });
+  }
+}
+
 async function showPushNotification(payload) {
   const workbenches = (await listWindowClients()).filter((client) => isWorkbenchClient(client.url));
   const hasVisibleWorkbench = workbenches.some((client) => client.visibilityState === "visible");
@@ -163,21 +289,33 @@ async function showPushNotification(payload) {
     canSkipDisplay &&
     hasForegroundViewer(await queryWorkbenchStates(workbenches), payload.taskId)
   ) {
+    if (payload.eventKey) {
+      const existing = await readEventRecord(payload.eventKey);
+      if (!existing) {
+        await writeEventRecord({
+          key: payload.eventKey,
+          tag: payload.tag,
+          at: Date.now(),
+          suppressed: true,
+        });
+      }
+    }
+    return;
+  }
+  if (payload.eventKey) {
+    await showKeyedPushNotification(payload, workbenches, canSkipDisplay);
     return;
   }
 
   const tags = [payload.tag, payload.secondaryTag].filter(Boolean);
-  // 页内请求可能还在查询标签页或展示。等实际结果，避免把未展示成功的占位当作重复推送。
-  for (;;) {
-    const pending = tags.map((tag) => pendingPageNotifications.get(tag)).filter(Boolean);
-    if (pending.length === 0) break;
-    await Promise.all(pending);
-  }
   const shownPageTag = tags.find((tag) => isRecentTag(tag, "page"));
   if (shownPageTag && canSkipDisplay) return;
 
+  const preservedOriginClientId = tags
+    .map((candidate) => getRecentTagEntry(candidate)?.originClientId)
+    .find(Boolean);
   const tag = shownPageTag ?? payload.tag;
-  markTags("push", ...tags);
+  markTags("push", tags, preservedOriginClientId);
   await self.registration.showNotification(payload.title, {
     body: payload.body,
     tag,
@@ -185,28 +323,52 @@ async function showPushNotification(payload) {
     // 已由页内展示时沿用原标签（也可能是定时任务的 secondaryTag），静默替换。
     silent: payload.silent || Boolean(shownPageTag),
     renotify: false,
-    data: { ...clickTargetData(payload), tag },
-  });
-
-  // 告知工作台标签页：这条通知已由推送展示，页内通知不要再响一次；
-  // 页面据 taskId 判断自己是不是正看着该任务，决定要不要立即收回（Apple WebKit 无法跳过展示）。
-  for (const client of workbenches) {
-    client.postMessage({
-      type: "zcode:web-push-shown",
+    data: {
+      ...clickTargetData(payload),
       tag,
-      secondaryTag: tag === payload.tag ? payload.secondaryTag : payload.tag,
-      eventId: payload.eventId,
-      taskId: payload.taskId,
-    });
+      ...(preservedOriginClientId ? { originClientId: preservedOriginClientId } : {}),
+    },
+  });
+  broadcastPushShown(workbenches, payload, tag);
+}
+
+/**
+ * 带 eventKey 的推送：同一事件已展示或被前台抑制过时，可跳过就跳过，
+ * 必须履行 userVisibleOnly 时以原 tag 静默替换，记录里的发起页来源保持不变。
+ * 新事件以 renotify 提醒，即使通知栏里还留着同一会话上一轮回合的通知。
+ */
+async function showKeyedPushNotification(payload, workbenches, canSkipDisplay) {
+  const existing = await readEventRecord(payload.eventKey);
+  if (existing && canSkipDisplay) return;
+  const tag = existing ? existing.tag : payload.tag;
+  const silent = payload.silent || Boolean(existing);
+  const originClientId = existing?.originClientId;
+  await self.registration.showNotification(payload.title, {
+    body: payload.body,
+    tag,
+    icon: ICON_PATH,
+    silent,
+    renotify: !silent,
+    data: {
+      ...clickTargetData(payload),
+      tag,
+      eventKey: payload.eventKey,
+      ...(originClientId ? { originClientId } : {}),
+    },
+  });
+  if (!existing) {
+    await writeEventRecord({ key: payload.eventKey, tag, at: Date.now() });
   }
+  broadcastPushShown(workbenches, payload, tag);
 }
 
 /**
  * 页内通知由页面请求 Service Worker 代展示。回复 { shown, playSound }：
- * 同一 tag 在去重窗口内已提示过，或另一个前台标签页正看着该任务时不展示、不响铃；
- * 否则由这里展示（silent），并只让发起请求的这一个标签页响铃。error 表示请求页应回退本地展示。
+ * 同一事件已提示或被前台抑制过（有 eventKey 时查持久记录，否则看 4 秒内的 tag），或另一个前台标签页正看着该任务时
+ * 不展示、不响铃；否则由这里展示（silent），并只让发起请求的这一个标签页响铃。
+ * error 表示请求页应回退本地展示。
  */
-async function decideTaskNotification(request) {
+async function decideTaskNotification(request, originClientId) {
   const payload = request.payload;
   const tag = readString(request.tag);
   if (
@@ -219,26 +381,41 @@ async function decideTaskNotification(request) {
   ) {
     return { shown: false, playSound: false, error: true };
   }
-  if (isRecentTag(tag)) return { shown: false, playSound: false };
-  if (pendingPageNotifications.has(tag)) {
-    const decision = await pendingPageNotifications.get(tag);
-    return { ...decision, shown: false, playSound: false };
+  const eventKey = readString(payload.eventKey);
+  if (eventKey) {
+    const existing = await readEventRecord(eventKey);
+    if (existing) {
+      // 推送先到或别的标签页已展示：不再提醒，只补记第一个发起页，供点击回到原页。
+      // 若原记录是前台查看抑制（suppressed），不把无关后台请求页绑定成发起页。
+      if (originClientId && !existing.originClientId && !existing.suppressed) {
+        await writeEventRecord({ ...existing, originClientId });
+      }
+      return { shown: false, playSound: false };
+    }
+  } else {
+    const recent = getRecentTagEntry(tag);
+    if (recent) {
+      if (originClientId && !recent.originClientId) {
+        recentTags.set(tag, { ...recent, originClientId });
+      }
+      return { shown: false, playSound: false };
+    }
   }
-  const pending = displayPageNotification(payload, tag);
-  pendingPageNotifications.set(tag, pending);
-  try {
-    return await pending;
-  } finally {
-    pendingPageNotifications.delete(tag);
-  }
+  return displayPageNotification(payload, tag, eventKey, originClientId);
 }
 
-async function displayPageNotification(payload, tag) {
+async function displayPageNotification(payload, tag, eventKey, originClientId) {
   try {
     const workbenches = (await listWindowClients()).filter((client) =>
       isWorkbenchClient(client.url),
     );
     if (hasForegroundViewer(await queryWorkbenchStates(workbenches), payload.taskId)) {
+      if (eventKey) {
+        const existing = await readEventRecord(eventKey);
+        if (!existing) {
+          await writeEventRecord({ key: eventKey, tag, at: Date.now(), suppressed: true });
+        }
+      }
       return { shown: false, playSound: false };
     }
     await self.registration.showNotification(payload.title, {
@@ -253,28 +430,68 @@ async function displayPageNotification(payload, tag) {
           workspaceIdentity: readString(payload.workspaceIdentity),
         }),
         tag,
+        ...(eventKey ? { eventKey } : {}),
+        ...(originClientId ? { originClientId } : {}),
       },
     });
-    markTags("page", tag);
+    if (eventKey) {
+      await writeEventRecord({
+        key: eventKey,
+        tag,
+        at: Date.now(),
+        ...(originClientId ? { originClientId } : {}),
+      });
+    } else {
+      markTags("page", [tag], originClientId);
+    }
     return { shown: true, playSound: true };
   } catch {
     return { shown: false, playSound: false, error: true };
   }
 }
 
+/** 只信任浏览器给出的 event.source：同源工作台窗口的 client id。 */
+function trustedSourceClientId(source) {
+  if (!source || typeof source.id !== "string" || !source.id) return undefined;
+  return isWorkbenchClient(source.url) ? source.id : undefined;
+}
+
 self.addEventListener("message", (event) => {
   const request = event.data;
-  if (!request || request.type !== "zcode:show-task-notification") return;
+  if (!request || typeof request !== "object") return;
+  if (request.type === "zcode:mark-task-notification-handled") {
+    if (event.source && !isWorkbenchClient(event.source.url)) return;
+    const eventKey = readString(request.eventKey);
+    const tag = readString(request.tag);
+    if (!eventKey || !tag) return;
+    event.waitUntil(
+      serial(async () => {
+        const existing = await readEventRecord(eventKey);
+        if (!existing) {
+          await writeEventRecord({ key: eventKey, tag, at: Date.now(), suppressed: true });
+        }
+      }),
+    );
+    return;
+  }
+  if (request.type !== "zcode:show-task-notification") return;
   const port = event.ports && event.ports[0];
+  const originClientId = trustedSourceClientId(event.source);
   event.waitUntil(
-    decideTaskNotification(request).then((decision) => {
-      if (port) port.postMessage(decision);
-    }),
+    serial(() => decideTaskNotification(request, originClientId)).then(
+      (decision) => {
+        if (port) port.postMessage(decision);
+      },
+      () => {
+        if (port) port.postMessage({ shown: false, playSound: false, error: true });
+      },
+    ),
   );
 });
 
 self.addEventListener("push", (event) => {
-  event.waitUntil(showPushNotification(normalizePushPayload(event)));
+  const payload = normalizePushPayload(event);
+  event.waitUntil(serial(() => showPushNotification(payload)));
 });
 
 function buildTargetUrl({ taskId, workspacePath, workspaceIdentity }) {
@@ -300,35 +517,54 @@ function pickPreferredClient(entries) {
   return preferred && preferred.client;
 }
 
-/**
- * 点击通知后挑选最合适的工作台标签页：已经打开着该任务的 > 当前停在该工作区的 >
- * 已打开该工作区 tab 的 > 任意聚焦/可见的。这样看着别的任务的标签页不会被冲掉。
- */
-async function pickTargetWorkbench(workbenches, { taskId, workspacePath }) {
-  if (workbenches.length === 1) return workbenches[0];
-  const entries = await queryWorkbenchStates(workbenches);
-  const tiers = [
-    taskId && ((state) => state.activeTaskId === taskId),
-    workspacePath && ((state) => state.activeWorkspacePath === workspacePath),
-    workspacePath && ((state) => state.openWorkspacePaths.includes(workspacePath)),
-  ];
-  for (const matches of tiers) {
-    if (!matches) continue;
-    const candidates = entries.filter(({ state }) => state !== null && matches(state));
-    if (candidates.length > 0) return pickPreferredClient(candidates);
+/** 记录里的发起页仍然存活且仍是工作台时返回它（依次查事件持久记录、通知 data、近期 tag）。 */
+async function findOriginClient(data) {
+  if (!data || typeof self.clients.get !== "function") return null;
+  try {
+    const eventKey = readString(data.eventKey);
+    let originClientId;
+    if (eventKey) {
+      const record = await readEventRecord(eventKey);
+      originClientId = record?.originClientId;
+    }
+    originClientId = originClientId || readString(data.originClientId);
+    if (!originClientId && !eventKey) {
+      const tag = readString(data.tag);
+      if (tag) originClientId = getRecentTagEntry(tag)?.originClientId;
+    }
+    if (!originClientId) return null;
+    const client = await self.clients.get(originClientId);
+    return client && isWorkbenchClient(client.url) ? client : null;
+  } catch {
+    return null;
   }
-  return pickPreferredClient(entries);
+}
+
+/**
+ * 点击通知后挑选目标工作台标签页：发起该通知的原页（仍存活）> 已经打开着该任务的标签页。
+ * 都没有时返回 null，由调用方打开深链新页，不切走正在看其他任务或设置的标签页。
+ * 没有 taskId 的通用通知只需要拉起工作台，取聚焦/可见的标签页。
+ */
+async function pickTargetWorkbench(workbenches, data) {
+  const { taskId } = data;
+  const origin = await findOriginClient(data);
+  if (origin) return origin;
+  if (workbenches.length === 0) return null;
+  const entries = await queryWorkbenchStates(workbenches);
+  if (!taskId) return pickPreferredClient(entries);
+  const candidates = entries.filter(({ state }) => state !== null && state.activeTaskId === taskId);
+  return candidates.length > 0 ? pickPreferredClient(candidates) : null;
 }
 
 async function openOrFocusTarget(data) {
   const { taskId, workspacePath, workspaceIdentity } = data;
   const targetUrl = buildTargetUrl(data);
   const workbenches = (await listWindowClients()).filter((client) => isWorkbenchClient(client.url));
-  if (workbenches.length === 0) {
+  const client = await pickTargetWorkbench(workbenches, data);
+  if (!client) {
     await self.clients.openWindow(targetUrl);
     return;
   }
-  const client = await pickTargetWorkbench(workbenches, data);
   const message = {
     type: "zcode:notification-click",
     taskId,
@@ -339,19 +575,19 @@ async function openOrFocusTarget(data) {
   try {
     focusedClient = await client.focus();
   } catch {
-    // 部分浏览器在无用户手势或后台时拒绝 focus，下面同步保底 postMessage 并尝试打开新窗口。
+    // 部分浏览器在无用户手势或后台时拒绝 focus，下面先尝试打开新窗口，仅在无法打开时才回退发消息给已选客户端。
   }
   if (isForegroundClient(focusedClient)) {
     focusedClient.postMessage(message);
     return;
   }
-  // Chromium 在调用 focus() 时会消耗单次窗口交互令牌，后续 openWindow 可能抛 InvalidAccessError；
-  // 先向已有窗口发跳转消息保底，再在 Firefox Android 等环境尝试 openWindow 拉起前台。
-  client.postMessage(message);
+  // focus() 失败或客户端仍不可见时先尝试 openWindow 打开新窗口；
+  // 只有 openWindow 被拒绝（如 Chromium 已消耗交互令牌）才回退让原目标客户端导航，避免新窗口打开同时误导航隐藏旧窗口。
   try {
-    await self.clients.openWindow(targetUrl);
+    const opened = await self.clients.openWindow(targetUrl);
+    if (opened === null) client.postMessage(message);
   } catch {
-    // 窗口交互令牌已被 focus() 消耗时保留上面的 postMessage 导航结果。
+    client.postMessage(message);
   }
 }
 

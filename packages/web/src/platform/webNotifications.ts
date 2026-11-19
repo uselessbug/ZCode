@@ -14,7 +14,10 @@ import {
   type WebPushSupportedLocale,
 } from "@zcode/shared/web-push";
 
-/** 同一个 tag 在该窗口内只提示一次，避免页内通知与 Web Push 重复响。 */
+/**
+ * 本页防抖窗口：同一事件键（没有事件键时为 tag）在该窗口内只交给 Service Worker 裁决一次。
+ * 跨标签、跨通道与 Service Worker 重启后的去重由 Service Worker 的持久事件记录负责。
+ */
 export const WEB_NOTIFICATION_DEDUPE_WINDOW_MS = 4_000;
 /** 页内通知交给 Service Worker 统一裁决时的等待上限，超时回退到本页直接展示。 */
 const SERVICE_WORKER_DECISION_TIMEOUT_MS = 300;
@@ -36,6 +39,8 @@ export interface WebNotificationTaskPayload {
   taskId: string;
   status: Parameters<typeof buildTaskNotificationTag>[0]["status"];
   requestId?: string;
+  /** 同一事实的稳定事件键；有它时 Service Worker 按它与 Web Push 合并并持久去重，否则退回按 tag 的 4 秒窗口。 */
+  eventKey?: string;
   /** 通知点击后用来定位会话所属工作区。 */
   workspacePath?: string;
   workspaceIdentity?: string;
@@ -99,20 +104,49 @@ export function toWebPushLocale(locale: string | undefined): WebPushSupportedLoc
   return locale.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
 }
 
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+type ServiceWorkerNotificationDecision =
+  | { status: "decided"; shown: boolean; playSound: boolean }
+  | { status: "error" }
+  | { status: "undelivered" }
+  | { status: "timeout" };
+
+function parseSwDecision(data: unknown): ServiceWorkerNotificationDecision {
+  if (!data || typeof data !== "object") return { status: "error" };
+  const record = data as { shown?: unknown; playSound?: unknown; error?: unknown };
+  if (record.error === true) return { status: "error" };
+  return { status: "decided", shown: record.shown === true, playSound: record.playSound === true };
+}
+
+function clickTargetOf(payload: {
+  taskId: string;
+  workspacePath?: string;
+  workspaceIdentity?: string;
+}): NotificationClickTarget {
+  return {
+    taskId: payload.taskId,
+    ...(payload.workspacePath ? { workspacePath: payload.workspacePath } : {}),
+    ...(payload.workspaceIdentity ? { workspaceIdentity: payload.workspaceIdentity } : {}),
+  };
+}
+
 /** 读取并清理通知深链参数，其余查询参数（token、remote 等）原样保留。 */
 export function consumeNotificationDeepLink(
   host: Pick<WebNotificationHost, "location" | "history"> = window,
 ): NotificationClickTarget | null {
   const params = new URLSearchParams(host.location.search);
-  const taskId = params.get(WEB_PUSH_QUERY_TASK_KEY)?.trim();
-  const workspacePath = params.get(WEB_PUSH_QUERY_WORKSPACE_KEY)?.trim();
-  const workspaceIdentity = params.get(WEB_PUSH_QUERY_WORKSPACE_IDENTITY_KEY)?.trim();
   const queryKeys = [
     WEB_PUSH_QUERY_TASK_KEY,
     WEB_PUSH_QUERY_WORKSPACE_KEY,
     WEB_PUSH_QUERY_WORKSPACE_IDENTITY_KEY,
   ];
   if (!queryKeys.some((key) => params.has(key))) return null;
+  const taskId = params.get(WEB_PUSH_QUERY_TASK_KEY)?.trim();
+  const workspacePath = params.get(WEB_PUSH_QUERY_WORKSPACE_KEY)?.trim();
+  const workspaceIdentity = params.get(WEB_PUSH_QUERY_WORKSPACE_IDENTITY_KEY)?.trim();
   for (const key of queryKeys) params.delete(key);
   const search = params.toString();
   host.history.replaceState(
@@ -120,12 +154,7 @@ export function consumeNotificationDeepLink(
     "",
     `${host.location.pathname}${search ? `?${search}` : ""}${host.location.hash}`,
   );
-  if (!taskId) return null;
-  return {
-    taskId,
-    ...(workspacePath ? { workspacePath } : {}),
-    ...(workspaceIdentity ? { workspaceIdentity } : {}),
-  };
+  return taskId ? clickTargetOf({ taskId, workspacePath, workspaceIdentity }) : null;
 }
 
 function urlBase64ToUint8Array(value: string): Uint8Array<ArrayBuffer> {
@@ -170,9 +199,10 @@ export function createWebNotificationController(options: WebNotificationControll
 
   function isIosBrowser(): boolean {
     const ua = host.navigator.userAgent ?? "";
-    if (/iPad|iPhone|iPod/.test(ua)) return true;
-    // iPadOS 13+ 默认伪装成 Mac Safari，只能靠触控点数区分。
-    return host.navigator.platform === "MacIntel" && (host.navigator.maxTouchPoints ?? 0) > 1;
+    return (
+      /iPad|iPhone|iPod/.test(ua) ||
+      (host.navigator.platform === "MacIntel" && (host.navigator.maxTouchPoints ?? 0) > 1)
+    );
   }
 
   function isStandaloneDisplay(): boolean {
@@ -387,18 +417,12 @@ export function createWebNotificationController(options: WebNotificationControll
     }
   }
 
-  async function unsubscribe(): Promise<void> {
-    const subscription = await readSubscription();
-    if (subscription) await dropSubscription(subscription);
-  }
-
   async function setWebPushSubscribed(
     subscribed: boolean,
     setOptions?: { locale?: string; soundEnabled?: boolean },
   ): Promise<WebNotificationStateSnapshot> {
     if (!pushEnabled || !hasPushApi()) return emitState();
     if (subscribed) {
-      // “任务通知”总开关关闭时不允许建立后台订阅。
       if (!isEnabled()) return emitState();
       // 本设备已订阅时，再次调用只是把最新的语言与声音偏好同步给服务端，不打断界面。
       if (readPermission() === "granted") {
@@ -419,19 +443,17 @@ export function createWebNotificationController(options: WebNotificationControll
     try {
       if (subscribed) {
         if (readPermission() === "default") await requestPermissionNow();
-        if (readPermission() !== "granted") return await finishToggle();
-        await subscribe(setOptions?.locale, setOptions?.soundEnabled);
+        if (readPermission() === "granted") {
+          await subscribe(setOptions?.locale, setOptions?.soundEnabled);
+        }
       } else {
-        await unsubscribe();
+        const subscription = await readSubscription();
+        if (subscription) await dropSubscription(subscription);
       }
     } catch (error) {
       console.warn("[web-push] failed to update subscription", error);
       local.error = toErrorCode(error, subscribed ? "subscribe_failed" : "unsubscribe_failed");
     }
-    return finishToggle();
-  }
-
-  function finishToggle(): Promise<WebNotificationStateSnapshot> {
     local.busy = false;
     return emitState();
   }
@@ -513,10 +535,6 @@ export function createWebNotificationController(options: WebNotificationControll
     return isPageForeground() && (!taskId || activeTaskId === taskId);
   }
 
-  /**
-   * 约定 paths[0] 是当前激活的工作区（没有激活工作区时为空串），其后是本页所有已打开的工作区。
-   * 平台接口里没有单独的“激活工作区”入口，复用 syncWindowTabs 携带。
-   */
   function syncWindowTabs(paths: string[]): void {
     activeWorkspacePath = paths[0] || null;
     openWorkspacePaths = paths.filter(Boolean);
@@ -530,7 +548,6 @@ export function createWebNotificationController(options: WebNotificationControll
     taskId: string,
     context?: { workspacePath?: string; workspaceIdentity?: string },
   ): void {
-    // 进入会话后，该会话遗留的系统通知（终态、待确认等）都已经处理过，一并清掉。
     void closeDisplayedNotifications(
       (notification) => (notification.data as { taskId?: unknown } | null)?.taskId === taskId,
     );
@@ -551,12 +568,9 @@ export function createWebNotificationController(options: WebNotificationControll
   function onTaskNotificationClick(handler: NotificationClickHandler): () => void {
     clickHandlers.add(handler);
     flushPendingClicks();
-    return () => {
-      clickHandlers.delete(handler);
-    };
+    return () => void clickHandlers.delete(handler);
   }
 
-  /** 返回 true 表示该 tag 刚提示过，调用方应跳过。 */
   function isRecentTag(tag: string): boolean {
     const current = now();
     for (const [key, at] of recentTags) {
@@ -565,50 +579,51 @@ export function createWebNotificationController(options: WebNotificationControll
     return recentTags.has(tag);
   }
 
-  function markTag(tag: string): void {
-    recentTags.set(tag, now());
-  }
+  const markTag = (tag: string): void => void recentTags.set(tag, now());
 
-  function clickTargetOf(payload: WebNotificationTaskPayload): NotificationClickTarget {
-    return {
-      taskId: payload.taskId,
-      ...(payload.workspacePath ? { workspacePath: payload.workspacePath } : {}),
-      ...(payload.workspaceIdentity ? { workspaceIdentity: payload.workspaceIdentity } : {}),
-    };
-  }
-
-  /** 把页内通知交给 Service Worker 统一裁决（跨标签去重、同任务前台抑制）；不可用或超时返回 null。 */
+  /** 把页内通知交给 Service Worker 统一裁决（跨标签去重、同任务前台抑制）；区分未投递/报错与已交接超时。 */
   function askServiceWorker(
     worker: ServiceWorker,
     payload: WebNotificationTaskPayload,
     tag: string,
-  ): Promise<{ shown: boolean; playSound: boolean; error: boolean } | null> {
+  ): Promise<ServiceWorkerNotificationDecision> {
+    if (worker.state === "redundant") return Promise.resolve({ status: "undelivered" });
     return new Promise((resolve) => {
       const channel = new MessageChannel();
-      const finish = (result: { shown: boolean; playSound: boolean; error: boolean } | null) => {
+      let settled = false;
+      const finish = (result: ServiceWorkerNotificationDecision) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         channel.port1.close();
         resolve(result);
       };
-      const timer = setTimeout(() => finish(null), SERVICE_WORKER_DECISION_TIMEOUT_MS);
-      channel.port1.onmessage = (event: MessageEvent) => {
-        const data = event.data as { shown?: unknown; playSound?: unknown; error?: unknown } | null;
-        finish(
-          data && typeof data === "object"
-            ? {
-                shown: data.shown === true,
-                playSound: data.playSound === true,
-                error: data.error === true,
-              }
-            : null,
-        );
-      };
+      const timer = setTimeout(
+        () => finish({ status: "timeout" }),
+        SERVICE_WORKER_DECISION_TIMEOUT_MS,
+      );
+      channel.port1.onmessage = (event: MessageEvent) => finish(parseSwDecision(event.data));
       try {
         worker.postMessage({ type: "zcode:show-task-notification", payload, tag }, [channel.port2]);
       } catch {
-        finish(null);
+        finish({ status: "undelivered" });
       }
     });
+  }
+
+  /** 前台正查看该任务而抑制带事件键的页内通知时，同步告知 Service Worker 记为已处理，避免失焦后迟到推送再次响铃。 */
+  async function markTaskNotificationHandled(eventKey: string, tag: string): Promise<void> {
+    const registration = await findRegistration();
+    if (!registration?.active || registration.active.state === "redundant") return;
+    try {
+      registration.active.postMessage({
+        type: "zcode:mark-task-notification-handled",
+        eventKey,
+        tag,
+      });
+    } catch {
+      // Service Worker 不可达时静默忽略，不影响前台抑制本身。
+    }
   }
 
   /** 本页直接展示：优先 registration.showNotification，其次 new Notification。 */
@@ -652,54 +667,48 @@ export function createWebNotificationController(options: WebNotificationControll
   }
 
   /**
-   * played：已展示且由本页响铃；skipped：别处已展示或有标签页正看着该任务，本页什么都不做；
+   * played：已展示且由本页响铃；skipped：别处已展示、前台正在查看或已交接 Service Worker 等待裁决，本页什么都不做；
    * failed：没能展示，调用方释放去重占位。
-   * 独立 Web 有激活的 Service Worker 时由它跨标签裁决，保证同一事件只弹一次、只响一次。
    */
   async function deliverTaskNotification(
     payload: WebNotificationTaskPayload,
     tag: string,
   ): Promise<"played" | "skipped" | "failed"> {
-    // 远控页没有独立 Server，也不借用根作用域的 Service Worker，直接走 Notification。
     const registration = pushEnabled ? await findRegistration() : undefined;
     if (registration?.active) {
       const decision = await askServiceWorker(registration.active, payload, tag);
-      if (decision && !decision.error) {
+      if (decision.status === "decided") {
         return decision.shown && decision.playSound ? "played" : "skipped";
       }
+      // postMessage 已成功交接给 Service Worker，超时只代表裁决尚未回包，不得再本页重复弹窗。
+      if (decision.status === "timeout") return "skipped";
     }
     return (await showTaskNotificationLocally(payload, tag, registration)) ? "played" : "failed";
   }
 
   function showTaskNotification(payload: WebNotificationTaskPayload): void {
     if (!isEnabled()) return;
-    if (isViewingTask(payload.taskId)) return;
-    if (readPermission() !== "granted") return;
     const tag = buildTaskNotificationTag(payload);
-    if (isRecentTag(tag)) return;
-    // 先占位再异步发送，连续两次调用不会各弹一条。
-    markTag(tag);
+    if (isViewingTask(payload.taskId)) {
+      if (payload.eventKey && pushEnabled && readPermission() === "granted") {
+        void markTaskNotificationHandled(payload.eventKey, tag);
+      }
+      return;
+    }
+    if (readPermission() !== "granted") return;
+    const dedupeKey = payload.eventKey || tag;
+    if (isRecentTag(dedupeKey)) return;
+    markTag(dedupeKey);
     void deliverTaskNotification(payload, tag).then((outcome) => {
       if (outcome === "played") void options.playSound?.();
-      else if (outcome === "failed") recentTags.delete(tag);
+      else if (outcome === "failed") recentTags.delete(dedupeKey);
     });
   }
 
   function handleServiceWorkerMessage(event: MessageEvent): void {
-    const data = event.data as
-      | {
-          type?: string;
-          tag?: unknown;
-          secondaryTag?: unknown;
-          taskId?: unknown;
-          workspacePath?: unknown;
-          workspaceIdentity?: unknown;
-        }
-      | null
-      | undefined;
+    const data = event.data as Record<string, unknown> | null | undefined;
     if (!data || typeof data !== "object") return;
     if (data.type === "zcode:query-client-state") {
-      // Service Worker 做展示或点击路由决策前的快照查询，只回报本页事实，不做判断。
       event.ports?.[0]?.postMessage({
         focused: isPageForeground(),
         activeTaskId,
@@ -709,33 +718,24 @@ export function createWebNotificationController(options: WebNotificationControll
       return;
     }
     if (data.type === "zcode:web-push-shown") {
-      // 主标签与次标签（如定时任务与会话终态）都记入去重窗口，避免页内通知再响一次。
-      const tags = [data.tag, data.secondaryTag].filter(
-        (tag): tag is string => typeof tag === "string" && tag.length > 0,
+      const tags = [readString(data.tag), readString(data.secondaryTag)].filter(
+        (tag): tag is string => Boolean(tag),
       );
-      for (const tag of tags) markTag(tag);
-      // iOS/Safari 下 Service Worker 无法跳过展示；只有本页正看着该任务时才随即收回，
-      // 前台标签页在看任务 A 时，不能把任务 B 的推送一并关掉。
-      if (
-        tags.length > 0 &&
-        isViewingTask(typeof data.taskId === "string" && data.taskId ? data.taskId : undefined)
-      ) {
+      if (!readString(data.eventKey)) {
+        for (const tag of tags) markTag(tag);
+      }
+      if (tags.length > 0 && isViewingTask(readString(data.taskId))) {
         void closeDisplayedNotifications((notification) => tags.includes(notification.tag));
       }
       return;
     }
-    if (
-      data.type === "zcode:notification-click" &&
-      typeof data.taskId === "string" &&
-      data.taskId
-    ) {
-      emitNotificationClick(data.taskId, {
-        ...(typeof data.workspacePath === "string" && data.workspacePath
-          ? { workspacePath: data.workspacePath }
-          : {}),
-        ...(typeof data.workspaceIdentity === "string" && data.workspaceIdentity
-          ? { workspaceIdentity: data.workspaceIdentity }
-          : {}),
+    const taskId = readString(data.taskId);
+    if (data.type === "zcode:notification-click" && taskId) {
+      const workspacePath = readString(data.workspacePath);
+      const workspaceIdentity = readString(data.workspaceIdentity);
+      emitNotificationClick(taskId, {
+        ...(workspacePath ? { workspacePath } : {}),
+        ...(workspaceIdentity ? { workspaceIdentity } : {}),
       });
     }
   }

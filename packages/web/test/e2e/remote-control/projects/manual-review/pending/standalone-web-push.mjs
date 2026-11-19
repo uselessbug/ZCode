@@ -1354,7 +1354,12 @@ const ORCHESTRATOR_ENTRY = `
 async function runTerminalNotificationSuite(mod) {
   console.log("终态通知收集：collectTerminalTaskNotificationPayloads");
   const formatMessage = ({ id }, values) => (values?.title ? `${id}:${values.title}` : String(id));
-  const session = (sessionId, phase, title = "demo") => ({ sessionId, phase, title });
+  const session = (sessionId, phase, title = "demo", extra = {}) => ({
+    sessionId,
+    phase,
+    title,
+    ...extra,
+  });
   const collect = (previousPhase, nextPhase, extra = {}) =>
     mod.collectTerminalTaskNotificationPayloads({
       previousBySessionId: new Map(
@@ -1380,6 +1385,57 @@ async function runTerminalNotificationSuite(mod) {
       assert.equal(failed.length, 1);
       assert.equal(failed[0].status, "failed");
       assert.equal(failed[0].title, "notification.error");
+    },
+  );
+
+  await check(
+    "终态 eventKey 优先使用稳定 terminalAt（不受 conflated lastActivityAt 漂移影响），且跨合并新回合正常提醒",
+    async () => {
+      const [diverged] = mod.collectTerminalTaskNotificationPayloads({
+        previousBySessionId: new Map([
+          ["s1", session("s1", "running", "demo", { lastActivityAt: 900 })],
+        ]),
+        sessions: [
+          session("s1", "completedSuccess", "demo", { terminalAt: 1000, lastActivityAt: 1500 }),
+        ],
+        formatMessage,
+      });
+      assert.equal(diverged.eventKey, "zcode:event:turn:s1:1000");
+
+      assert.deepEqual(
+        mod.collectTerminalTaskNotificationPayloads({
+          previousBySessionId: new Map([
+            [
+              "s1",
+              session("s1", "completedSuccess", "demo", {
+                terminalAt: 1000,
+                lastActivityAt: 1000,
+              }),
+            ],
+          ]),
+          sessions: [
+            session("s1", "completedSuccess", "demo", { terminalAt: 1000, lastActivityAt: 1600 }),
+          ],
+          formatMessage,
+        }),
+        [],
+      );
+      const [nextTurn] = mod.collectTerminalTaskNotificationPayloads({
+        previousBySessionId: new Map([
+          [
+            "s1",
+            session("s1", "completedSuccess", "demo", {
+              terminalAt: 1000,
+              lastActivityAt: 1600,
+            }),
+          ],
+        ]),
+        sessions: [
+          session("s1", "completedSuccess", "demo", { terminalAt: 2000, lastActivityAt: 2050 }),
+        ],
+        formatMessage,
+      });
+      assert.equal(nextTurn.eventKey, "zcode:event:turn:s1:2000");
     },
   );
 

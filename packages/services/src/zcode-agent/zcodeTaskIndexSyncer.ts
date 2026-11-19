@@ -95,6 +95,11 @@ export interface ZCodeTaskIndexTerminalEvent {
   kind: "turn.completed" | "turn.failed";
   /** phase === "completedInterrupted" 时为 true，供定时任务区分正常完成与用户主动中断。 */
   interrupted?: boolean;
+  /**
+   * 触发这次终态迁移的稳定终态时间戳（summary.terminalAt ?? summary.lastActivityAt）。
+   * 会话终态 Web Push 用同一个值构造事件键，定时任务结算沿用它，使二者与页内通知合并为同一回合。
+   */
+  terminalAt?: number;
 }
 
 export interface ZCodeTaskIndexReadyEvent {
@@ -557,11 +562,13 @@ export function createZCodeTaskIndexSyncer(
     const phase = summary.phase;
     const failed = phase === "error";
     const interrupted = phase === "completedInterrupted";
+    const terminalAt = summary.terminalAt ?? summary.lastActivityAt;
     // 顺序保持旧协议语义：先 turn 终态（收口当前 input），再 prompt ready（放行下一条）。
     terminalEventEmitter.fire({
       target,
       kind: failed ? "turn.failed" : "turn.completed",
       ...(interrupted ? { interrupted: true } : {}),
+      terminalAt,
     });
     readyEventEmitter.fire({
       target,
@@ -645,6 +652,7 @@ export function createZCodeTaskIndexSyncer(
   function applyTerminalTransition(target: ZCodeAgentSessionTarget, summary: SessionSummary): void {
     emitTerminalAndReady(target, summary);
     const failed = summary.phase === "error";
+    const terminalAt = summary.terminalAt ?? summary.lastActivityAt;
     const unreadSignal = resolveTerminalUnreadSignal(summary);
     logger.debug(undefined, "task 终态未读裁决", {
       goalStatus: summary.goalStatus ?? null,
@@ -658,11 +666,12 @@ export function createZCodeTaskIndexSyncer(
         const sessionTitle = summary.title.trim();
         webPushService.notifySessionEvent({
           kind: "task_completed",
-          eventId: `session:${target.sessionId}:${summary.lastActivityAt}:task_completed`,
+          eventId: `session:${target.sessionId}:${terminalAt}:task_completed`,
           sessionId: target.sessionId,
           ...(sessionTitle ? { sessionTitle } : {}),
           workspacePath: target.workspacePath,
           ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+          terminalAt,
           occurredAt: summary.lastActivityAt,
         });
       } else if (failed && webPushService.consumeAutomationOwnedSessionTurn) {
@@ -675,12 +684,13 @@ export function createZCodeTaskIndexSyncer(
       const cleanDetail = detail?.trim() || "";
       webPushService.notifySessionEvent({
         kind: "task_failed",
-        eventId: `session:${target.sessionId}:${summary.lastActivityAt}:task_failed`,
+        eventId: `session:${target.sessionId}:${terminalAt}:task_failed`,
         sessionId: target.sessionId,
         ...(sessionTitle ? { sessionTitle } : {}),
         ...(cleanDetail ? { detail: cleanDetail } : {}),
         workspacePath: target.workspacePath,
         ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+        terminalAt,
         occurredAt: summary.lastActivityAt,
         ...(webPushService.consumeAutomationOwnedSessionTurn
           ? { skipAutomationTurnCheck: true }
@@ -850,11 +860,15 @@ export function createZCodeTaskIndexSyncer(
     // 仍为 draft。Host 再按执行 phase 过滤，会把新任务推迟到 Hook/TurnStarted 之后。
     const target = sessionTargetFrom(state.target, next.sessionId);
     const becameVisibleTask = previous === undefined;
-    // 终态迁移 = 基线里真实观察到非终态 → 终态。无基线的会话（冷恢复 hydration、
-    // 断档降级后新出现的历史会话）不回放终态；活跃会话必先以 running/prewarming
-    // 进入基线（gateway 每个事件都 fan-out），不会漏掉真实收口。
+    // 终态迁移 = 基线里真实观察到非终态 → 终态，或合并窗口内从上一轮终态进入具有新 terminalAt 的新终态。
+    // 无基线的会话（冷恢复 hydration、断档降级后新出现的历史会话）不回放终态。
     const becameTerminal =
-      previous !== undefined && !isTerminalPhase(previous.phase) && isTerminalPhase(next.phase);
+      previous !== undefined &&
+      isTerminalPhase(next.phase) &&
+      (!isTerminalPhase(previous.phase) ||
+        (previous.terminalAt !== undefined &&
+          next.terminalAt !== undefined &&
+          previous.terminalAt !== next.terminalAt));
     if (becameTerminal) {
       applyTerminalTransition(target, next);
       return;

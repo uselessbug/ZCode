@@ -48,6 +48,8 @@ export interface AutomationRunNotificationEvent {
   workspacePath: string;
   workspaceIdentity?: string;
   occurredAt?: number;
+  /** 关联会话本回合的稳定终态时间戳（terminalAt ?? 终态帧 lastActivityAt）；有它时通知与该会话终态合并为同一事件。 */
+  sessionTerminalAt?: number;
 }
 
 export type AutomationDispatchSettlement =
@@ -146,6 +148,7 @@ export interface AutomationTaskServicePort {
       outcome: "succeeded" | "failed" | "stopped";
       error?: string;
       interrupted?: boolean;
+      terminalAt?: number;
     }) => void,
   ) => {
     dispose: () => void;

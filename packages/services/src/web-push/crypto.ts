@@ -342,13 +342,14 @@ export function encodeWebPushMessageWithBudget(
     return fittedTitle;
   }
 
-  // 依次剔除可选字段（workspacePath -> workspaceIdentity -> secondaryTag -> taskId），尽量保留有效载荷。
+  // 依次剔除可选字段（workspacePath -> workspaceIdentity -> secondaryTag -> eventKey -> taskId），
+  // 尽量保留有效载荷；缺 eventKey 时 Service Worker 退回按 tag 去重。
   const optionalDrops: Array<
     keyof Pick<
       WebPushNotificationMessage,
-      "workspacePath" | "workspaceIdentity" | "secondaryTag" | "taskId"
+      "workspacePath" | "workspaceIdentity" | "secondaryTag" | "eventKey" | "taskId"
     >
-  > = ["workspacePath", "workspaceIdentity", "secondaryTag", "taskId"];
+  > = ["workspacePath", "workspaceIdentity", "secondaryTag", "eventKey", "taskId"];
 
   let currentBase: WebPushNotificationMessage = { ...baseNoBody };
   for (const field of optionalDrops) {

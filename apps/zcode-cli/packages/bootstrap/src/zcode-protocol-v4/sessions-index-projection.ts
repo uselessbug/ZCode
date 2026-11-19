@@ -15,11 +15,37 @@ export interface SessionSummaryDeriveExtra {
   workspaceId: string;
   createdAt: number;
   lastActivityAt: number;
+  terminalAt?: number;
   lastOutcome?: SessionSummary["lastOutcome"];
   parentSessionId?: string;
 }
 
 const MAX_PREVIEW_CHARS = 120;
+
+function isTerminalSessionPhase(phase: SessionSummary["phase"]): boolean {
+  return phase === "completedSuccess" || phase === "completedInterrupted" || phase === "error";
+}
+
+function resolveSnapshotTerminalAt(snapshot: ConversationSnapshot): number | undefined {
+  if (!isTerminalSessionPhase(snapshot.control.phase)) return undefined;
+  if (snapshot.control.phase === "error" && snapshot.control.lastError?.at !== undefined) {
+    return snapshot.control.lastError.at;
+  }
+  const rows = snapshot.rows.window;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (
+      row &&
+      row.kind === "turnHeader" &&
+      row.endedAt !== undefined &&
+      row.state !== "running" &&
+      row.executionKind !== "controlOnly"
+    ) {
+      return row.endedAt;
+    }
+  }
+  return undefined;
+}
 
 /** 从 ConversationSnapshot + 会话元信息派生 SessionSummary（纯函数，golden 可测）。 */
 export function deriveSessionSummary(
@@ -85,6 +111,9 @@ export function deriveSessionSummary(
           ...(pending.autoResolution ? { autoResolution: pending.autoResolution } : {}),
         }
       : undefined;
+  const terminalAt = isTerminalSessionPhase(snapshot.control.phase)
+    ? (extra.terminalAt ?? resolveSnapshotTerminalAt(snapshot) ?? extra.lastActivityAt)
+    : undefined;
   return {
     sessionId: snapshot.sessionId,
     workspaceId: extra.workspaceId,
@@ -108,6 +137,7 @@ export function deriveSessionSummary(
       : {}),
     ...(snapshot.goal ? { goalStatus: snapshot.goal.status } : {}),
     lastActivityAt: extra.lastActivityAt,
+    ...(terminalAt !== undefined ? { terminalAt } : {}),
     ...(lastAssistantPreview ? { lastAssistantPreview } : {}),
     createdAt: extra.createdAt,
   };
@@ -133,6 +163,7 @@ function summariesEqual(a: SessionSummary, b: SessionSummary): boolean {
     a.pendingInteractionSummary?.userInputCount === b.pendingInteractionSummary?.userInputCount &&
     a.goalStatus === b.goalStatus &&
     a.lastActivityAt === b.lastActivityAt &&
+    a.terminalAt === b.terminalAt &&
     a.lastAssistantPreview === b.lastAssistantPreview &&
     a.createdAt === b.createdAt
   );
@@ -155,6 +186,7 @@ export class SessionsIndexProjection {
     snapshot: ConversationSnapshot,
     extra: Omit<SessionSummaryDeriveExtra, "workspaceId">,
   ): SessionsIndexDelta[] {
+    const snapshotTerminalAt = resolveSnapshotTerminalAt(snapshot);
     const summary = deriveSessionSummary(snapshot, {
       workspaceId: this.workspaceId,
       ...extra,
@@ -191,13 +223,26 @@ export class SessionsIndexProjection {
       // 会话一旦有过真实内容就不可能退回 draft；若用它覆盖非 draft 基线，
       // 打开一个历史任务就会广播一帧「completedSuccess→draft」纯降级 delta，
       // UI 列表行状态被清空、对应 workspace 列表整体重查（表现为"点开任务列表重新加载"）。
-      // phase/sessionEnded/goalStatus 同窗口同源，一并保基线。
+      // phase/sessionEnded/goalStatus/terminalAt 同窗口同源，一并保基线。
       if (summary.phase === "draft" && prev.phase !== "draft") {
         summary.phase = prev.phase;
         summary.sessionEnded = prev.sessionEnded;
         if (summary.goalStatus === undefined && prev.goalStatus !== undefined) {
           summary.goalStatus = prev.goalStatus;
         }
+        if (prev.terminalAt !== undefined) {
+          summary.terminalAt = prev.terminalAt;
+        }
+      } else if (
+        isTerminalSessionPhase(summary.phase) &&
+        isTerminalSessionPhase(prev.phase) &&
+        summary.phase === prev.phase &&
+        extra.terminalAt === undefined &&
+        snapshotTerminalAt === undefined &&
+        prev.terminalAt !== undefined
+      ) {
+        // 保持同一终态期间，后续后台任务/标题等活动推进 lastActivityAt 不得改写 terminalAt。
+        summary.terminalAt = prev.terminalAt;
       }
     }
     if (prev && summariesEqual(prev, summary)) return [];

@@ -99,6 +99,8 @@ export const webPushNotificationMessageSchema = z.object({
   version: z.literal(1),
   action: z.literal("show"),
   eventId: z.string().min(1),
+  /** 与页内通知共用的事件键（见 buildTerminalTurnEventKey 等），Service Worker 按它合并去重。 */
+  eventKey: z.string().min(1).optional(),
   tag: z.string().min(1),
   secondaryTag: z.string().min(1).optional(),
   kind: z

@@ -36,6 +36,7 @@ import {
   buildAutomationNotificationTag,
   buildInteractionNotificationTag,
   buildTerminalTaskNotificationTag,
+  buildTerminalTurnEventKey,
   webPushNotificationMessageSchema,
   type WebPushNotificationMessage,
 } from "@zcode/shared/web-push";
@@ -838,7 +839,7 @@ describe("Web Push backend service & HTTP endpoints", () => {
                   session: {
                     sessionId: env.sessionId, workspaceId: topic.slice("sessions-index/".length),
                     title: "修复构建", phase: "completedSuccess", sessionEnded: true,
-                    hasBackgroundWork: false, lastActivityAt: 2000, createdAt: 900
+                    hasBackgroundWork: false, lastActivityAt: 2050, terminalAt: 2000, createdAt: 900
                   }
                 }]
               }
@@ -1045,6 +1046,11 @@ describe("Web Push backend service & HTTP endpoints", () => {
       ),
     );
     assert.ok(completedMsg.body?.includes("修复构建"));
+    assert.equal(
+      completedMsg.eventKey,
+      buildTerminalTurnEventKey("sess-e2e-1", 2000),
+      "eventKey must use canonical terminalAt rather than mutable lastActivityAt",
+    );
 
     // User interrupted turn -> NO task_completed / task_failed push!
     const countBeforeInterrupt = deliveredMessages.length;
@@ -1202,6 +1208,8 @@ describe("Web Push backend service & HTTP endpoints", () => {
       taskId: "sess-e2e-1",
       inputId: manualRun.runId,
       outcome: "succeeded",
+      // syncer 终态迁移那一帧的 lastActivityAt，与会话终态推送、页内通知共用为同一回合事件键。
+      terminalAt: 1_700_000_000_123,
     });
 
     const completedAutoMsg = await waitFor(() =>
@@ -1212,6 +1220,10 @@ describe("Web Push backend service & HTTP endpoints", () => {
       ),
     );
     assert.equal(completedAutoMsg.secondaryTag, buildTerminalTaskNotificationTag("sess-e2e-1"));
+    assert.equal(
+      completedAutoMsg.eventKey,
+      buildTerminalTurnEventKey("sess-e2e-1", 1_700_000_000_123),
+    );
     await new Promise((r) => setTimeout(r, 120));
 
     const autoMessages = deliveredMessages.slice(countBeforeAuto);

@@ -3245,6 +3245,7 @@ export function createZCodeTaskServiceAdapter(
             ...(inputId ? { inputId } : {}),
             outcome: terminal.kind === "turn.failed" ? "failed" : "succeeded",
             ...(terminal.interrupted ? { interrupted: true } : {}),
+            ...(terminal.terminalAt !== undefined ? { terminalAt: terminal.terminalAt } : {}),
           };
           listener(payload);
         });

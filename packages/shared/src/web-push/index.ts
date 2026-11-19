@@ -14,6 +14,26 @@ export function buildAutomationNotificationTag(runId: string): string {
   return `zcode:automation:${runId}`;
 }
 
+/**
+ * 通知事件键：标识“同一个事实”，页内通知与 Web Push 共用，Service Worker 按它合并并持久去重。
+ * 与显示替换 tag 分离：同一会话每轮回合的终态共用一个 tag 槽位，但事件键各不相同。
+ * terminalAt 取会话进入当前终态的稳定时间戳（summary.terminalAt ?? 终态帧 lastActivityAt）：
+ * 页面、服务端 syncer 与定时任务结算（同一次 syncer 终态迁移派生）观察到同一终态标识，
+ * 即使后续 lastActivityAt 因其他活动推进也不漂移。
+ */
+export function buildTerminalTurnEventKey(sessionId: string, terminalAt: number): string {
+  return `zcode:event:turn:${sessionId}:${terminalAt}`;
+}
+
+export function buildInteractionEventKey(interactionId: string): string {
+  return `zcode:event:interaction:${interactionId}`;
+}
+
+/** 定时任务没有关联会话终态（如派发失败）时，以 runId 为事件归属。 */
+export function buildAutomationRunEventKey(runId: string): string {
+  return `zcode:event:automation:${runId}`;
+}
+
 export function buildTaskNotificationTag(input: {
   taskId: string;
   status: TaskNotificationStatusKind;

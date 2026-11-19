@@ -78,6 +78,8 @@ export interface TaskNotificationPayload {
   taskId: string;
   status: "completed" | "failed" | "permission_request" | "elicitation_request" | "feedback_update";
   requestId?: string;
+  /** 同一事实的稳定事件键（@zcode/shared/web-push 的 build*EventKey）；Web 端据此与 Web Push 合并，桌面端忽略。 */
+  eventKey?: string;
   workspacePath?: string;
   workspaceIdentity?: string;
   title: string;

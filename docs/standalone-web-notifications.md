@@ -49,23 +49,27 @@ packages/services/src/web-push/
   - `syncWindowTabs(paths)`：Web 端约定 `paths[0]` 为当前激活的工作区路径（无激活工作区如设置页时为空字符串 `""`），其后为本标签页所有已打开的工作区路径列表。
 - **按任务精确防打扰**：无论页内通知还是后台推送，仅当某个同源工作台标签页（路径为 `/` 或 `/index.html`）处于前台聚焦状态（`visibilityState !== "hidden" && document.hasFocus()`）且正在查看该 `taskId`（`activeTaskId === payload.taskId`）时才抑制通知；若前台标签页正在查看任务 A、停留在设置页或停留在手机 `Home` 列表，后台任务 B 的通知照常弹出。
 - **页内浏览器通知与 Service Worker 统一裁决（`showTaskNotification`）**：
+  - 当「任务通知」总开关开启且本页正在查看目标 `taskId` 时，跳过本地展示与响铃；若携带 `eventKey` 且存在已激活的 `/zcode-push-sw.js`，同步发送 `zcode:mark-task-notification-handled` 记为已由前台处理，防止失焦后晚到的同事件推送再次响铃。
   - 当「任务通知」总开关开启且本页未在查看目标 `taskId` 时触发。
-  - 若当前已激活 `/zcode-push-sw.js`，页面不再自行弹窗或各自播放提示音，而是通过 `MessageChannel` 向 Service Worker 发送 `{ type: "zcode:show-task-notification", payload, tag }`（超时 `300ms` 或异常时回退本页 `registration.showNotification()` / `new Notification()`）。
-  - Service Worker 按 `tag` 共享一次进行中的页内展示，再通过 `MessageChannel` 并发采集工作台标签页的 `{ focused, activeTaskId, activeWorkspacePath, openWorkspacePaths }`，每个标签页最多等 `120ms`。若 4 秒内已展示，或前台聚焦标签页正在查看该任务，就返回 `{ shown: false, playSound: false }`。展示成功后才记录 `"page"` 标签，并仅让发起展示的标签页播放自定义提示音。
+  - 若当前已激活 `/zcode-push-sw.js`，页面不再自行弹窗或各自播放提示音，而是通过 `MessageChannel` 向 Service Worker 发送 `{ type: "zcode:show-task-notification", payload, tag }`（`300ms` 裁决上限）。仅在消息未投递（无激活 Service Worker、`redundant` 或 `postMessage` 抛错）或 Service Worker 明确回复 `{ error: true }` 时才回退本页 `registration.showNotification()` / `new Notification()`；`postMessage` 成功交接后的等待超时不再触发本页重复展示。
+  - Service Worker 按 `tag` / `eventKey` 串行裁决：先通过 `MessageChannel` 并发采集工作台标签页的 `{ focused, activeTaskId, activeWorkspacePath, openWorkspacePaths }`（每个标签页最多等 `120ms`）。若已有事件记录，或 4 秒内存窗口内已提示，或前台聚焦标签页正在查看该任务（带 `eventKey` 时同步标记为已抑制处理），则返回 `{ shown: false, playSound: false }`。展示成功后记录 `"page"` 来源（同时将 `originClientId` 写入通知 `data` 与事件/标签记录），并仅让发起展示的标签页播放自定义提示音。
 - **主动停止或发新消息抢占打断静默**：`taskNotificationOrchestrator.ts` 的 `terminalStatusForPhase` 与后端 Web Push 保持一致，仅对 `completedSuccess` 生成完成通知、对 `error` 生成失败通知；用户主动点击停止或运行中发送新消息打断旧回合产生的 `completedInterrupted` 一律保持静默，不弹「任务已完成」。
 - **后台推送（Web Push）**：由服务端 `IWebPushService` 直接向浏览器推送服务端点投递 `aes128gcm` 加密载荷，`zcode-push-sw.js` 在 `push` 事件中调用 `self.registration.showNotification()` 展示系统通知，覆盖浏览器后台、标签页关闭与手机锁屏场景。
 - **远控代理页边界**：手机远控代理页（`externalWebRemoteControlProxy`）不挂载独立 Server 的 `/api/web-push/*`，`pushAvailable` 固定为 `false`，不借用根作用域 Service Worker，设置页隐藏「后台推送」开关，仅保留页内 `new Notification()` 通知。
 
-### 2. 统一 `tag` 与 `secondaryTag` 去重
+### 2. 事件 ID 去重与显示替换 `tag` 分离
 
-页内通知与后台推送共用 `packages/shared/src/web-push/index.ts` 的 `tag` 规则：
-
-- 会话终态：`zcode:task:<taskId>:terminal`
-- 待处理交互（权限审批 / 提问 / 计划确认）：`zcode:interaction:<interactionId>`
-- 定时任务终态：`zcode:automation:<runId>`（同时携带 `secondaryTag = zcode:task:<sessionId>:terminal`）
-- 反馈更新：`zcode:feedback:<taskId>`
-
-`zcode-push-sw.js` 在 `recentTags` 中统一记录 `"page"`（页内代展示）与 `"push"`（后台推送）两个来源的最近标签（窗口 `4000ms`），并在推送展示后向所有同源工作台窗口广播 `postMessage({ type: "zcode:web-push-shown", tag, secondaryTag, eventId, taskId })`。前端 `webNotifications.ts` 收到后将 `tag` 与 `secondaryTag` 记入本页 4 秒去重窗口，避免推送与 WebSocket 页内事件双响。
+- **两类标识职责分离**：
+  - **显示替换 `tag`（与 `secondaryTag`）**：用于系统通知栏同一任务/交互槽位的展示归并与替换，页内通知与后台推送共用 `packages/shared/src/web-push/index.ts` 的 `tag` 规则：
+    - 会话终态：`zcode:task:<taskId>:terminal`
+    - 待处理交互（权限审批 / 提问 / 计划确认）：`zcode:interaction:<interactionId>`
+    - 定时任务终态：`zcode:automation:<runId>`（同时携带 `secondaryTag = zcode:task:<sessionId>:terminal`）
+    - 反馈更新：`zcode:feedback:<taskId>`
+  - **事件键（`eventKey` / `eventId`）与稳定终态标识 `terminalAt`**：标识单次具体通知事件。`SessionSummary` 在协议层携带仅在离开终态再进入下一轮终态时更新的稳定 `terminalAt`（优先取权威错误/回合结束时间，不随后续标题或后台任务刷新 `lastActivityAt` 而漂移）。页内 `taskNotificationOrchestrator`、服务端 `zcodeTaskIndexSyncer` 与定时任务结算共用 `buildTerminalTurnEventKey(sessionId, summary.terminalAt ?? summary.lastActivityAt)`（待处理交互共用 `buildInteractionEventKey(interactionId)`，无会话终态的定时任务失败共用 `buildAutomationRunEventKey(runId)`），确保合并投影与双通道下同一事实拥有完全一致的事件键；同一任务进入新一轮回合则拥有新的事件标识，仍正常通知。
+- **Service Worker 串行裁决与有界持久化已处理事件**：
+  - `zcode-push-sw.js` 对页内代展示请求、前台抑制登记与 `push` 事件串行化裁决，并将已处理事件记录在有界持久化存储中（容量受控、TTL 至少覆盖推送与重连投递寿命）。
+  - 相同事件无论因多标签并发、页内与 Web Push 双通道先后到达、前台查看抑制后失焦晚到、Service Worker 重启，还是离线/锁屏后晚到投递，均按已处理事件去重，避免重复提醒或二次自定义提示音。
+  - 推送展示后向同源工作台窗口广播 `postMessage({ type: "zcode:web-push-shown", tag, secondaryTag, eventId, eventKey, taskId })`，无 `eventKey` 的旧载荷同步记入本页去重；带 `eventKey` 的页内请求仍交由 Service Worker 补记非抑制通知的发起页来源且不再响铃。
 
 ### 3. 总开关与通知声音联动
 
@@ -75,9 +79,11 @@ packages/services/src/web-push/
 ### 4. `userVisibleOnly: true` 约束、最小化静音合并与按任务前台清理
 
 - 浏览器标准要求 `pushManager.subscribe({ userVisibleOnly: true, applicationServerKey })` 的每次推送都必须展示可见通知，否则 iOS WebKit 会吊销订阅，Chromium 会弹出「此网站已在后台更新」警告。因此服务端只发送 `action: "show"` 可见推送，不下发静默撤回包。
+- **同事件晚到推送在 `userVisibleOnly` 下的保留/静默合并**：
+  - 当后台推送到达但该 `eventId` / `eventKey` 已由页内通知展示或在前台查看时被抑制过（或属于同一事件重复投递）：若当前存在可见同源窗口且浏览器豁免 `userVisibleOnly` 检查，直接跳过弹窗；若必须履行 `userVisibleOnly` 可见通知义务，则以原 `tag` / `secondaryTag` 并设置 `silent: true`、`renotify: false` 静默合并替换同一槽位，合并时保留原通知记录的发起标签页来源信息，且绝不触发第二次自定义提示音。
 - **非 Apple WebKit 浏览器**（桌面与 Android 的 Chromium / Firefox）对已有可见同源窗口（`hasVisibleOriginWindow`）的站点豁免 `userVisibleOnly` 检查：
-  - 当存在可见的工作台窗口时，若该推送 `tag` / `secondaryTag` 刚在 4 秒内由页内通知（`"page"` 来源）展示过，或经 `zcode:query-client-state` 确认有前台聚焦标签页正在查看该 `payload.taskId`，`zcode-push-sw.js` 直接跳过弹窗。
-  - 当所有工作台窗口均不可见时，Service Worker 仍调用 `showNotification()`。若页内已用同一 `tag` 或定时任务的 `secondaryTag` 展示，推送复用该标签并设置 `silent: true`、`renotify: false`，在系统通知栏静默替换原通知。
+  - 当存在可见的工作台窗口时，若该事件已展示过，或经 `zcode:query-client-state` 确认有前台聚焦标签页正在查看该 `payload.taskId`，`zcode-push-sw.js` 直接跳过弹窗。
+  - 当所有工作台窗口均不可见时，Service Worker 仍调用 `showNotification()`。若页内已展示同一事件或同槽位通知，推送复用该标签并设置 `silent: true`、`renotify: false`（保留已有来源页记录），在系统通知栏静默替换原通知。
 - **Apple WebKit 环境**（iPhone / iPad 所有浏览器及 macOS Safari）无前台豁免，`zcode-push-sw.js` 始终调用 `showNotification()`。`webNotifications.ts` 仅按任务精确收回通知：
   - 收到 `zcode:web-push-shown` 时，仅当本页处于前台且正在查看该 `taskId`（`isViewingTask(data.taskId)`）时才立即关闭对应 `tag` 的系统通知，不会在查看任务 A 时误关后台任务 B 的推送通知；
   - 窗口通过 `focus` / `visibilitychange` 回到前台时，仅关闭无 `taskId` 或归属当前 `activeTaskId` 的 `zcode:*` 通知，保留其他未查看后台任务的通知。
@@ -128,9 +134,10 @@ packages/services/src/web-push/
 ### 3. 点击通知聚焦与跨项目会话定位
 
 - **页内通知与后台推送统一携带工作区坐标**：`TaskNotificationPayload`（`packages/shared/src/platform.ts`）与 `useWorkspaceTerminalTaskNotifications`、`usePendingInteractionTaskNotifications`、`V4InteractionDialogs` 均携带 `workspacePath` 与可选 `workspaceIdentity`，使页内通知与后台 Web Push 具有一致的目标工作区上下文。
-- **多工作台标签页精准挑选与不可见回退（`zcode-push-sw.js`）**：
-  - 点击系统通知时，`zcode-push-sw.js` 先关闭被点击通知，并在同源工作台窗口（`/` 或 `/index.html`）中挑选目标标签页：当存在多个工作台标签页时，先经 `MessageChannel`（`zcode:query-client-state`，`120ms` 超时）查询各标签页状态，按 **「已打开该 `taskId` 的标签页（`state.activeTaskId === taskId`） > 当前停留在目标项目工作区的标签页（`state.activeWorkspacePath === workspacePath`） > 已打开目标项目工作区 Tab 的标签页（`state.openWorkspacePaths.includes(workspacePath)`） > 兜底窗口」** 四级优先级匹配（同级内优先 `focused === true`，其次 `visibilityState === "visible"`），避免将其他标签页正在查看的任务冲掉。
-  - 选定目标 `client` 后调用 `client.focus()`：若返回的客户端已处于前台（`focused === true || visibilityState === "visible"`），直接向该客户端发送 `postMessage({ type: "zcode:notification-click", taskId, workspacePath, workspaceIdentity })`；若 `client.focus()` 抛错或返回客户端仍不可见（例如 Android 浏览器处于后台或停留在其他标签页），先向该客户端发送 `postMessage` 保底，再调用 `clients.openWindow(targetUrl)` 回退拉起前台（同时捕获 Chromium 因 `focus()` 消耗单次窗口交互令牌可能抛出的异常，保留 `postMessage` 导航结果）。前端在 `navigator.serviceWorker` 上显式调用 `startMessages()`，确保页面被拉起时立即消费消息队列。
+- **点击路由：发起原页优先、纯 Push 仅复用同任务页，不冲掉其他页面（`zcode-push-sw.js`）**：
+  - **有有效发起标签页的页内通知（及合并保留了来源页的通知）**：页内通过 Service Worker 代展示通知时将发起该通知的 `originClientId` 记录在通知 `data` 与事件/标签记录中；若随后后台 Web Push 静默合并替换同一槽位通知（包括推送先到、页内请求后到对非抑制事件的补记，以及无 `eventKey` 的 `tag` 合并），继承并保留该来源 client。用户点击通知时，若该发起标签页仍然存活有效，优先聚焦并路由回该原发起标签页。
+  - **纯 Web Push 通知（或原发起标签页已关闭）**：查询当前同源工作台标签页状态（`zcode:query-client-state`），仅当存在**正在展示同一 `taskId`**（`state.activeTaskId === taskId`）的标签页时才复用并聚焦该页；否则直接调用 `clients.openWindow(targetUrl)` 打开目标深链新页面，**不复用**正在查看其他任务或停留在其他页面的已有标签页，避免冲掉用户在其他标签页中的上下文。
+  - 选定复用的目标 `client` 后调用 `client.focus()`，聚焦成功且处于前台时发送 `postMessage({ type: "zcode:notification-click", taskId, workspacePath, workspaceIdentity })`；若 `client.focus()` 失败或客户端仍不可见，优先尝试 `clients.openWindow(targetUrl)` 打开新窗口，仅当 `openWindow` 失败/返回 `null` 时才回退向原目标 `client` 发送导航消息，避免在打开新窗口的同时误导航隐藏旧窗口。前端在 `navigator.serviceWorker` 上显式调用 `startMessages()`，确保页面被拉起时立即消费消息队列。
 - **无窗口冷启动深链直达（`packages/web/src/main.tsx`）**：若当前无已打开的工作台窗口，`zcode-push-sw.js` 调用 `clients.openWindow("/?zcodeTask=<taskId>&zcodeWorkspace=<workspacePath>&zcodeWorkspaceIdentity=<workspaceIdentity>")`。页面启动时 `main.tsx` 调用 `consumeNotificationDeepLink()` 提取目标参数并通过 `history.replaceState` 清理 `zcodeTask`、`zcodeWorkspace`、`zcodeWorkspaceIdentity`（原样保留 `token` 等其他查询参数）：
   - 当深链携带 `workspacePath` 时，直接覆盖 `<Root>` 的 `initialWorkspaceAbsPath`、`initialWorkspaceIdentity`、`initialTaskId` 并设置 `initialWebRemoteControlMobileNavigationIntent="chat"`，不再重复放入点击队列，避免冷启动先落入服务器默认 `/workspace` 的新任务草稿页；`useRootPlatformEffects` 在历史标签恢复后通过 `resolveBootstrapWorkspaceIdentity` 复用已恢复的同路径本地 path-only 标签并直接选中目标会话。
   - 仅携带 `taskId`（无 `workspacePath`）的深链才作为 `initialNotificationTarget` 注入 `createWebPlatform`，交由点击队列遍历已打开的工作区定位。

@@ -218,6 +218,7 @@ export function createAutomationExecutor(
             sessionId: params.taskId,
             workspacePath: params.workspacePath,
             ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+            ...(result.terminalAt !== undefined ? { sessionTerminalAt: result.terminalAt } : {}),
           });
         } else {
           options.onTurnCleared?.({ sessionId: params.taskId, runId: params.runId });

@@ -1,4 +1,5 @@
 import type { TaskNotificationPayload } from "@zcode/shared";
+import { buildInteractionEventKey, buildTerminalTurnEventKey } from "@zcode/shared/web-push";
 import type {
   ConversationSnapshot,
   PendingInteraction,
@@ -51,6 +52,17 @@ function taskTitleBody(
   return formatMessage({ id: fallbackMessageId });
 }
 
+/**
+ * 终态事件键优先取稳定终态时间戳 terminalAt（缺失时回退 lastActivityAt），与服务端 syncer 及
+ * 定时任务结算的 Web Push 一致；即使后续活动推进了 lastActivityAt，Service Worker 仍能合并为同一回合。
+ */
+function terminalEventKeyFor(session: SessionSummary): { eventKey?: string } {
+  const terminalAt = session.terminalAt ?? session.lastActivityAt;
+  return Number.isFinite(terminalAt)
+    ? { eventKey: buildTerminalTurnEventKey(session.sessionId, terminalAt) }
+    : {};
+}
+
 function terminalPayloadForSession(
   session: SessionSummary,
   status: Extract<TaskNotificationPayload["status"], "completed" | "failed">,
@@ -60,6 +72,7 @@ function terminalPayloadForSession(
     return {
       taskId: session.sessionId,
       status,
+      ...terminalEventKeyFor(session),
       title: formatMessage({ id: "notification.completed" }),
       body: taskTitleBody(session.title, "notification.completedBody", formatMessage),
     };
@@ -68,6 +81,7 @@ function terminalPayloadForSession(
   return {
     taskId: session.sessionId,
     status,
+    ...terminalEventKeyFor(session),
     title: formatMessage({ id: "notification.error" }),
     body: taskTitleBody(session.title, "notification.error", formatMessage),
   };
@@ -88,7 +102,11 @@ export function collectTerminalTaskNotificationPayloads(params: {
     if (!previous) continue;
 
     const previousStatus = terminalStatusForPhase(previous.phase);
-    if (previousStatus === status) continue;
+    const sameTurnTerminal =
+      previous.terminalAt === undefined ||
+      session.terminalAt === undefined ||
+      previous.terminalAt === session.terminalAt;
+    if (previousStatus === status && sameTurnTerminal) continue;
 
     payloads.push(
       withWorkspaceContext(
@@ -123,6 +141,8 @@ function pendingInteractionPayload(params: {
 }): TaskNotificationPayload | null {
   const { snapshot, interaction, formatMessage } = params;
   const requestId = interaction.interactionId;
+  // 与服务端交互推送同一事件键：同一个 interactionId 只提醒一次。
+  const eventKey = buildInteractionEventKey(requestId);
   const taskId = snapshot.sessionId;
   const taskTitle = snapshot.meta.title;
 
@@ -136,6 +156,7 @@ function pendingInteractionPayload(params: {
       taskId,
       status: "elicitation_request",
       requestId,
+      eventKey,
       title: formatMessage({ id: "plugin.discovery.confirmTitle" }),
       body: interaction.payload.reason,
     };
@@ -146,6 +167,7 @@ function pendingInteractionPayload(params: {
       taskId,
       status: "permission_request",
       requestId,
+      eventKey,
       title: formatMessage({ id: "notification.permissionRequired" }),
       body:
         interaction.payload.summary.trim() ||
@@ -158,6 +180,7 @@ function pendingInteractionPayload(params: {
       taskId,
       status: "elicitation_request",
       requestId,
+      eventKey,
       title: formatMessage({ id: "notification.planApprovalRequired" }),
       body: formatMessage({ id: "notification.planApprovalBody" }),
     };
@@ -167,6 +190,7 @@ function pendingInteractionPayload(params: {
     taskId,
     status: "elicitation_request",
     requestId,
+    eventKey,
     title: formatMessage({ id: "notification.inputRequired" }),
     body:
       interaction.payload.prompt.trim() ||
