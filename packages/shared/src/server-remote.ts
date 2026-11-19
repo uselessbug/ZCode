@@ -3,6 +3,17 @@ import { compatibilityManifestSchema } from "./source-server/compatibility.js";
 
 export const SERVER_REMOTE_PROTOCOL_VERSION = 1;
 
+export const STANDALONE_TERMINAL_OWNER_SUBPROTOCOL = "zcode-standalone-terminal-v1";
+export const STANDALONE_TERMINAL_OWNER_SUBPROTOCOL_PREFIX = `${STANDALONE_TERMINAL_OWNER_SUBPROTOCOL}.`;
+export const STANDALONE_TERMINAL_OWNER_CLOSE_CODE = 4001;
+export const STANDALONE_TERMINAL_OWNER_CLOSE_API_PATH = "/api/standalone-terminal-owner/close";
+
+export interface StandaloneTerminalOwnerState {
+  ownerId: string;
+  resumeToken: string;
+  terminalIds: string[];
+}
+
 const serverRemoteWorkspaceInfoShape = {
   path: z.string().trim().min(1),
   label: z.string().trim().min(1).optional(),
@@ -42,6 +53,8 @@ export const serverRemoteInfoSchema = z.object({
     virtualProjects: z.literal(true).optional(),
     // 独立 Web 本地连接已注册受管 worktree 频道时才声明；缺省视为不支持，前端据此 fail-closed。
     managedWorktrees: z.literal(true).optional(),
+    // 独立 Web 本地连接启用页面级 PTY owner 隔离与宽限回收时才声明；缺省按未启用处理。
+    standaloneTerminalOwners: z.literal(true).optional(),
     // 旧 Server 缺少新增 dynamic event，必须先声明能力再订阅，避免异常打进对端读循环。
     processResourceTelemetry: z.boolean().optional(),
     remoteConversationTelemetry: z.boolean().optional(),
@@ -67,6 +80,7 @@ export const serverRemoteInfoOutputSchema = z
         websocketRpc: z.literal(true),
         virtualProjects: z.literal(true).optional(),
         managedWorktrees: z.literal(true).optional(),
+        standaloneTerminalOwners: z.literal(true).optional(),
         // 输入和严格输出保持同一能力合同，否则新 Server 会在监听前被自身 schema 拒绝。
         processResourceTelemetry: z.boolean().optional(),
         remoteConversationTelemetry: z.boolean().optional(),

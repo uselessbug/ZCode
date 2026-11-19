@@ -11,6 +11,7 @@ import { consumeNotificationDeepLink, createWebPlatform } from "#src/platform/in
 import { mobilePluginDiscoveryTelemetrySchema } from "@zcode/shared";
 import {
   sessionCreateTelemetrySchema,
+  STANDALONE_TERMINAL_OWNER_CLOSE_API_PATH,
   WEB_REMOTE_CONTROL_WORKSPACE_RECONNECT_TIMEOUT_MS,
   createWebRemoteControlConnectionRecoveryTimeoutFailure,
   resolveWebRemoteControlRelayWsUrl,
@@ -38,6 +39,8 @@ import {
   connectViaProtocol,
   connectViaWebSocket,
   createAcknowledgedWebRemoteControlRelayProtocol,
+  createStandaloneTerminalPage,
+  type StandaloneTerminalPage,
 } from "@zcode/client";
 
 import { WebCallbackPage } from "./auth/WebCallbackPage.js";
@@ -250,6 +253,8 @@ interface WebBootstrapResult {
   allowOpenWorkspace?: boolean;
   /** 仅 /api/server-info 声明 capabilities.managedWorktrees 时为 true；`?remote=` 跨机代理与失败回退均不开启。 */
   managedWorktrees?: boolean;
+  /** 仅 /api/server-info 声明 capabilities.standaloneTerminalOwners 时为 true；`?remote=` 与失败回退均不开启。 */
+  standaloneTerminalOwners?: boolean;
   /** 首屏 /api/server-info 的访问结果：ok 表示已确认登录态有效，首连可直接握手。 */
   initialAccessState: "ok" | "auth-required" | "unknown";
 }
@@ -492,6 +497,9 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
       wsUrl,
       initialAccessState: "ok",
       ...(serverInfo.capabilities?.managedWorktrees === true ? { managedWorktrees: true } : {}),
+      ...(serverInfo.capabilities?.standaloneTerminalOwners === true
+        ? { standaloneTerminalOwners: true }
+        : {}),
       ...(workspace?.path ? { initialWorkspaceAbsPath: workspace.path } : {}),
       ...(workspace?.workspaceIdentity
         ? { initialWorkspaceIdentity: workspace.workspaceIdentity }
@@ -2016,7 +2024,30 @@ function createStandaloneWebConnection(ports: StandaloneWebConnectionPorts) {
       hadReady = true;
       // 只稳定 settingService/broadcastService 两个引用；其余 services 每次保持 fresh，
       // 让 Root 的 [services] effect 重新读取最新设置，而不是把设置快照搬进转发对象。
-      ports.onReady({ ...services, broadcastService: broadcast, settingService });
+      // 使用 Proxy 保持 RemoteServiceAccess 原型与不可枚举成员，不展开类实例。
+      ports.onReady(
+        new Proxy(services, {
+          get(target, key, receiver) {
+            if (key === "broadcastService") return broadcast;
+            if (key === "settingService") return settingService;
+            return Reflect.get(target, key, receiver);
+          },
+          getOwnPropertyDescriptor(target, key) {
+            if (key === "broadcastService") {
+              return { configurable: true, enumerable: true, value: broadcast, writable: false };
+            }
+            if (key === "settingService") {
+              return {
+                configurable: true,
+                enumerable: true,
+                value: settingService,
+                writable: false,
+              };
+            }
+            return Reflect.getOwnPropertyDescriptor(target, key);
+          },
+        }),
+      );
       publish("connected");
       heartbeatTimer = setTimeout(() => void pulse(), 25_000);
     } catch {
@@ -2208,14 +2239,31 @@ async function bootstrapWebApp() {
       </>,
     );
   };
+  const isLocalStandalone = !params.get("remote");
+  let standaloneTerminalPage: StandaloneTerminalPage | undefined;
   const startConnection = () => {
     connection = createStandaloneWebConnection({
       initialAccessVerified: bootstrap.initialAccessState === "ok",
-      connect: (options) =>
-        connectViaWebSocket(bootstrap.wsUrl, {
+      connect: (options) => {
+        if (isLocalStandalone && bootstrap.standaloneTerminalOwners === true) {
+          standaloneTerminalPage ??= createStandaloneTerminalPage({
+            onExplicitCloseWithoutOpenSocket: (resumeToken) => {
+              void fetch(STANDALONE_TERMINAL_OWNER_CLOSE_API_PATH, {
+                method: "POST",
+                keepalive: true,
+                credentials: "same-origin",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ resumeToken }),
+              }).catch(() => {});
+            },
+          });
+        }
+        return connectViaWebSocket(bootstrap.wsUrl, {
           ...options,
           managedWorktreeService: bootstrap.managedWorktrees === true,
-        }),
+          ...(standaloneTerminalPage ? { standaloneTerminalPage } : {}),
+        });
+      },
       async checkAccess(signal) {
         const response = await fetch("/api/server-info", {
           cache: "no-store",
@@ -2230,7 +2278,22 @@ async function bootstrapWebApp() {
         )
           return false;
         if (!response.ok) throw new Error("Server unavailable");
-        return response.headers.get("content-type")?.includes("application/json") === true;
+        if (response.headers.get("content-type")?.includes("application/json") !== true) {
+          return false;
+        }
+        if (isLocalStandalone) {
+          try {
+            const serverInfo = (await response.json()) as Partial<ServerRemoteInfo>;
+            if (serverInfo.capabilities?.managedWorktrees === true) {
+              bootstrap.managedWorktrees = true;
+            }
+            bootstrap.standaloneTerminalOwners =
+              serverInfo.capabilities?.standaloneTerminalOwners === true;
+          } catch {
+            return false;
+          }
+        }
+        return true;
       },
       onReady(next) {
         services = next;
@@ -2260,9 +2323,10 @@ async function bootstrapWebApp() {
   }
   window.addEventListener("pagehide", (event) => {
     // BFCache 恢复（persisted）继续走既有 lifecycle 恢复路径，不做整页刷新；
-    // 真实退出时释放连接并清理提示计时器。
+    // 真实退出时先显式关闭独立终端页面 owner（在 abort 之前发送 4001 或保活关闭请求），再释放连接并清理提示计时器。
     if (!event.persisted) {
       clearTimeout(connectionHintTimer);
+      standaloneTerminalPage?.close();
       connection?.dispose();
     }
   });

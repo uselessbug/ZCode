@@ -29,6 +29,7 @@ import {
   IManagedWorktreeService,
   IProviderProvisioningTargetService,
   IProjectService,
+  ITerminalService,
   IWebPushService,
   WebPushValidationError,
 } from "@zcode/services";
@@ -48,6 +49,10 @@ import {
   formatLogPrefix,
   serverRemoteInfoOutputSchema,
   SERVER_REMOTE_PROTOCOL_VERSION,
+  STANDALONE_TERMINAL_OWNER_CLOSE_API_PATH,
+  STANDALONE_TERMINAL_OWNER_CLOSE_CODE,
+  STANDALONE_TERMINAL_OWNER_SUBPROTOCOL,
+  STANDALONE_TERMINAL_OWNER_SUBPROTOCOL_PREFIX,
   ZCODE_RPC_HOST_CAPABILITY_HEADER,
   ZCODE_COMPATIBILITY_MANIFEST,
   ZCODE_VERSION,
@@ -56,7 +61,12 @@ import {
   type ServerRemoteWorkspaceInfo,
 } from "@zcode/shared";
 import {
+  createStandaloneTerminalOwners,
+  createTerminalScope,
   SourceServerWorkspaceIdentityChannelServer,
+  type StandaloneTerminalConnectionLease,
+  type StandaloneTerminalOwnerBindRequest,
+  type StandaloneTerminalOwners,
   type SourceServerWorkspaceIdentityMapper,
 } from "@zcode/services/node";
 import { createHostCapabilityStore } from "./hostCapability.js";
@@ -142,12 +152,46 @@ function createStandaloneProjectAlias<T extends object>(service: T, ownerHostId:
   });
 }
 
+const STANDALONE_TERMINAL_WS_PING_INTERVAL_MS = 15_000;
+const STANDALONE_TERMINAL_TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+
+function parseStandaloneTerminalOwnerSubprotocol(
+  headerValue: string | undefined,
+): StandaloneTerminalOwnerBindRequest | { kind: "none" } | { kind: "invalid" } {
+  if (headerValue === undefined) {
+    return { kind: "none" };
+  }
+  const protocols = headerValue
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (protocols.length !== 1) {
+    return { kind: "invalid" };
+  }
+  const protocol = protocols[0];
+  if (protocol === STANDALONE_TERMINAL_OWNER_SUBPROTOCOL) {
+    return { kind: "fresh" };
+  }
+  if (!protocol?.startsWith(STANDALONE_TERMINAL_OWNER_SUBPROTOCOL_PREFIX)) {
+    return { kind: "invalid" };
+  }
+  const resumeToken = protocol.slice(STANDALONE_TERMINAL_OWNER_SUBPROTOCOL_PREFIX.length);
+  if (!STANDALONE_TERMINAL_TOKEN_PATTERN.test(resumeToken)) {
+    return { kind: "invalid" };
+  }
+  return { kind: "resume", resumeToken };
+}
+
 function setupChannelServer(
   ws: WebSocket,
   services: ServiceCollection,
   clientMode: "desktop-continuous" | "web-remote-replayable",
   workspaceIdentityMapper?: SourceServerWorkspaceIdentityMapper,
   resourcePeers?: TopicResourcePeers,
+  standaloneTerminalOwner?: {
+    owners: StandaloneTerminalOwners;
+    request: StandaloneTerminalOwnerBindRequest;
+  },
 ) {
   const socket = wrapWebSocket(ws);
   const protocol = new SocketProtocol(socket);
@@ -236,8 +280,92 @@ function setupChannelServer(
     // Web Push 管理只走同源鉴权 HTTP API，不允许 WebSocket RPC 触发内部推送或关闭服务。
     overrides.set(IWebPushService.channelName, {});
   }
+  let lease: StandaloneTerminalConnectionLease | undefined;
+  let legacyTerminalScope: ReturnType<typeof createTerminalScope> | undefined;
+  if (clientMode === "web-remote-replayable") {
+    const terminalService = services.getOptional(ITerminalService);
+    if (terminalService) {
+      if (standaloneTerminalOwner) {
+        lease = standaloneTerminalOwner.owners.bind(
+          standaloneTerminalOwner.request,
+          terminalService,
+          () => {
+            // 同页新连接已接管或显式结束该作用域，立即中止旧/半开 socket 释放 RPC 资源。
+            try {
+              ws.terminate();
+            } catch {
+              // ignore
+            }
+          },
+        );
+        overrides.set(ITerminalService.channelName, lease.service);
+      } else {
+        // 旧客户端或未带页面 owner 子协议的 /ws 连接按 attachment 生命周期隔离并随断线回收 PTY。
+        legacyTerminalScope = createTerminalScope(terminalService, (error) => {
+          log("failed to dispose attachment terminal scope", error);
+        });
+        overrides.set(ITerminalService.channelName, legacyTerminalScope.service);
+      }
+    }
+  }
   services.exposeOnChannelServer(server, overrides);
+  if (legacyTerminalScope && ws.readyState === ws.CLOSED) {
+    legacyTerminalScope.dispose();
+  }
+  let stopStandalonePing: (() => void) | undefined;
+  if (lease) {
+    let isAlive = true;
+    const onPong = () => {
+      isAlive = true;
+    };
+    const onMessage = () => {
+      isAlive = true;
+    };
+    ws.on("pong", onPong);
+    ws.on("message", onMessage);
+    const pingTimer = setInterval(() => {
+      if (ws.readyState !== ws.OPEN) return;
+      if (!isAlive) {
+        ws.terminate();
+        return;
+      }
+      isAlive = false;
+      try {
+        ws.ping();
+      } catch {
+        ws.terminate();
+      }
+    }, STANDALONE_TERMINAL_WS_PING_INTERVAL_MS);
+    pingTimer.unref?.();
+
+    let finalized = false;
+    const finalizeLease = (code?: number) => {
+      if (finalized) return;
+      finalized = true;
+      clearInterval(pingTimer);
+      ws.off("pong", onPong);
+      ws.off("message", onMessage);
+      lease.release({
+        explicitEnd: code === STANDALONE_TERMINAL_OWNER_CLOSE_CODE,
+      });
+    };
+    stopStandalonePing = () => {
+      clearInterval(pingTimer);
+      ws.off("pong", onPong);
+      ws.off("message", onMessage);
+    };
+
+    if (ws.readyState === ws.CLOSED) {
+      finalizeLease();
+    } else {
+      ws.once("close", (code) => {
+        finalizeLease(code);
+      });
+    }
+  }
   socket.onClose(() => {
+    stopStandalonePing?.();
+    legacyTerminalScope?.dispose();
     peer?.dispose();
     reverseClient?.dispose();
     void connectionScope?.dispose();
@@ -302,7 +430,7 @@ function createServerInfo(options: HttpServerOptions): ServerRemoteInfo {
       websocketRpc: true,
       ...(options.virtualProjects ? { virtualProjects: true } : {}),
       ...(process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"
-        ? { managedWorktrees: true }
+        ? { managedWorktrees: true, standaloneTerminalOwners: true }
         : {}),
       processResourceTelemetry: true,
       remoteConversationTelemetry: true,
@@ -523,6 +651,11 @@ export function createHttpServer(
   const app = new Hono();
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
   const hostCapabilities = createHostCapabilityStore();
+  const standaloneTerminalOwners = createStandaloneTerminalOwners({
+    onCleanupError: (error) => {
+      log("failed to dispose standalone terminal owner", error);
+    },
+  });
 
   const authToken = options.authToken?.trim();
   if (authToken) {
@@ -542,19 +675,68 @@ export function createHttpServer(
 
   // 普通 `/ws` 永远是 terminal-client；浏览器/任意客户端设置旧 mode header
   // 都不能再把自己提升为 trusted host。
+  app.use("/ws", async (c, next) => {
+    const subprotocol = parseStandaloneTerminalOwnerSubprotocol(
+      c.req.header("sec-websocket-protocol"),
+    );
+    if (subprotocol.kind === "none") {
+      await next();
+      return;
+    }
+    if (subprotocol.kind === "invalid") {
+      return c.json({ error: "Invalid WebSocket subprotocol" }, 400);
+    }
+    if (process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS !== "1") {
+      return c.json({ error: "Standalone terminal owners are disabled" }, 403);
+    }
+    if (!isSameOriginRequest(c)) {
+      return c.json({ error: "Forbidden cross-origin WebSocket request" }, 403);
+    }
+    await next();
+  });
   app.get(
     "/ws",
-    upgradeWebSocket(() => ({
-      onOpen(_event, ws) {
-        setupChannelServer(
-          ws.raw as WebSocket,
-          services,
-          "web-remote-replayable",
-          options.workspaceIdentityMapper,
-        );
-      },
-    })),
+    upgradeWebSocket((c) => {
+      const subprotocol = parseStandaloneTerminalOwnerSubprotocol(
+        c.req.header("sec-websocket-protocol"),
+      );
+      const standaloneTerminalOwnerRequest =
+        subprotocol.kind === "fresh" || subprotocol.kind === "resume" ? subprotocol : undefined;
+      return {
+        onOpen(_event, ws) {
+          setupChannelServer(
+            ws.raw as WebSocket,
+            services,
+            "web-remote-replayable",
+            options.workspaceIdentityMapper,
+            undefined,
+            standaloneTerminalOwnerRequest
+              ? {
+                  owners: standaloneTerminalOwners,
+                  request: standaloneTerminalOwnerRequest,
+                }
+              : undefined,
+          );
+        },
+      };
+    }),
   );
+
+  app.post(STANDALONE_TERMINAL_OWNER_CLOSE_API_PATH, async (c) => {
+    if (process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS !== "1") {
+      return c.json({ error: "Standalone terminal owners are disabled" }, 403);
+    }
+    if (!isSameOriginRequest(c)) {
+      return c.json({ error: "Forbidden cross-origin request" }, 403);
+    }
+    const rawBody = (await c.req.json().catch(() => null)) as { resumeToken?: unknown } | null;
+    const resumeToken = typeof rawBody?.resumeToken === "string" ? rawBody.resumeToken.trim() : "";
+    if (!STANDALONE_TERMINAL_TOKEN_PATTERN.test(resumeToken)) {
+      return c.json({ error: "Invalid terminal owner resume token" }, 400);
+    }
+    standaloneTerminalOwners.disposeByToken(resumeToken);
+    return c.json({ ok: true }, 200);
+  });
 
   const upgradeTrustedHostWebSocket = upgradeWebSocket(() => ({
     onOpen(_event, ws) {
@@ -705,6 +887,9 @@ export function createHttpServer(
   });
 
   injectWebSocket(server);
+  server.on("close", () => {
+    standaloneTerminalOwners.disposeAll();
+  });
 
   return server;
 }

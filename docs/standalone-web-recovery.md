@@ -32,6 +32,30 @@ sequenceDiagram
 - 只自动重试握手和只读健康探测，不重放用户消息、Shell、删除、归档或其他写请求。
 - Access 认证阻断时保留页面和草稿，立即提供重新验证入口；不泄露或向浏览器下发 ZCode 服务令牌，不修改 Access 或 Caddy。
 
+## 独立 Web 终端（PTY）页面作用域与断线回收
+
+```mermaid
+sequenceDiagram
+    participant Page as 独立 Web 页面 (Page Owner)
+    participant WS as /ws 连接与服务端作用域跟踪
+    participant PTY as 该页所属 PTY 会话
+    Page->>WS: 首连 /ws（裸子协议 zcode-standalone-terminal-v1）
+    WS-->>Page: 通过 terminal.getStandaloneOwnerState 返回 ownerId 与不可预测 resumeToken
+    alt 同页短断线（网络抖动/切后台/BFCache 恢复）
+        WS-->>PTY: 进入 3s 有限宽限期保留
+        Page->>WS: 宽限期内携带 zcode-standalone-terminal-v1.<resumeToken> 重连
+        WS-->>PTY: 取消回收计时，对账并校验关闭竞态后继续复用原 PTY
+    else 确认退出/刷新 或 超过长断线宽限期 或 未知令牌
+        Page->>WS: 非持久化 pagehide 先发 4001（断线重连中走同源保活接口），或宽限期到期
+        WS->>PTY: 仅回收该页面 owner 名下的 PTY（未知/过期令牌仅返回全新隔离 owner）
+        Note over WS,PTY: 不影响其他浏览器标签页、/ws/host、桌面端或手机远控的 PTY
+    end
+```
+
+- **复用官方作用域跟踪与服务端签发不可预测令牌**：服务端复用 `createTerminalScope` 隔离终端作用域；仅当同源本地独立 Web 启用 `capabilities.standaloneTerminalOwners`（含 `auth-required` 重试登录后重新读取 `/api/server-info` 确认）时，每个浏览器页面复用单个 `StandaloneTerminalPage` 实例。首连使用裸子协议 `zcode-standalone-terminal-v1`，由服务端在 `terminal.getStandaloneOwnerState()` 返回唯一 `ownerId` 与不可预测 `resumeToken`，重连时携带 `zcode-standalone-terminal-v1.<resumeToken>`；客户端不能自行指定 UUID 认领既有作用域，未知或已过期令牌仅分配全新隔离作用域，不影响任何其他 owner。
+- **同源鉴权、传统连接兜底与首屏零阻塞**：带页面子协议的 `/ws` 及同源保活关闭接口 `/api/standalone-terminal-owner/close` 受同源检查与现有单主体令牌鉴权保护；未携带页面子协议的传统 `/ws` 连接（`web-remote-replayable`）按 attachment 局部 `createTerminalScope` 隔离并在断线时回收，不共享宿主全量终端，也不改变 `/ws/host` 与桌面端的原有语义。WS `open` 时立即完成应用首屏挂载（不额外等待 `getStandaloneOwnerState` 往返），终端就绪等待与关闭竞态对账（订阅 `onDynamicData`/`onDynamicExit` 后紧随一次有序快照校验，并结合服务端退出码回放）仅收敛在终端调用范围内。
+- **显式退出与长断线精确回收**：非持久化 `pagehide`（非 BFCache）在 `abort` 之前显式关闭终端页面 owner：WS 已打开时直接发送关闭码 `4001` 立即回收；若处于重连/未建连窗口且已持有 `resumeToken`，则发同源保活 `POST /api/standalone-terminal-owner/close`（不可达时回退到 3 秒宽限超时回收）。BFCache 持久化挂起（`event.persisted === true`）不关闭 owner，恢复后沿用同一页面实例重连。
+
 ## 验收
 
 1. 断开 WebSocket 后，已发送和新 RPC 均被拒绝，无永久 pending。
@@ -42,3 +66,4 @@ sequenceDiagram
 6. Access 阻断（`401` / `403` / `302`）立即显示重新验证入口，不无限尝试 WebSocket，不丢弃草稿；重新验证继续走现有认证。
 7. 断线重连期间不设置 `inert`，浏览器真实页面保留输入草稿与焦点，恢复后可读取最新任务状态；不重复提交任何写命令。
 8. 原有独立 Web host alias 补丁仍生效；仅替换 ZCode 镜像，AGM、Access checker、Caddy、Asspp 和游戏服务不变。
+9. 独立 Web 终端（PTY）按页面独立 owner 隔离：同页短断线在有限宽限期内重连可保留原 PTY；页面确认关闭/刷新或长断线超时后仅回收该页 PTY，不影响其他标签页、桌面或远控。

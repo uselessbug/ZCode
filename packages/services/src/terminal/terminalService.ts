@@ -1,11 +1,16 @@
+import { randomBytes, randomUUID } from "node:crypto";
 import { accessSync, chmodSync, constants, existsSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, release } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { Emitter, type Event } from "@zcode/rpc";
+import { Emitter, Event, type IDisposable } from "@zcode/rpc";
 import type { IPty } from "node-pty";
 import type { ISettingService } from "../setting/setting.js";
-import type { ITerminalService, TerminalWindowsPtyInfo } from "./terminal.js";
+import type {
+  IStandaloneTerminalService,
+  ITerminalService,
+  TerminalWindowsPtyInfo,
+} from "./terminal.js";
 import {
   resolveTerminalFontProfile,
   type TerminalFontFamilySource,
@@ -510,4 +515,364 @@ export function createTerminalService(dependencies: {
   };
 
   return service;
+}
+
+/** 旧客户端没有页面 owner 时按 attachment 回收，避免继续产生无主 PTY。 */
+export function createTerminalScope(
+  base: ITerminalService,
+  onCleanupError: (error: unknown) => void,
+  onTerminalExit?: (id: string, exitCode: number) => void,
+) {
+  let active = true;
+  const terminals = new Map<string, IDisposable>();
+  function assertActive(id?: string): void {
+    if (!active || (id !== undefined && !terminals.has(id))) {
+      throw new Error("Terminal owner has ended or does not own this terminal");
+    }
+  }
+  const release = async (id: string) => {
+    await base.dispose({ id });
+    terminals.get(id)?.dispose();
+    terminals.delete(id);
+  };
+  const service: ITerminalService = {
+    async create(params) {
+      assertActive();
+      const result = await base.create(params);
+      // create 跨 RPC/加载 await；owner 已结束时必须回收返回的真实 PTY，不能只丢响应。
+      if (!active) {
+        await base.dispose({ id: result.id });
+        throw new Error("Terminal owner has ended");
+      }
+      const subscription = base.onDynamicExit(result.id)((exitCode) => {
+        terminals.get(result.id)?.dispose();
+        terminals.delete(result.id);
+        onTerminalExit?.(result.id, exitCode);
+      });
+      terminals.set(result.id, subscription);
+      return result;
+    },
+    async write(params) {
+      assertActive(params.id);
+      await base.write(params);
+    },
+    async resize(params) {
+      assertActive(params.id);
+      await base.resize(params);
+    },
+    async dispose({ id }) {
+      if (!active || !terminals.has(id)) return;
+      await release(id);
+    },
+    async listTerminalIdsUnderPath(params) {
+      assertActive();
+      // attachment 只能看到自己创建的终端，不能借查询枚举 Host 上其他 owner 的终端。
+      return (await base.listTerminalIdsUnderPath(params)).filter((id) => terminals.has(id));
+    },
+    onDynamicData(id) {
+      assertActive(id);
+      try {
+        return base.onDynamicData(id);
+      } catch (error) {
+        terminals.get(id)?.dispose();
+        terminals.delete(id);
+        throw error;
+      }
+    },
+    onDynamicExit(id) {
+      assertActive(id);
+      try {
+        return base.onDynamicExit(id);
+      } catch (error) {
+        terminals.get(id)?.dispose();
+        terminals.delete(id);
+        throw error;
+      }
+    },
+  };
+  return {
+    service,
+    hasTerminal(id: string): boolean {
+      return active && terminals.has(id);
+    },
+    listOwnedTerminalIds(): string[] {
+      return active ? Array.from(terminals.keys()) : [];
+    },
+    dispose(): void {
+      if (!active) return;
+      active = false;
+      const owned = Array.from(terminals.entries());
+      terminals.clear();
+      for (const [id, subscription] of owned) {
+        subscription.dispose();
+        void release(id).catch(onCleanupError);
+      }
+    },
+  };
+}
+
+export const DEFAULT_STANDALONE_TERMINAL_OWNER_GRACE_MS = 3_000;
+const MAX_RECORDED_EXITED_TERMINALS_PER_OWNER = 200;
+
+export type StandaloneTerminalOwnerBindRequest =
+  | { kind: "fresh" }
+  | { kind: "resume"; resumeToken: string };
+
+export interface StandaloneTerminalOwnersOptions {
+  graceMs?: number;
+  onCleanupError: (error: unknown) => void;
+  createOwnerId?: () => string;
+  createResumeToken?: () => string;
+}
+
+export interface StandaloneTerminalConnectionLease {
+  ownerId: string;
+  resumeToken: string;
+  service: IStandaloneTerminalService;
+  release(options: { explicitEnd: boolean }): void;
+}
+
+export interface StandaloneTerminalOwners {
+  bind(
+    request: StandaloneTerminalOwnerBindRequest,
+    base: ITerminalService,
+    onSuperseded?: () => void,
+  ): StandaloneTerminalConnectionLease;
+  disposeByToken(resumeToken: string): boolean;
+  disposeAll(): void;
+}
+
+interface StandaloneOwnerEntry {
+  ownerId: string;
+  resumeToken: string;
+  scope: ReturnType<typeof createTerminalScope>;
+  exitedCodes: Map<string, number>;
+  activeConnectionToken: symbol | undefined;
+  onSuperseded: (() => void) | undefined;
+  graceTimer: ReturnType<typeof setTimeout> | undefined;
+  releasingStaleIds: Set<string>;
+  ended: boolean;
+}
+
+function defaultCreateResumeToken(): string {
+  return randomBytes(24).toString("base64url");
+}
+
+/** 独立 Web 按服务端签发的不可预测 resumeToken 隔离终端作用域，支持短断线 3s 宽限保留与显式立即回收。 */
+export function createStandaloneTerminalOwners(
+  options: StandaloneTerminalOwnersOptions,
+): StandaloneTerminalOwners {
+  const graceMs = options.graceMs ?? DEFAULT_STANDALONE_TERMINAL_OWNER_GRACE_MS;
+  const createOwnerId = options.createOwnerId ?? randomUUID;
+  const createResumeToken = options.createResumeToken ?? defaultCreateResumeToken;
+  const owners = new Map<string, StandaloneOwnerEntry>();
+
+  function endOwner(owner: StandaloneOwnerEntry): void {
+    if (owner.ended) return;
+    owner.ended = true;
+    owner.activeConnectionToken = undefined;
+    owner.onSuperseded = undefined;
+    if (owner.graceTimer !== undefined) {
+      clearTimeout(owner.graceTimer);
+      owner.graceTimer = undefined;
+    }
+    if (owners.get(owner.resumeToken) === owner) {
+      owners.delete(owner.resumeToken);
+    }
+    owner.exitedCodes.clear();
+    owner.scope.dispose();
+  }
+
+  return {
+    bind(
+      request: StandaloneTerminalOwnerBindRequest,
+      base: ITerminalService,
+      onSuperseded?: () => void,
+    ): StandaloneTerminalConnectionLease {
+      // 仅命中有效且未结束的服务端 resumeToken 才能复用既有作用域；未知或已过期的令牌一律创建全新隔离作用域。
+      let existing = request.kind === "resume" ? owners.get(request.resumeToken) : undefined;
+      if (!existing || existing.ended) {
+        const exitedCodes = new Map<string, number>();
+        const ownerId = createOwnerId();
+        const resumeToken = createResumeToken();
+        existing = {
+          ownerId,
+          resumeToken,
+          scope: createTerminalScope(base, options.onCleanupError, (id, exitCode) => {
+            if (existing?.ended) return;
+            exitedCodes.set(id, exitCode);
+            if (exitedCodes.size > MAX_RECORDED_EXITED_TERMINALS_PER_OWNER) {
+              const oldest = exitedCodes.keys().next().value;
+              if (oldest !== undefined) exitedCodes.delete(oldest);
+            }
+          }),
+          exitedCodes,
+          activeConnectionToken: undefined,
+          onSuperseded: undefined,
+          graceTimer: undefined,
+          releasingStaleIds: new Set<string>(),
+          ended: false,
+        };
+        owners.set(resumeToken, existing);
+      } else if (existing.graceTimer !== undefined) {
+        clearTimeout(existing.graceTimer);
+        existing.graceTimer = undefined;
+      }
+
+      const owner = existing;
+      const previousSuperseded = owner.onSuperseded;
+      const connectionToken = Symbol("standalone-terminal-connection");
+      // 先切换当前连接代际再通知被取代连接，防止旧 socket 在关闭回调里误伤新租约。
+      owner.activeConnectionToken = connectionToken;
+      owner.onSuperseded = onSuperseded;
+      if (previousSuperseded) {
+        try {
+          previousSuperseded();
+        } catch (error) {
+          options.onCleanupError(error);
+        }
+      }
+
+      const isConnectionCurrent = (): boolean =>
+        !owner.ended && owner.activeConnectionToken === connectionToken;
+      const assertConnectionCurrent = (): void => {
+        if (!isConnectionCurrent()) {
+          throw new Error("Terminal owner has ended or connection is no longer active");
+        }
+      };
+
+      const service: IStandaloneTerminalService = {
+        async create(params) {
+          assertConnectionCurrent();
+          const result = await owner.scope.service.create(params);
+          if (!isConnectionCurrent()) {
+            // 旧连接在 create 等待期间断线或被同页新连接取代，仅回收本次晚到返回的终端。
+            owner.releasingStaleIds.add(result.id);
+            try {
+              await owner.scope.service.dispose({ id: result.id }).catch(options.onCleanupError);
+            } finally {
+              owner.releasingStaleIds.delete(result.id);
+            }
+            throw new Error("Terminal connection has closed");
+          }
+          return result;
+        },
+        async write(params) {
+          assertConnectionCurrent();
+          await owner.scope.service.write(params);
+        },
+        async resize(params) {
+          assertConnectionCurrent();
+          await owner.scope.service.resize(params);
+        },
+        async dispose(params) {
+          assertConnectionCurrent();
+          owner.exitedCodes.delete(params.id);
+          await owner.scope.service.dispose(params);
+        },
+        async listTerminalIdsUnderPath(params) {
+          assertConnectionCurrent();
+          const ids = await owner.scope.service.listTerminalIdsUnderPath(params);
+          return owner.releasingStaleIds.size === 0
+            ? ids
+            : ids.filter((id) => !owner.releasingStaleIds.has(id));
+        },
+        onDynamicData(id) {
+          assertConnectionCurrent();
+          if (owner.scope.hasTerminal(id)) {
+            return owner.scope.service.onDynamicData(id);
+          }
+          if (owner.exitedCodes.has(id)) {
+            return Event.None;
+          }
+          return owner.scope.service.onDynamicData(id);
+        },
+        onDynamicExit(id) {
+          assertConnectionCurrent();
+          if (owner.scope.hasTerminal(id)) {
+            return owner.scope.service.onDynamicExit(id);
+          }
+          if (owner.exitedCodes.has(id)) {
+            const exitCode = owner.exitedCodes.get(id)!;
+            return (listener) => {
+              let disposed = false;
+              queueMicrotask(() => {
+                if (!disposed && isConnectionCurrent()) {
+                  listener(exitCode);
+                }
+              });
+              return {
+                dispose() {
+                  disposed = true;
+                },
+              };
+            };
+          }
+          return owner.scope.service.onDynamicExit(id);
+        },
+        async getStandaloneOwnerState() {
+          assertConnectionCurrent();
+          const ids = owner.scope.listOwnedTerminalIds();
+          return {
+            ownerId: owner.ownerId,
+            resumeToken: owner.resumeToken,
+            terminalIds:
+              owner.releasingStaleIds.size === 0
+                ? ids
+                : ids.filter((id) => !owner.releasingStaleIds.has(id)),
+          };
+        },
+      };
+
+      let released = false;
+      return {
+        ownerId: owner.ownerId,
+        resumeToken: owner.resumeToken,
+        service,
+        release({ explicitEnd }: { explicitEnd: boolean }): void {
+          if (released) return;
+          released = true;
+          if (owner.ended || owner.activeConnectionToken !== connectionToken) {
+            return;
+          }
+          owner.activeConnectionToken = undefined;
+          owner.onSuperseded = undefined;
+          if (explicitEnd) {
+            endOwner(owner);
+            return;
+          }
+          if (owner.graceTimer !== undefined) {
+            clearTimeout(owner.graceTimer);
+          }
+          owner.graceTimer = setTimeout(() => {
+            owner.graceTimer = undefined;
+            if (!owner.ended && owner.activeConnectionToken === undefined) {
+              endOwner(owner);
+            }
+          }, graceMs);
+        },
+      };
+    },
+    disposeByToken(resumeToken: string): boolean {
+      const owner = owners.get(resumeToken);
+      if (!owner || owner.ended) {
+        return false;
+      }
+      const terminate = owner.onSuperseded;
+      endOwner(owner);
+      if (terminate) {
+        try {
+          terminate();
+        } catch (error) {
+          options.onCleanupError(error);
+        }
+      }
+      return true;
+    },
+    disposeAll(): void {
+      for (const owner of Array.from(owners.values())) {
+        endOwner(owner);
+      }
+    },
+  };
 }

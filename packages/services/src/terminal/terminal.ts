@@ -1,5 +1,5 @@
 import type { Event } from "@zcode/rpc";
-import { ServiceChannels } from "@zcode/shared";
+import { ServiceChannels, type StandaloneTerminalOwnerState } from "@zcode/shared";
 import { createServiceDescriptor } from "../descriptors.js";
 import type { TerminalFontFamilySource, TerminalThemeProfile } from "./terminalProfile.js";
 
@@ -25,6 +25,10 @@ export interface ITerminalService {
   listTerminalIdsUnderPath(params: { path: string }): Promise<string[]>;
   onDynamicData(id: string): Event<string>;
   onDynamicExit(id: string): Event<number>;
+}
+
+export interface IStandaloneTerminalService extends ITerminalService {
+  getStandaloneOwnerState(): Promise<StandaloneTerminalOwnerState>;
 }
 
 export const ITerminalService = createServiceDescriptor<ITerminalService>(ServiceChannels.Terminal);

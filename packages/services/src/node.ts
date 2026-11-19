@@ -191,7 +191,16 @@ export { GitCommitMessageGenerator } from "./git/gitCommitMessageGenerator.js";
 export { createGitCheckpointService } from "./git/gitCheckpointService.js";
 export { createSystemService } from "./system/systemService.js";
 export { listSSHConfigAliasesFromLocalConfig } from "./system/sshConfigAlias.js";
-export { createTerminalService } from "./terminal/terminalService.js";
+export {
+  createTerminalService,
+  createTerminalScope,
+  createStandaloneTerminalOwners,
+  DEFAULT_STANDALONE_TERMINAL_OWNER_GRACE_MS,
+  type StandaloneTerminalOwnerBindRequest,
+  type StandaloneTerminalConnectionLease,
+  type StandaloneTerminalOwners,
+  type StandaloneTerminalOwnersOptions,
+} from "./terminal/terminalService.js";
 export {
   createSettingService,
   createSettingServiceWithMigrations,
