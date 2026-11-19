@@ -178,8 +178,8 @@ export interface AppProps {
   remoteWorkspaceErrorByWorkspaceKey: Record<string, string>;
 
   remoteConnectionLogs?: RemoteConnectionLogEntry[];
-  onCreateTask: (request?: CreateTaskRequest) => void;
-  onCreateConversationTask?: () => void;
+  onCreateTask: (request?: CreateTaskRequest) => void | Promise<void>;
+  onCreateConversationTask?: (request?: CreateTaskRequest) => void | Promise<void>;
   onCreateConversationTaskOnSource?: (sourceServerId: string) => void;
   /** 解析“在项目外工作”的目标；identity 由 Root 按 Source 归属给出，Shell 不得按路径反查。 */
   onResolveConversationWorkspace?: () => Promise<{

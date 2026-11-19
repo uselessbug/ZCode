@@ -196,6 +196,74 @@ export function readComposerWorkspaceScope(
   }
   return undefined;
 }
+export function clearComposerWorkspaceScope(
+  path: string,
+  identity: string | undefined,
+  clientNamespace = "desktop",
+  expectedProjectId?: string | null,
+): void {
+  try {
+    if (expectedProjectId !== undefined) {
+      const current = readComposerWorkspaceScope(path, identity, clientNamespace);
+      if (!current || current.projectId !== expectedProjectId) return;
+    }
+    getStorage()?.removeItem(workspaceScopeKey(path, identity, clientNamespace));
+  } catch (error) {
+    warnStorageFailure(workspaceScopeKey(path, identity, clientNamespace), error);
+  }
+}
+export function transferStaleProjectDraftToProjectlessScope(params: {
+  staleWorkspacePath: string;
+  workspaceIdentity?: string;
+  staleProjectId: string;
+  targetWorkspacePath: string;
+  clientNamespace?: string;
+}): V4ComposerDraft | null {
+  const clientNamespace = params.clientNamespace ?? "desktop";
+  const staleScope = resolveComposerScope(
+    params.staleProjectId,
+    params.workspaceIdentity,
+    clientNamespace,
+  );
+  const nullScope = resolveComposerScope(null, params.workspaceIdentity, clientNamespace);
+  clearComposerWorkspaceScope(
+    params.staleWorkspacePath,
+    params.workspaceIdentity,
+    clientNamespace,
+    params.staleProjectId,
+  );
+  const staleDraft = readV4ComposerDraft(
+    params.staleWorkspacePath,
+    params.workspaceIdentity,
+    V4_DRAFT_SCOPE_ROOT,
+    staleScope,
+  );
+  if (!staleDraft || !staleDraft.text.trim()) return null;
+  const existingNullDraft = readV4ComposerDraft(
+    params.targetWorkspacePath,
+    params.workspaceIdentity,
+    V4_DRAFT_SCOPE_ROOT,
+    nullScope,
+  );
+  if (!existingNullDraft?.text?.trim()) {
+    const preserved = persistV4ComposerDraft(
+      params.targetWorkspacePath,
+      params.workspaceIdentity,
+      V4_DRAFT_SCOPE_ROOT,
+      { ...staleDraft, projectId: null, taskGroupId: null },
+      nullScope,
+    );
+    if (preserved) {
+      clearV4ComposerDraft(
+        params.staleWorkspacePath,
+        params.workspaceIdentity,
+        V4_DRAFT_SCOPE_ROOT,
+        staleScope,
+      );
+    }
+  }
+  return staleDraft;
+}
 
 function draftStorageKey(
   path: string,

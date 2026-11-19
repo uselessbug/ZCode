@@ -155,7 +155,7 @@ export const ProjectSidebarNode = memo(
         }
         onCreate={() =>
           runProjectAction(async () => {
-            onCreateTask({
+            await onCreateTask({
               projectId: project.id,
               taskGroupId: null,
               ...(isWebRemoteControl || remoteHost ? { hostId: project.hostId } : {}),

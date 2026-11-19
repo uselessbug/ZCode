@@ -168,7 +168,7 @@ export const ProjectSidebar = memo(function ProjectSidebar(props: ProjectSidebar
               .getWorkspaceState(props.workspacePath, props.workspaceIdentity).draftTaskGroupId ??
             null)
           : null;
-    props.onCreateTask({
+    await props.onCreateTask({
       projectId: projectId ?? null,
       taskGroupId: taskGroupId === undefined ? inheritedGroup : taskGroupId,
       ...(hostId ? { hostId } : {}),

@@ -77,7 +77,7 @@
     `switcher={webRemoteControlWorkspaceSwitcher}` 原样传入。
   - 手机 Home 导航（仅 `mobile && !isWebRemoteControlShell`）：`onSelectTask` /
     `onStartDraftInWorkspace` / `onCreateTask` / `onCreateConversationTask` /
-    `onOpenAutomations` / `onOpenPluginStore` 在调用原 handler 后 `mobile.navigateToChat()`。
+    `onOpenAutomations` / `onOpenPluginStore` 在调用原 handler 后 `mobile.navigateToChat()`；其中新建任务/草稿等异步操作须等待操作成功完成后才切入 `Chat`，若失败则留在 `Home` 列表页并保留错误反馈，避免进到空白或无效会话页。
   - 草稿头部 `ProjectComposerMenu` / `GitBranchSwitcher` 的
     `compactForRemoteControl` 改用 `isCompactMobileWorkspace`。
 - 窄屏防溢出：

@@ -33,6 +33,7 @@ import {
   rememberComposerWorkspaceScope,
   readComposerWorkspaceScope,
   rotateMissingPendingTaskDraft,
+  transferStaleProjectDraftToProjectlessScope,
 } from "@/v4/composer/composerDraftStore.js";
 import { openFolderFromWorkspaceEntry } from "@/root/openWorkspaceFolderEntry.js";
 import { useConversationWorkspaceActions } from "@/root/useConversationWorkspaceActions.js";
@@ -308,7 +309,11 @@ export function useRootWorkspaceActions({
         const hasExplicitProject =
           typeof request === "object" &&
           request !== null &&
-          ("projectId" in request || Boolean(request.targetWorkspace?.projectId));
+          (request.projectId !== undefined || request.targetWorkspace?.projectId !== undefined);
+        let staleLocalProjectFallback: {
+          staleWorkspacePath: string;
+          staleProjectId: string;
+        } | null = null;
         const newTaskTarget = resolveNewTaskTargetFromRequest(request, () =>
           resolveWorkbenchNewTaskTarget({
             activeWorkspacePath,
@@ -358,6 +363,12 @@ export function useRootWorkspaceActions({
               )
             ) {
               logger.debug("[Root] 新任务不继承已删除的本地项目", { projectId });
+              if (!workspace.activeTaskId) {
+                staleLocalProjectFallback = {
+                  staleWorkspacePath: newTaskTarget.workspacePath,
+                  staleProjectId: projectId,
+                };
+              }
               projectId = undefined;
             }
           }
@@ -370,7 +381,7 @@ export function useRootWorkspaceActions({
           // 归属先在共享入口解析，目录仍只由 bridge owner 准备；旧 Root 不写交接后的草稿。
           await openMobileProjectDraft({
             ...requestOptions,
-            ...(projectId ? { projectId } : {}),
+            ...(projectId !== undefined ? { projectId } : {}),
             ...(hostId ? { hostId } : {}),
           });
           return;
@@ -424,6 +435,14 @@ export function useRootWorkspaceActions({
           const currentDraft = readPendingTaskDraft(pendingScope);
           if (!currentDraft || currentDraft.draftId !== pendingDraft.draftId) return;
           bindPendingTaskDraft(pendingScope, pendingDraft.draftId, target.workspacePath);
+          if (staleLocalProjectFallback && target.projectId === null) {
+            transferStaleProjectDraftToProjectlessScope({
+              staleWorkspacePath: staleLocalProjectFallback.staleWorkspacePath,
+              staleProjectId: staleLocalProjectFallback.staleProjectId,
+              targetWorkspacePath: target.workspacePath,
+              clientNamespace: composerClientNamespace,
+            });
+          }
         }
         if (hostId && hostId !== "local") {
           if (!target.workspaceIdentity || !openRemoteProjectWorkspace)
@@ -640,12 +659,37 @@ export function useRootWorkspaceActions({
         if (!isCurrent()) return;
         // 项目模型迁移后，单独 addTab 不再赋予项目归属。桌面目录入口必须先由
         // Host 原子复用/创建项目，再初始化草稿，不能沿用该目录的旧草稿归属。
-        let projectId: string | undefined;
+        let projectId: string | null | undefined;
         if (isDesktop) {
           if (!services.projectService) throw new Error("project.service-unavailable");
           projectId = (
             await services.projectService.saveProject({ roots: [path], reuseExistingRoot: true })
           ).id;
+        } else {
+          const cachedProjectId = readComposerWorkspaceScope(
+            path,
+            undefined,
+            composerClientNamespace,
+          )?.projectId;
+          if (cachedProjectId && services.projectService) {
+            // 非桌面入口复验缓存项目：仅在确认已不存在或软删除时降回 null 并保留草稿，读取失败不误判。
+            const projects = await services.projectService.readProjects();
+            if (!isCurrent()) return;
+            if (
+              !projects.some(
+                (project) =>
+                  project.id === cachedProjectId && project.hostId === "local" && !project.deleted,
+              )
+            ) {
+              transferStaleProjectDraftToProjectlessScope({
+                staleWorkspacePath: path,
+                staleProjectId: cachedProjectId,
+                targetWorkspacePath: path,
+                clientNamespace: composerClientNamespace,
+              });
+              projectId = null;
+            }
+          }
         }
         if (!isCurrent()) return;
         // 桌面端：检查是否已有其他窗口打开了该目录，如果是则激活该窗口对应 tab
@@ -662,7 +706,7 @@ export function useRootWorkspaceActions({
         addTab(path);
         // 打开 workspace 是 workspace-only 意图，不是“继续上次会话”。
         // 即使命中已存在 tab，也必须清掉该 workspace 的 activeTaskId 并回到单 pane 草稿。
-        startDraftInWorkspace(path, undefined, projectId ? { projectId } : undefined);
+        startDraftInWorkspace(path, undefined, projectId !== undefined ? { projectId } : undefined);
         setWorkspaceActionError(null);
         logger.info("[Root] 已打开目录", { path, projectId });
       } catch (err) {
@@ -673,6 +717,7 @@ export function useRootWorkspaceActions({
     },
     [
       addTab,
+      composerClientNamespace,
       intl,
       onOpenRemoteConnection,
       platform,

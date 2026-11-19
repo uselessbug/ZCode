@@ -2151,19 +2151,17 @@ async function bootstrapWebApp() {
                   // 无 workspaceIdentity 时 store 必须走该 Host 的 mcpSyncService，
                   // 不得回退无桌面代理的 Web platform 空实现。
                   mcpBaseHostDirectoryService={services.mcpSyncService}
-                  initialWorkspaceAbsPath={
-                    coldLaunchWorkspace?.workspacePath ?? bootstrap.initialWorkspaceAbsPath
-                  }
-                  initialWorkspaceIdentity={
-                    coldLaunchWorkspace
-                      ? coldLaunchWorkspace.workspaceIdentity
-                      : bootstrap.initialWorkspaceIdentity
-                  }
-                  initialTaskId={coldLaunchWorkspace?.taskId ?? bootstrap.initialTaskId}
+                  // 浏览器草稿原本已存在本地；沿用原命名空间，升级后仍能找回正文和首发命令。
+                  // 页面导航独立保存，不再读写服务端 lastActiveWorkspace。
+                  standaloneWebNavigation
+                  standaloneWebDefaultWorkspacePath={bootstrap.initialWorkspaceAbsPath}
+                  initialWorkspaceAbsPath={coldLaunchWorkspace?.workspacePath}
+                  initialWorkspaceIdentity={coldLaunchWorkspace?.workspaceIdentity}
+                  initialTaskId={coldLaunchWorkspace?.taskId}
                   initialWebRemoteControlMobileNavigationIntent={
                     coldLaunchWorkspace ? "chat" : undefined
                   }
-                  restoreSession={bootstrap.restoreSession}
+                  restoreSession={false}
                   allowOpenWorkspace={bootstrap.allowOpenWorkspace}
                   preferDirectoryBrowser
                   // 修复原因：独立 Web 与桌面共享同一 Host 持久化的 Assistant row，Root 默认关闭

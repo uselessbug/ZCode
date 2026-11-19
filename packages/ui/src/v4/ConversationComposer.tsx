@@ -462,6 +462,8 @@ export interface ConversationComposerProps {
   modelSelectionRefresh?: () => Promise<ModelSelectionRefreshResult>;
   /** 草稿态使用预热 session 作附件 transaction 载体。 */
   attachmentSessionId?: string | null;
+  sessionPreparationError?: string | null;
+  onRetrySessionPreparation?: () => void;
   attachmentPut: AttachmentPutFn;
   onRuntimeRestart?: (listener: () => void) => () => void;
   /** 承载 transport 暴露 runtime 存活态时优先用它，替代 onRuntimeRestart。 */
@@ -601,6 +603,8 @@ function ConversationComposerImpl({
   modelSelectionReload,
   modelSelectionRefresh,
   attachmentSessionId = null,
+  sessionPreparationError = null,
+  onRetrySessionPreparation,
   attachmentPut,
   onRuntimeRestart,
   onRuntimeLifecycle,
@@ -832,6 +836,8 @@ function ConversationComposerImpl({
     remoteSessionId,
     scopeId: draftScopeId,
     attachmentSessionId,
+    sessionPreparationError,
+    onRetrySessionPreparation,
     attachmentPut,
     onRuntimeRestart,
     onRuntimeLifecycle,

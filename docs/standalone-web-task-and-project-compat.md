@@ -118,6 +118,18 @@ sequenceDiagram
 - `saveProject` 0 目录项目（对齐官方桌面生命周期）：开启 `allowStandaloneMultiRoot` 的独立 Web 允许 `0..n` 个目录，0 目录新建时保留 `roots: []`（不提前在磁盘建目录，未填名称时使用干净默认名 `New project` / `defaultName`），编辑传入 `roots: []` 允许清空为 0 目录；首次 `prepareSession({ projectId })` 时通过 `initializeProjectRoot` 在 `<root>/.zcode/workspace/<projectId>` 懒创建并登记唯一 root。未开启 `allowStandaloneMultiRoot` 的普通远端仍要求恰好 1 个不可变 root（`project.remote-single-root-required` / `project.remote-root-immutable`）。独立 Web 的多 root 能力与任务移动增补 root 见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
 - 前端：非项目草稿绑定稳定 `draftId`，切换时显式 `projectId: null` 并保留转移中的草稿（无项目草稿目录保持 `<root>/.zcode/conversations/draft-<draftId>`）；已绑定的草稿目录在磁盘上被移走或清理（`ENOENT`）时，`packages/services/src/project/index.ts` 对 `reuseDraft: true` 分支返回稳定业务错误码 `project.draft-workspace-missing`（不静默重建），`useRootWorkspaceActions.ts` 与 `useConversationWorkspaceActions.ts` 捕获该错误时须先确认当前导航未过时且无在途首发 `commandId`，再调用 `composerDraftStore.ts` 的 `rotateMissingPendingTaskDraft`（先校验 `current` 与 `commandId`，即使被其他入口换绑也先拦截在途命令），并以当前绑定状态 `reuseDraft: Boolean(rotatedDraft.workspacePath)` 幂等重试 `prepareSession`（不强制 `reuseDraft: false` 重建已被删除的目录），异步回包后核验导航与草稿所有权（`readPendingTaskDraft(scope)?.draftId === pendingDraft.draftId`）才写回绑定或导航；当无项目草稿菜单（`resolveConversationWorkspaceTarget`）位于当前受管 `pendingDraft` 路径时同样不绕过 `prepareSession`，真实历史非项目会话快捷路径继续保留；输入框正文草稿按 `ComposerScope` 保存并在换绑后完整保留；`ProjectEditor` 对真实远端仍限制为单 root（选择目录最多保留 1 个、既有项目 root 固定不可移除），独立 Web 对齐官方桌面删除 `standaloneAutoRootHint` 提示，允许增删多个 root、0 目录新建项目以及编辑已有项目移除最后一个目录回到 0 目录状态（首次 `prepareSession` 懒创建 `<root>/.zcode/workspace/<projectId>`）；`formatProjectError` 为三个错误码提供可读国际化文案，不向用户暴露原始错误码。
 
+### 补充项：页面导航隔离、草稿恢复与无项目附件发送
+
+- **独立 Web 页面导航隔离与恢复优先级**：
+  - 独立 Web 的页面导航状态按同源的本浏览器页面保留（不同浏览器或客户端之间不共享服务端全局 `lastActiveWorkspace`，并与桌面端及真实手机远控隔离）。
+  - 启动与恢复时，通知深链优先；无深链时优先恢复本浏览器页面仍有效的草稿或目标会话。
+  - 仅在确认原归属项目不存在或已删除时，才回退调用 `prepareSession` 复用未归类草稿目录，并保留草稿正文与用户已有选择（如模型、模式等）；网络抖动或临时连线失败不得误判为项目已删除或被静默吞掉。
+- **首发状态不明时只查不重发**：
+  - 首条消息发送过程中若遭遇断线或结果不明，恢复后仅按原命令标识查询投递/接纳状态，不自动重发首发消息，避免重复创建或重复投递。
+- **无项目草稿附件预热与发送门禁**：
+  - 无项目草稿在添加或粘贴附件时，需等待草稿工作区目录就绪（预热完成）后再落盘写入。
+  - 附件处于上传/准备中时发送入口等待；若附件进入终态失败，允许用户单独重试或移除该附件，且在存在缺失或失败附件时仍禁止发送。
+
 ### 补充项：任务菜单文件入口与项目设备名称
 
 - 独立 Web 侧栏任务菜单（列表视图与分组视图）将桌面本地文件管理器入口替换为复用官方 `openTaskFiles` 的「显示文件树」（定位任务 `cwd` 并打开右侧文件栏），顶栏任务菜单与手机远控隐藏该项。
@@ -140,3 +152,4 @@ sequenceDiagram
 7. 0 目录新建项目保存为 `roots: []`（磁盘未提前建目录、默认名干净），编辑传入 `roots: []` 可清空为 0 目录；首次 `prepareSession({ projectId })` 在 `<root>/.zcode/workspace/<projectId>` 懒创建并登记工作目录；未开启 `allowStandaloneMultiRoot` 时多于 1 目录抛 `project.remote-single-root-required`、改既有 root 抛 `project.remote-root-immutable`。独立 Web 多 root 与移动增补 root 的验收见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
 8. 未开启策略的普通远端 owner 仍抛 `project.remote-project-required` 与 `project.remote-single-root-required`；跨 Host 仍被拒绝。
 9. 既有独立 Web host alias 与连接恢复补丁仍生效；仅替换 ZCode 镜像，AGM、Access checker、Caddy 与其他服务不变。
+10. 独立 Web 不同浏览器互不覆盖当前活动工作区/草稿，通知深链优先于本地恢复；仅在确认项目不存在或已删除时回退 `prepareSession` 复用未归类草稿目录并保留正文与用户选择，连线失败不误吞；首发结果不明时只查原命令不重发；无项目草稿附件等待预热完成，终态失败可重试或移除，存在缺失/失败附件时禁止发送。

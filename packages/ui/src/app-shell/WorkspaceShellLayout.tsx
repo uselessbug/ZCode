@@ -1515,7 +1515,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
         return;
       }
       showChatMainView();
-      onCreateTask(request);
+      return onCreateTask(request);
     },
     [onCreateTask, showChatMainView, workspaceReadOnlyReason],
   );
@@ -2420,36 +2420,34 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       fileTreeOpenRequest={fileTreeOpenRequest}
       onCreateTask={
         mobile && !isWebRemoteControlShell
-          ? (request?: import("./types.js").CreateTaskRequest) => {
+          ? async (request?: import("./types.js").CreateTaskRequest) => {
               const nextRequest =
                 typeof request === "string" ? { provider: request } : { ...request };
               const prevOnComplete = nextRequest.onComplete;
-              handleCreateTaskInChat({
+              await handleCreateTaskInChat({
                 ...nextRequest,
                 onComplete: () => {
                   prevOnComplete?.();
                   mobile.navigateToChat();
                 },
               });
-              mobile.navigateToChat();
             }
           : handleCreateTaskInChat
       }
       onCreateConversationTask={
         mobile && !isWebRemoteControlShell
-          ? (request?: import("./types.js").CreateTaskRequest) => {
+          ? async (request?: import("./types.js").CreateTaskRequest) => {
               const handler = onCreateConversationTask ?? handleCreateTaskInChat;
               const nextRequest =
                 typeof request === "string" ? { provider: request } : { ...request };
               const prevOnComplete = nextRequest.onComplete;
-              handler({
+              await handler({
                 ...nextRequest,
                 onComplete: () => {
                   prevOnComplete?.();
                   mobile.navigateToChat();
                 },
               });
-              mobile.navigateToChat();
             }
           : (onCreateConversationTask ?? handleCreateTaskInChat)
       }

@@ -3,10 +3,24 @@ import { getConversationShareErrorDetails } from "@/lib/conversationShareError.j
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useZCodeSessionStore } from "@/store/zcodeSessionStore.js";
 import type { CreateTaskOptions } from "@/app-shell/types.js";
-import type { IPlatformService, ZCodeTaskClientMode } from "@zcode/shared";
+import {
+  remoteHostIdFromWorkspaceIdentity,
+  type IPlatformService,
+  type WorkspacePurpose,
+  type ZCodeTaskClientMode,
+} from "@zcode/shared";
 import type { IServiceAccessor } from "@zcode/services";
-import { readV4ComposerDraft, V4_DRAFT_SCOPE_ROOT } from "@/v4/composer/composerDraftStore.js";
-import { readComposerWorkspaceScope } from "@/v4/composer/composerDraftStore.js";
+import {
+  bindPendingTaskDraft,
+  ensurePendingTaskDraft,
+  readComposerWorkspaceScope,
+  readPendingTaskDraft,
+  readV4ComposerDraft,
+  resolveComposerScope,
+  rotateMissingPendingTaskDraft,
+  transferStaleProjectDraftToProjectlessScope,
+  V4_DRAFT_SCOPE_ROOT,
+} from "@/v4/composer/composerDraftStore.js";
 import { useComposerClientNamespace } from "@/hooks/useServices.js";
 import {
   isWorkspaceTab,
@@ -44,6 +58,91 @@ type NotificationTaskContext = { workspacePath?: string; workspaceIdentity?: str
 
 /** 冷启动时 workspace 列表可能还在加载，通知点击最多等待这么久再放弃。 */
 const NOTIFICATION_TASK_WAIT_MS = 12_000;
+
+const STANDALONE_PAGE_NAV_STORAGE_KEY = "zcode-standalone-page-navigation:v1";
+const STANDALONE_BROWSER_NAV_STORAGE_KEY = "zcode-standalone-browser-navigation:v1";
+
+export interface StandaloneWebNavigationSnapshot {
+  workspacePath: string;
+  workspaceIdentity?: string;
+  workspacePurpose?: WorkspacePurpose;
+  taskId: string | null;
+  projectId?: string | null;
+}
+
+function parseStandaloneWebNavigationSnapshot(
+  raw: string | null | undefined,
+): StandaloneWebNavigationSnapshot | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (typeof record.workspacePath !== "string" || !record.workspacePath.trim()) return null;
+    if (record.taskId !== null && typeof record.taskId !== "string") return null;
+    if (
+      record.projectId !== undefined &&
+      record.projectId !== null &&
+      typeof record.projectId !== "string"
+    ) {
+      return null;
+    }
+    if (record.workspaceIdentity !== undefined && typeof record.workspaceIdentity !== "string") {
+      return null;
+    }
+    if (
+      record.workspacePurpose !== undefined &&
+      record.workspacePurpose !== "project" &&
+      record.workspacePurpose !== "conversation"
+    ) {
+      return null;
+    }
+    return {
+      workspacePath: record.workspacePath,
+      ...(record.workspaceIdentity ? { workspaceIdentity: record.workspaceIdentity } : {}),
+      ...(record.workspacePurpose ? { workspacePurpose: record.workspacePurpose } : {}),
+      taskId: record.taskId,
+      ...(record.projectId !== undefined ? { projectId: record.projectId } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function readStandaloneWebNavigationSnapshot(): StandaloneWebNavigationSnapshot | null {
+  if (typeof window === "undefined") return null;
+  // 页面级 sessionStorage 优先（同浏览器多标签互不干扰且刷新保留）；新开标签回退本浏览器 localStorage，
+  // 全程不读写服务端全局 settings.lastActiveWorkspace。
+  for (const readStorage of [
+    () => window.sessionStorage?.getItem(STANDALONE_PAGE_NAV_STORAGE_KEY),
+    () => window.localStorage?.getItem(STANDALONE_BROWSER_NAV_STORAGE_KEY),
+  ]) {
+    try {
+      const parsed = parseStandaloneWebNavigationSnapshot(readStorage());
+      if (parsed) return parsed;
+    } catch {
+      // 隐私模式/禁用 storage 降级跳过
+    }
+  }
+  return null;
+}
+
+export function persistStandaloneWebNavigationSnapshot(
+  snapshot: StandaloneWebNavigationSnapshot,
+): void {
+  if (typeof window === "undefined") return;
+  const serialized = JSON.stringify(snapshot);
+  for (const writeStorage of [
+    () => window.sessionStorage?.setItem(STANDALONE_PAGE_NAV_STORAGE_KEY, serialized),
+    () => window.localStorage?.setItem(STANDALONE_BROWSER_NAV_STORAGE_KEY, serialized),
+  ]) {
+    try {
+      writeStorage();
+    } catch {
+      // 存储受限时保留内存导航
+    }
+  }
+}
 
 type NotificationNavigationDeps = {
   activateTabByPath: (workspacePath: string, options?: { workspaceIdentity?: string }) => boolean;
@@ -245,6 +344,8 @@ export function useRootPlatformEffects({
   initialWorkspacePurpose,
   initialTaskId,
   initialTaskDraft,
+  standaloneWebNavigation = false,
+  standaloneWebDefaultWorkspacePath,
   clientMode = "desktop-continuous",
   canBootstrapInitialWorkspace = true,
   addTab,
@@ -275,6 +376,8 @@ export function useRootPlatformEffects({
   initialWorkspacePurpose?: import("@zcode/shared").WorkspacePurpose;
   initialTaskId?: string;
   initialTaskDraft?: CreateTaskOptions;
+  standaloneWebNavigation?: boolean;
+  standaloneWebDefaultWorkspacePath?: string;
   clientMode?: ZCodeTaskClientMode;
   canBootstrapInitialWorkspace?: boolean;
   addTab: (
@@ -312,6 +415,13 @@ export function useRootPlatformEffects({
   isRestoringOAuthSession: boolean;
 }) {
   const didBootstrapInitialWorkspaceRef = useRef(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const baseServices = useOptionalBaseWorkspaceServices();
   const pendingShareImportRef = useRef<ShareImportIntent | null>(null);
   const [shareImportRevision, setShareImportRevision] = useState(0);
@@ -361,6 +471,307 @@ export function useRootPlatformEffects({
     }
 
     didBootstrapInitialWorkspaceRef.current = true;
+    const openStandaloneProjectlessDraft = async (stale?: {
+      staleWorkspacePath?: string;
+      staleWorkspaceIdentity?: string;
+      staleProjectId?: string;
+    }) => {
+      const projectService = baseServices?.projectService;
+      if (!projectService) throw new Error("project.service-unavailable");
+      const nullScope = resolveComposerScope(null, undefined, composerClientNamespace);
+      let draft = ensurePendingTaskDraft(nullScope);
+      let target: Awaited<ReturnType<typeof projectService.prepareSession>>;
+      try {
+        target = await projectService.prepareSession({
+          draftId: draft.draftId,
+          reuseDraft: Boolean(draft.workspacePath),
+        });
+      } catch (error) {
+        if (!mountedRef.current) return;
+        const message =
+          error && typeof error === "object" && "message" in error
+            ? String(error.message)
+            : String(error);
+        if (!draft.workspacePath || !message.includes("project.draft-workspace-missing")) {
+          throw error;
+        }
+        const rotated = rotateMissingPendingTaskDraft(nullScope, draft.draftId);
+        if (!rotated) {
+          // 在途首发 commandId 存在时不得换绑或重建空目录；保留原目录供 SessionPane 仅查询恢复。
+          if (draft.workspacePath) {
+            if (stale?.staleWorkspacePath && stale.staleProjectId) {
+              transferStaleProjectDraftToProjectlessScope({
+                staleWorkspacePath: stale.staleWorkspacePath,
+                workspaceIdentity: stale.staleWorkspaceIdentity,
+                staleProjectId: stale.staleProjectId,
+                targetWorkspacePath: draft.workspacePath,
+                clientNamespace: composerClientNamespace,
+              });
+            }
+            addTab(draft.workspacePath, { workspacePurpose: "conversation" });
+            startDraftInWorkspace(draft.workspacePath, undefined, {
+              projectId: null,
+              draftId: draft.draftId,
+              taskGroupId: null,
+            });
+            return;
+          }
+          throw error;
+        }
+        draft = rotated;
+        target = await projectService.prepareSession({
+          draftId: draft.draftId,
+          reuseDraft: Boolean(draft.workspacePath),
+        });
+      }
+      if (!mountedRef.current) return;
+      const currentDraft = readPendingTaskDraft(nullScope);
+      if (!currentDraft || currentDraft.draftId !== draft.draftId) return;
+      bindPendingTaskDraft(nullScope, draft.draftId, target.workspacePath);
+      if (stale?.staleWorkspacePath && stale.staleProjectId) {
+        transferStaleProjectDraftToProjectlessScope({
+          staleWorkspacePath: stale.staleWorkspacePath,
+          workspaceIdentity: stale.staleWorkspaceIdentity,
+          staleProjectId: stale.staleProjectId,
+          targetWorkspacePath: target.workspacePath,
+          clientNamespace: composerClientNamespace,
+        });
+      }
+      addTab(target.workspacePath, {
+        workspacePurpose: "conversation",
+        ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+      });
+      startDraftInWorkspace(target.workspacePath, target.workspaceIdentity, {
+        projectId: null,
+        draftId: draft.draftId,
+        taskGroupId: null,
+      });
+    };
+
+    const resolveValidatedLocalCachedProject = async (params: {
+      workspacePath: string;
+      workspaceIdentity?: string;
+      workspacePurpose?: WorkspacePurpose;
+      projectId: string;
+    }) => {
+      const projectService = baseServices?.projectService;
+      if (!projectService) throw new Error("project.service-unavailable");
+      let projects: Awaited<ReturnType<typeof projectService.readProjects>>;
+      try {
+        projects = await projectService.readProjects();
+      } catch (error) {
+        // 读取失败不得当成项目删除：保留原项目导航，暴露错误。
+        if (!mountedRef.current) return;
+        logger.warn("[Root] 冷恢复校验项目失败，保留原导航", {
+          projectId: params.projectId,
+          error,
+        });
+        setWorkspaceActionError(error instanceof Error ? error.message : String(error));
+        addTab(params.workspacePath, {
+          ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+          ...(params.workspacePurpose ? { workspacePurpose: params.workspacePurpose } : {}),
+        });
+        startDraftInWorkspace(params.workspacePath, params.workspaceIdentity, {
+          projectId: params.projectId,
+        });
+        return;
+      }
+      if (!mountedRef.current) return;
+      const validProject = projects.find(
+        (project) =>
+          project.id === params.projectId && project.hostId === "local" && !project.deleted,
+      );
+      if (validProject) {
+        if (standaloneWebNavigation) {
+          try {
+            const target = await projectService.prepareSession({ projectId: params.projectId });
+            if (!mountedRef.current) return;
+            addTab(target.workspacePath, {
+              workspacePurpose: "project",
+              ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+            });
+            startDraftInWorkspace(target.workspacePath, target.workspaceIdentity, {
+              projectId: target.projectId,
+            });
+            return;
+          } catch (prepareError) {
+            if (!mountedRef.current) return;
+            const prepareMessage =
+              prepareError && typeof prepareError === "object" && "message" in prepareError
+                ? String(prepareError.message)
+                : String(prepareError);
+            if (!prepareMessage.includes("project.not-found")) {
+              logger.warn("[Root] 冷恢复准备有效项目失败，保留原导航", {
+                projectId: params.projectId,
+                error: prepareError,
+              });
+              setWorkspaceActionError(prepareMessage);
+              addTab(params.workspacePath, {
+                workspacePurpose: params.workspacePurpose ?? "project",
+                ...(params.workspaceIdentity
+                  ? { workspaceIdentity: params.workspaceIdentity }
+                  : {}),
+              });
+              startDraftInWorkspace(params.workspacePath, params.workspaceIdentity, {
+                projectId: params.projectId,
+              });
+              return;
+            }
+          }
+        } else {
+          addTab(params.workspacePath, {
+            ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+            ...(params.workspacePurpose ? { workspacePurpose: params.workspacePurpose } : {}),
+          });
+          startDraftInWorkspace(params.workspacePath, params.workspaceIdentity, {
+            projectId: params.projectId,
+          });
+          return;
+        }
+      }
+      // 确认原项目不存在或已软删除：在保留草稿正文与配置意图的前提下路由到正常无项目草稿。
+      logger.info("[Root] 冷恢复确认项目已不存在或软删除，路由到无项目草稿", {
+        projectId: params.projectId,
+      });
+      await openStandaloneProjectlessDraft({
+        staleWorkspacePath: params.workspacePath,
+        staleWorkspaceIdentity: params.workspaceIdentity,
+        staleProjectId: params.projectId,
+      });
+    };
+
+    if (standaloneWebNavigation && !initialWorkspaceAbsPath) {
+      void (async () => {
+        let savedNav = readStandaloneWebNavigationSnapshot();
+        const nullScope = resolveComposerScope(null, undefined, composerClientNamespace);
+        const pendingDraft = readPendingTaskDraft(nullScope);
+        if (!savedNav && pendingDraft?.workspacePath) {
+          savedNav = {
+            workspacePath: pendingDraft.workspacePath,
+            workspacePurpose: "conversation",
+            taskId: null,
+            projectId: null,
+          };
+        }
+        if (savedNav?.taskId) {
+          const taskService = baseServices?.zcodeTaskService;
+          if (taskService) {
+            try {
+              const meta = await taskService.getTaskMeta({
+                workspacePath: savedNav.workspacePath,
+                ...(savedNav.workspaceIdentity
+                  ? { workspaceIdentity: savedNav.workspaceIdentity }
+                  : {}),
+                taskId: savedNav.taskId,
+              });
+              if (!mountedRef.current) return;
+              if (meta) {
+                const resolvedPath = meta.workspacePath || savedNav.workspacePath;
+                const resolvedIdentity = meta.workspaceIdentity ?? savedNav.workspaceIdentity;
+                addTab(resolvedPath, {
+                  ...(resolvedIdentity ? { workspaceIdentity: resolvedIdentity } : {}),
+                  ...(savedNav.workspacePurpose
+                    ? { workspacePurpose: savedNav.workspacePurpose }
+                    : {}),
+                });
+                useZCodeSessionStore
+                  .getState()
+                  .setActiveTaskId(resolvedPath, savedNav.taskId, resolvedIdentity);
+                return;
+              }
+              // 任务已不存在，降回同一工作区草稿检查。
+              savedNav = { ...savedNav, taskId: null };
+            } catch (error) {
+              // 读取失败不当成任务已删除，保留目标交由会话面板重连。
+              if (!mountedRef.current) return;
+              logger.warn("[Root] 冷恢复校验任务失败，保留原会话导航", {
+                taskId: savedNav.taskId,
+                error,
+              });
+              addTab(savedNav.workspacePath, {
+                ...(savedNav.workspaceIdentity
+                  ? { workspaceIdentity: savedNav.workspaceIdentity }
+                  : {}),
+                ...(savedNav.workspacePurpose
+                  ? { workspacePurpose: savedNav.workspacePurpose }
+                  : {}),
+              });
+              useZCodeSessionStore
+                .getState()
+                .setActiveTaskId(
+                  savedNav.workspacePath,
+                  savedNav.taskId,
+                  savedNav.workspaceIdentity,
+                );
+              return;
+            }
+          }
+        }
+        // 旧版没有页面导航快照，但草稿作用域仍在本浏览器。只在有显式项目意图时迁移，
+        // 不从服务器默认目录猜项目或直接在那里建会话。
+        if (!savedNav && standaloneWebDefaultWorkspacePath) {
+          const legacyScope = readComposerWorkspaceScope(
+            standaloneWebDefaultWorkspacePath,
+            undefined,
+            composerClientNamespace,
+          );
+          if (legacyScope?.projectId) {
+            savedNav = {
+              workspacePath: standaloneWebDefaultWorkspacePath,
+              taskId: null,
+              projectId: legacyScope.projectId,
+            };
+          }
+        }
+        const candidateProjectId =
+          savedNav?.projectId !== undefined
+            ? savedNav.projectId
+            : savedNav?.workspacePath
+              ? (readComposerWorkspaceScope(
+                  savedNav.workspacePath,
+                  savedNav.workspaceIdentity,
+                  composerClientNamespace,
+                )?.projectId ?? null)
+              : null;
+        if (candidateProjectId && savedNav?.workspacePath) {
+          const hostId = savedNav.workspaceIdentity
+            ? remoteHostIdFromWorkspaceIdentity(savedNav.workspaceIdentity)
+            : null;
+          if (hostId && hostId !== "local") {
+            addTab(savedNav.workspacePath, {
+              workspaceIdentity: savedNav.workspaceIdentity,
+              ...(savedNav.workspacePurpose ? { workspacePurpose: savedNav.workspacePurpose } : {}),
+            });
+            startDraftInWorkspace(savedNav.workspacePath, savedNav.workspaceIdentity, {
+              projectId: candidateProjectId,
+            });
+            return;
+          }
+          await resolveValidatedLocalCachedProject({
+            workspacePath: savedNav.workspacePath,
+            workspaceIdentity: savedNav.workspaceIdentity,
+            workspacePurpose: savedNav.workspacePurpose,
+            projectId: candidateProjectId,
+          });
+          return;
+        }
+        await openStandaloneProjectlessDraft();
+      })()
+        .catch((error) => {
+          if (!mountedRef.current) return;
+          logger.error("[Root] 独立 Web 冷恢复失败", error);
+          setWorkspaceActionError(
+            error && typeof error === "object" && "message" in error
+              ? String(error.message)
+              : String(error),
+          );
+        })
+        .finally(() => {
+          if (mountedRef.current) settleInitialBootstrap();
+        });
+      return;
+    }
+
     if (
       isDesktop &&
       initialWorkspaceAbsPath &&
@@ -384,6 +795,33 @@ export function useRootPlatformEffects({
         initialWorkspaceIdentity,
         composerClientNamespace,
       );
+      if (
+        standaloneWebNavigation &&
+        !initialTaskId &&
+        !initialTaskDraft &&
+        !initialWorkspaceIdentity &&
+        savedScope?.projectId
+      ) {
+        void resolveValidatedLocalCachedProject({
+          workspacePath: initialWorkspaceAbsPath,
+          workspaceIdentity: initialWorkspaceIdentity,
+          workspacePurpose: initialWorkspacePurpose,
+          projectId: savedScope.projectId,
+        })
+          .catch((error) => {
+            if (!mountedRef.current) return;
+            logger.error("[Root] 初始工作区项目校验失败", error);
+            setWorkspaceActionError(
+              error && typeof error === "object" && "message" in error
+                ? String(error.message)
+                : String(error),
+            );
+          })
+          .finally(() => {
+            if (mountedRef.current) settleInitialBootstrap();
+          });
+        return;
+      }
       // 手机重建 Root 时 bridge 只有地址；项目意图随已有浏览器草稿恢复，先于 prewarm。
       const savedDraft =
         clientMode === "web-remote-replayable" && !initialTaskId && !initialTaskDraft
@@ -439,6 +877,7 @@ export function useRootPlatformEffects({
     settleInitialBootstrap();
   }, [
     addTab,
+    baseServices,
     openWorkspacePath,
     isDesktop,
     canBootstrapInitialWorkspace,
@@ -451,6 +890,9 @@ export function useRootPlatformEffects({
     initialWorkspacePurpose,
     platform,
     settleInitialBootstrap,
+    setWorkspaceActionError,
+    standaloneWebDefaultWorkspacePath,
+    standaloneWebNavigation,
     startDraftInWorkspace,
     tabStoreApi,
   ]);

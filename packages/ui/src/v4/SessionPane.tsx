@@ -3372,7 +3372,12 @@ export function SessionPane({
   // ── 草稿态 v4 draft session 预热（m5）──
   // pane 未绑定会话时后台建 phase=draft 会话作预热载体：配置写 CAS 直达、首发复用。
   // 对外绑定语义不变（shell activeTaskId 仍 null），预热会话只是 pane 内部 effective 订阅目标。
-  const { binding: prewarmBinding, waitForSession: waitForDraftSession } = useDraftSessionPrewarm({
+  const {
+    binding: prewarmBinding,
+    error: prewarmError,
+    retry: retryDraftPrewarm,
+    waitForSession: waitForDraftSession,
+  } = useDraftSessionPrewarm({
     // worktree 草稿不预热：会话要等 worktree 建好后由 Host 创建，cwd 一次确定（§3.2）。
     enabled:
       sessionId === null && draftAgentStartupAllowed && !recoveringDraft && !draftWorktreeEnabled,
@@ -3660,14 +3665,14 @@ export function SessionPane({
     void lease.store.refreshPlans();
   }, [lease, sessionId, snapshot?.sessionId, state.planDirectoryRevision]);
 
-  // 预热会话订阅失败（CLI 重启内存会话消失等）→ 丢弃旧 binding，下一次发送由 owner 重试。
+  // 预热会话订阅失败（CLI 重启内存会话消失等）→ 丢弃旧 binding，暴露失败出口供用户显式重试。
   useEffect(() => {
     if (sessionId === null && prewarmBinding && state.status === "error") {
       logger.warn("[v4-draft-prewarm] 预热会话订阅失败，丢弃旧 binding", {
         prewarmSessionId: prewarmBinding.sessionId,
         lastError: state.lastError ?? null,
       });
-      prewarmBinding.discard();
+      prewarmBinding.discard(state.lastError ?? undefined);
     }
   }, [prewarmBinding, sessionId, state.lastError, state.status]);
 
@@ -5780,15 +5785,38 @@ export function SessionPane({
     usageStatsService: baseWorkspaceServices.usageStatsService,
     mcpUnavailableNotice,
   });
+  const [dismissedPrewarmError, setDismissedPrewarmError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!prewarmError) setDismissedPrewarmError(null);
+  }, [prewarmError]);
+  const handleRetryDraftPrewarm = useCallback(() => {
+    setDismissedPrewarmError(null);
+    retryDraftPrewarm();
+  }, [retryDraftPrewarm]);
   // Bug 根因：当前显示哪条错误与「关闭」归谁曾在两处分别判断——渲染按「未关闭」状态取横幅，关闭处理却按
   // 原始状态分支；用户关掉模型失效横幅后，后续投影错误横幅的关闭按钮会一直落到已关闭的那条上而失效。
   // 这里把显示与关闭动作在同一处派生，两者不可能再分叉。
-  const composerBanner = useMemo<{ error: ZCodeUiError; dismiss: () => void } | null>(() => {
+  const composerBanner = useMemo<{
+    error: ZCodeUiError;
+    dismiss: () => void;
+    retryPrewarm?: boolean;
+  } | null>(() => {
     if (draftModelReadinessError) {
       return { error: draftModelReadinessError, dismiss: dismissDraftModelReadinessError };
     }
     if (sendSubmissionError) {
       return { error: sendSubmissionError, dismiss: () => setSendSubmissionError(null) };
+    }
+    if (sessionId === null && prewarmError && dismissedPrewarmError !== prewarmError) {
+      return {
+        error: {
+          code: getRemoteConnectionFailureCode(prewarmError) ?? "DRAFT_PREWARM_FAILED",
+          message: intl.formatMessage({ id: "chat.initialization.failed" }),
+          detail: prewarmError,
+        },
+        dismiss: () => setDismissedPrewarmError(prewarmError),
+        retryPrewarm: true,
+      };
     }
     // 会话模型已失效是当前最可操作的事实（解释了发送为何被禁用），先于历史投影错误显示。
     if (sessionModelUnavailable && sessionModelUnavailable.key !== dismissedModelUnavailableKey) {
@@ -5817,13 +5845,18 @@ export function SessionPane({
     controlLastErrorKey,
     dismissDraftModelReadinessError,
     dismissedModelUnavailableKey,
+    dismissedPrewarmError,
     draftModelReadinessError,
+    intl,
+    prewarmError,
     projectedComposerError,
     quotaBanner.takesOverError,
     sendSubmissionError,
+    sessionId,
     sessionModelUnavailable,
   ]);
   const composerError = composerBanner?.error ?? null;
+  const retryPrewarmBannerEnabled = Boolean(composerBanner?.retryPrewarm);
   const retryConfigReadRow = snapshot?.rows.window.findLast(
     (row) => row.kind === "userInput" && row.origin === "realUser",
   );
@@ -6329,7 +6362,7 @@ export function SessionPane({
       autoFocusEnabled={focused}
       disabled={
         connecting ||
-        draftRuntimeRebuilding ||
+        (draftRuntimeRebuilding && !prewarmError) ||
         composerEdit.pendingLockQueueItemId !== null ||
         quotaBanner.state.blocksSubmit
       }
@@ -6342,6 +6375,8 @@ export function SessionPane({
       modelSelectionReload={modelSelectionRead.reload}
       modelSelectionRefresh={modelSelectionRead.refresh}
       attachmentSessionId={effectiveSessionId}
+      sessionPreparationError={sessionId === null ? prewarmError : null}
+      onRetrySessionPreparation={sessionId === null ? handleRetryDraftPrewarm : undefined}
       attachmentPut={attachmentPut}
       onRuntimeRestart={onRuntimeRestart}
       onRuntimeLifecycle={onRuntimeLifecycle}
@@ -6389,7 +6424,13 @@ export function SessionPane({
       error={composerError}
       onDismissError={handleDismissComposerError}
       onRetryInitialization={handleRetrySubscribe}
-      onRetryError={retryConfigReadEnabled ? handleRetryConfigRead : undefined}
+      onRetryError={
+        retryConfigReadEnabled
+          ? handleRetryConfigRead
+          : retryPrewarmBannerEnabled
+            ? handleRetryDraftPrewarm
+            : undefined
+      }
       onOpenModelSettings={handleOpenModelSettings}
       onOpenModelUpgrade={handleOpenModelUpgrade}
       modelConfigTarget={modelConfigTarget}

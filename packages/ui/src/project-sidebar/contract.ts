@@ -117,8 +117,8 @@ export interface ProjectSidebarProps {
   onStartDraftInWorkspace: (targetWorkspacePath: string, targetWorkspaceIdentity?: string) => void;
   onOpenBrowserUrl?: (url: string) => void;
   fileTreeOpenRequest?: SidebarFileTreeOpenRequest | null;
-  onCreateTask: (request?: CreateTaskRequest) => void;
-  onCreateConversationTask: () => void;
+  onCreateTask: (request?: CreateTaskRequest) => void | Promise<void>;
+  onCreateConversationTask: (request?: CreateTaskRequest) => void | Promise<void>;
   onCreateConversationTaskOnSource?: (sourceServerId: string) => void;
   onOpenFolderFromWorkspaceMenu: () => void;
   onOpenRemoteWorkspace?: AppProps["onOpenRemoteWorkspace"];

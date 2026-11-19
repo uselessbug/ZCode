@@ -121,6 +121,8 @@ export interface UseComposerAttachmentsOptions {
   remoteSessionId?: string;
   scopeId: string;
   attachmentSessionId?: string | null;
+  sessionPreparationError?: string | null;
+  onRetrySessionPreparation?: () => void;
   attachmentPut: AttachmentPutFn;
   onRuntimeRestart?: (listener: () => void) => () => void;
   /**
@@ -240,6 +242,8 @@ export function useComposerAttachments(
     remoteSessionId,
     scopeId,
     attachmentSessionId = null,
+    sessionPreparationError = null,
+    onRetrySessionPreparation,
     attachmentPut,
     onRuntimeRestart,
     onRuntimeLifecycle,
@@ -528,12 +532,30 @@ export function useComposerAttachments(
       !isRemoteAttachmentTarget({ remoteSessionId, workspaceIdentity }) || Boolean(remoteSessionId);
     if (attachmentSessionId && remoteTargetReady) {
       for (const item of current) {
-        if (item.uploadStatus === "waitingSession") {
+        if (
+          item.uploadStatus === "waitingSession" ||
+          (item.uploadStatus === "failed" && item.uploadErrorKind === "sessionPreparation")
+        ) {
           updateItem(scopeKey, item.id, (candidate) => ({
             ...candidate,
             uploadStatus: "queued",
+            uploadError: undefined,
+            uploadErrorKind: undefined,
           }));
           enqueueUpload(scopeKey, item.id);
+        }
+      }
+      return;
+    }
+    if (!attachmentSessionId && sessionPreparationError) {
+      for (const item of current) {
+        if (item.uploadStatus === "waitingSession") {
+          updateItem(scopeKey, item.id, (candidate) => ({
+            ...candidate,
+            uploadStatus: "failed",
+            uploadError: sessionPreparationError,
+            uploadErrorKind: "sessionPreparation",
+          }));
         }
       }
     }
@@ -543,6 +565,7 @@ export function useComposerAttachments(
     remoteSessionId,
     restartEpoch,
     scopeKey,
+    sessionPreparationError,
     updateItem,
     workspaceIdentity,
   ]);
@@ -661,6 +684,7 @@ export function useComposerAttachments(
       const accepted = selectedAttachments.slice(0, remainingSlots);
       selectedAttachments.slice(remainingSlots).forEach(revokeChatComposerAttachment);
       const target = targetsRef.current.get(scopeKey);
+      const immediateSessionFailure = !target?.sessionId ? sessionPreparationError : null;
       const items: ComposerAttachmentUploadItem[] = accepted.map((attachment) => {
         // 远端 identity 往往早于 remoteSessionId 注入；这段窗口不能退化为本地路径直读。
         const localZeroCopy = Boolean(
@@ -670,8 +694,20 @@ export function useComposerAttachments(
           ...attachment,
           referenceOwnership: "composer",
           operationId: `prompt-attachment-${attachment.id}`,
-          uploadStatus: localZeroCopy ? "ready" : target?.sessionId ? "queued" : "waitingSession",
+          uploadStatus: localZeroCopy
+            ? "ready"
+            : target?.sessionId
+              ? "queued"
+              : immediateSessionFailure
+                ? "failed"
+                : "waitingSession",
           uploadProgress: localZeroCopy ? 100 : 0,
+          ...(immediateSessionFailure && !localZeroCopy
+            ? {
+                uploadError: immediateSessionFailure,
+                uploadErrorKind: "sessionPreparation" as const,
+              }
+            : {}),
           ...(localZeroCopy && attachment.localPath
             ? {
                 attachmentRef: {
@@ -698,7 +734,7 @@ export function useComposerAttachments(
       }
       return items.map((item) => item.id);
     },
-    [commitScope, enqueueUpload, scopeKey, showAttachmentLimitWarning],
+    [commitScope, enqueueUpload, scopeKey, sessionPreparationError, showAttachmentLimitWarning],
   );
 
   const addAttachmentFiles = useCallback(
@@ -981,8 +1017,9 @@ export function useComposerAttachments(
         showComplete: false,
       }));
       if (target?.sessionId) enqueueUpload(scopeKey, id);
+      else onRetrySessionPreparation?.();
     },
-    [enqueueUpload, scopeKey, updateItem],
+    [enqueueUpload, onRetrySessionPreparation, scopeKey, updateItem],
   );
 
   const clearAttachments = useCallback(
