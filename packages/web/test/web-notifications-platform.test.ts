@@ -1710,16 +1710,50 @@ describe("push service worker script", () => {
     assert.equal(messages.length, 1);
   });
 
-  it("opens the deep link without navigating a hidden client when focus() resolves non-foreground", async () => {
+  it("reuses a background desktop Firefox tab when focus() resolves with a stale hidden snapshot", async () => {
     const messages: unknown[] = [];
-    const { calls, dispatch } = await loadWorker([
-      makeWindowClient("https://zcode.example/", {
-        visibilityState: "hidden",
-        onMessage: (message) => messages.push(message),
-        focusResult: { focused: false, visibilityState: "hidden" },
-        pageState: SHOWING_T1,
-      }),
+    const { calls, dispatch } = await loadWorker(
+      [
+        makeWindowClient("https://zcode.example/", {
+          id: "origin-tab",
+          visibilityState: "hidden",
+          focused: false,
+          onMessage: (message) => messages.push(message),
+          focusResult: { focused: false, visibilityState: "hidden" },
+          pageState: SHOWING_T1,
+        }),
+      ],
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:161.0) Gecko/20100101 Firefox/161.0",
+    );
+    await dispatch("notificationclick", {
+      notification: {
+        close: () => {},
+        data: { taskId: "t1", workspacePath: "/repo", originClientId: "origin-tab" },
+      },
+    });
+    assert.deepEqual(plain(messages), [
+      {
+        type: "zcode:notification-click",
+        taskId: "t1",
+        workspacePath: "/repo",
+      },
     ]);
+    assert.deepEqual(calls.opened, []);
+  });
+
+  it("opens the deep link without navigating a hidden client on Android when focus() resolves non-foreground", async () => {
+    const messages: unknown[] = [];
+    const { calls, dispatch } = await loadWorker(
+      [
+        makeWindowClient("https://zcode.example/", {
+          visibilityState: "hidden",
+          onMessage: (message) => messages.push(message),
+          focusResult: { focused: false, visibilityState: "hidden" },
+          pageState: SHOWING_T1,
+        }),
+      ],
+      "Mozilla/5.0 (Android 17; Mobile; rv:163.0) Gecko/163.0 Firefox/163.0",
+    );
     await dispatch("notificationclick", {
       notification: { close: () => {}, data: { taskId: "t1", workspacePath: "/repo" } },
     });

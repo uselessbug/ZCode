@@ -183,6 +183,11 @@ function isNonAppleWebKit() {
   return !/safari/i.test(userAgent) || /chrome|chromium|edg|android/i.test(userAgent);
 }
 
+/** 是否为 Android 浏览器；Android 后台或非当前标签页上 focus() 可能 resolve 不可见客户端且不实际切页。 */
+function isAndroidBrowser() {
+  return /android/i.test(self.navigator?.userAgent || "");
+}
+
 function readStringList(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === "string" && item) : [];
 }
@@ -503,9 +508,20 @@ function buildTargetUrl({ taskId, workspacePath, workspaceIdentity }) {
   return url.href;
 }
 
-/** focus() 成功且页面确实在前台才算拉起；Android 浏览器在后台或其他标签页时可能 resolve 一个仍不可见的 client。 */
-function isForegroundClient(client) {
-  return Boolean(client) && (client.focused === true || client.visibilityState === "visible");
+/**
+ * 判定 client.focus() 是否已生效：
+ * 修复原因（2026-11-21）：桌面端多进程 Firefox 对后台标签调用 client.focus() 时，内容进程经 async RequestFocus
+ * 异步通知父进程切标签（Tabbrowser.on_framefocusrequested），但 ClientSource::Focus 在发完 IPC 后立刻同步快照旧文档状态，
+ * 返回 focused: false / visibilityState: "hidden"；原逻辑统一按前台态拦截导致误判失败并调 openWindow 多开新页。
+ * 修复依据：非 Android 端只要 focus() 正常 resolve 出有效客户端即视为浏览器已接受切页，直接投递导航消息；
+ * 仅在 Android 端保留 focused/visible 校验，继续兜底 Android 浏览器 resolve 隐藏客户端却不切页的场景。
+ */
+function didFocusClient(client) {
+  if (!client) return false;
+  if (isAndroidBrowser()) {
+    return client.focused === true || client.visibilityState === "visible";
+  }
+  return true;
 }
 
 /** 多个候选里优先聚焦的，其次可见的，最后取第一个。 */
@@ -577,11 +593,11 @@ async function openOrFocusTarget(data) {
   } catch {
     // 部分浏览器在无用户手势或后台时拒绝 focus，下面先尝试打开新窗口，仅在无法打开时才回退发消息给已选客户端。
   }
-  if (isForegroundClient(focusedClient)) {
+  if (didFocusClient(focusedClient)) {
     focusedClient.postMessage(message);
     return;
   }
-  // focus() 失败或客户端仍不可见时先尝试 openWindow 打开新窗口；
+  // focus() 失败、返回空值，或 Android 端仍不可见时先尝试 openWindow 打开新窗口；
   // 只有 openWindow 被拒绝（如 Chromium 已消耗交互令牌）才回退让原目标客户端导航，避免新窗口打开同时误导航隐藏旧窗口。
   try {
     const opened = await self.clients.openWindow(targetUrl);
