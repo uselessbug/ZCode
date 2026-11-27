@@ -99,7 +99,8 @@ export function PluginStorePage({
   const platform = usePlatform();
   const { intl, locale } = useZCodeIntl();
   const { order: storeOrder, refresh: refreshStoreOrder } = usePluginStoreOrder();
-  const { pluginManagementService, skillsService } = useServices();
+  const services = useServices();
+  const { pluginManagementService, skillsService } = services;
   const usePluginManagementStore = useScopedPluginManagementStore(pluginManagementService);
   // 市场卡片读写 User 层；当前项目覆盖禁用导致打不开时，引导到插件管理的当前项目视图处理覆盖。
   const pluginUi = useMarketPluginUi({
@@ -901,6 +902,7 @@ export function PluginStorePage({
         onAddMarketplace={handleAddMarketplace}
         activeOperations={activeOperations}
         error={addMarketplaceError}
+        services={services}
       />
     </div>
   );

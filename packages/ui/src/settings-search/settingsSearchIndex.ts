@@ -8,6 +8,8 @@ export interface SettingsSearchAvailability {
   notWindows: boolean;
   workflow: boolean;
   computerUse: boolean;
+  /** 独立 Web 工作台且服务端启用后台推送时为 true；未提供时该搜索项隐藏。 */
+  webPush?: boolean;
 }
 
 // 翻译 key 同时作为稳定定位 id；索引只描述入口，不持有任何配置值。
@@ -101,6 +103,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     section: "general",
     description: "settings.notificationSoundDescription",
     visibility: "all",
+  },
+  {
+    id: "settings.webPush",
+    section: "general",
+    description: "settings.webPushDescription",
+    visibility: "webPush",
   },
   {
     id: "settings.mobilePush",

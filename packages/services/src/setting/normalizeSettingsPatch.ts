@@ -98,5 +98,12 @@ export function normalizeSettingsPatch(patch: Partial<AppSettings>): Partial<App
     normalizedPatch.dynamicWorkflowMode = undefined;
   }
 
+  if ("replyLanguage" in normalizedPatch && typeof normalizedPatch.replyLanguage === "string") {
+    // 空串表示「清除回复语言、回到跟随对话语言」：RPC 会吞掉 undefined，这里把空串归一成删除。
+    const trimmedReplyLanguage = normalizedPatch.replyLanguage.trim();
+    normalizedPatch.replyLanguage =
+      trimmedReplyLanguage.length > 0 ? trimmedReplyLanguage : undefined;
+  }
+
   return normalizedPatch;
 }

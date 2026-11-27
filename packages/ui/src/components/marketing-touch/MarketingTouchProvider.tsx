@@ -92,7 +92,10 @@ export function MarketingTouchProvider({
     // 冷启动竞态修复：IntlProvider 读完 setting.json 之前 locale 只是占位初值（中文系统即 zh-CN），
     // 以前这时就创建 runtime 发 marketing/touch，X-Client-Language 会带错语言。等语言确定后再启动；
     // locale 变化本来就会重建 runtime，所以这里只多等一次设置读取。
-    if (!service || restoring || !localeResolved) return null;
+    // 修复原因：独立 Web / 手机网页没有桌面营销宿主，仍创建 runtime 会启动 poller、
+    // 挂载 body MutationObserver 并反复发 marketing-touch.query。
+    // 修复依据：营销只服务桌面入口（Root 声明 isDesktop），非桌面直接返回 null，消费方走既有空态。
+    if (!desktop || !service || restoring || !localeResolved) return null;
     let poller: ReturnType<typeof createMarketingTouchPoller>;
     const controller = createMarketingTouchController({
       query: () => service.query({ locale }),
@@ -108,10 +111,12 @@ export function MarketingTouchProvider({
             : delivery.popup.hero;
         // 投放内容只有中英两套；非中文界面语言用英文渲染。请求头仍用真实 locale。
         const contentLocale = toZhOrEnLocale(locale);
-        const success = prepareMarketingHero(visual, assets, contentLocale, desktop);
+        // 非桌面入口已在 createRuntime 入口返回 null，这里恒为桌面；
+        // 仍显式传 true 以保持上游 prepareMarketingHero 签名不变，避免与上游合并冲突。
+        const success = prepareMarketingHero(visual, assets, contentLocale, true);
         const background =
           delivery.resource_position === "banner"
-            ? prepareMarketingHero(delivery.banner.background, assets, contentLocale, desktop)
+            ? prepareMarketingHero(delivery.banner.background, assets, contentLocale, true)
             : undefined;
         let released = false;
         const release = async () => {

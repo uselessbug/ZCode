@@ -107,6 +107,8 @@ function GroupedTaskRowComponent({
   // 无效 action；本地 task 不需要 remoteSessionId，仍保持入口可用。
   const canOpenFileTree =
     Boolean(onOpenFileTree) && (!task.workspaceIdentity?.trim() || Boolean(remoteSessionId));
+  // 手机远控不提供本机文件入口；菜单「显示文件树」沿用与 hover 按钮相同的远端 session 门禁。
+  const canOpenMenuTaskFiles = canOpenFileTree && !presentation.isWebRemoteControl;
   const taskAttentionLabel = taskAttention
     ? intl.formatMessage({
         id: taskAttention.kind === "userInput" ? "taskList.userInputTag" : "taskList.permissionTag",
@@ -249,6 +251,7 @@ function GroupedTaskRowComponent({
     taskNativeSessionLogFile,
     providerConfigFile,
     fileManagerLabel,
+    canOpenLocalFiles,
     handleCopyText,
     handleOpenTaskPathInFileManager,
     handleOpenProviderConfig,
@@ -291,6 +294,12 @@ function GroupedTaskRowComponent({
   const handleOpenFileTree = (event: MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     event.stopPropagation();
+    if (workspaceActionsDisabled) {
+      return;
+    }
+    onOpenFileTree?.(task);
+  };
+  const handleOpenTaskFilesFromMenu = () => {
     if (workspaceActionsDisabled) {
       return;
     }
@@ -519,6 +528,8 @@ function GroupedTaskRowComponent({
           onArchiveTask={onArchiveTask}
           onMarkTaskAsUnread={onMarkTaskAsUnread}
           onOpenTaskPathInFileManager={() => void handleOpenTaskPathInFileManager()}
+          canOpenLocalFiles={canOpenLocalFiles}
+          onOpenTaskFiles={canOpenMenuTaskFiles ? handleOpenTaskFilesFromMenu : undefined}
           onCopyText={(label, text) => void handleCopyText(label, text)}
           onOpenProviderConfig={() => void handleOpenProviderConfig()}
           onOpenTaskFeedback={() => void handleOpenTaskFeedback()}

@@ -111,7 +111,7 @@ export async function purgeSessionDataWith(
       await host.store.purgeSessions([root as SessionId]);
       // 文件与行都删除后才从列表投影移除；失败时 sessions-index 与 Host 镜像保持原样。
       for (const id of ids) host.forgetIndexed(id);
-      result.deleted.push({ sessionId: root, bytes });
+      result.deleted.push({ sessionId: root, bytes, sessionIds: ids });
     } catch (error) {
       result.failed.push({ sessionId: root, code: failureCode(error) });
     }

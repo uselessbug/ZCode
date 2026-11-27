@@ -24,7 +24,9 @@ App 控制创建与普通创建共用 `reserveCreatedTask` 的创建回执：会
 
 自动归档以 cli_updated_at 为筛选依据，排除置顶和已有非终态订阅，不按 project_id 或默认目录过滤。新归档与绑定定时任务的暂停使用同一 SQLite 事务；按完整 workspace_key / target_task_id 匹配，只暂停 active 且 enabled 的任务。历史归档不追溯处理，取消归档不恢复调度，已认领轮次沿用现有执行规则。
 
-定时/闲时派发提供已保存的附加目录快照（含空数组），预留只验证同 Host 的既有项目，允许 roots 已编辑或项目已软删除；普通创建仍校验 cwd 属于当前未删除项目。快照不改写项目 roots，重复预留不覆盖已有归属。
+定时/闲时派发提供已保存的附加目录快照（含空数组），预留只验证同 Host 的既有项目，允许 roots 已编辑或项目已软删除；普通创建仍校验 cwd 属于当前未删除项目。独立 Web 下仅进程内不可序列化的可信冻结快照标记（`TRUSTED_FROZEN_EXECUTION_SNAPSHOT`）可跳过当前 `project.roots` 包含性校验并直接固化写入 `execution_directories`，普通外部 RPC 调用不得携带且仍受当前 `roots` 与未删除项目约束。
+
+独立 Web 开启 `allowStandaloneMultiRoot` 时允许项目拥有 `0..n` 个 roots（普通远端维持 `roots.length === 1` 与 `remote-root-immutable`）；存在合法 `worktreePlacement`（`cwd` 在 `worktreeRoot` 内、`task.workspaceIdentity` 为空、项目归属当前 `ownerHostId`）且开启 `allowStandaloneMultiRoot` / `allowStandaloneCloudWorkspaces` 时，校验 `task.workspacePath` 属于项目 roots 并放行位于 `worktreeRoot` 内的 `cwd` 与映射后的 `additionalDirectories`。
 
 带显式附加目录的新建将执行快照同事务写入 tasks.execution_directories，后续任何恢复从此不可变值读取；普通 session 为 NULL，继续读取项目当前 roots。重试不得覆盖快照，定义删除不改变生成会话的初始化配置。
 

@@ -32,6 +32,7 @@ import type {
   WebRemoteControlRendererActionResult,
 } from "#src/web-remote-relay/index.js";
 import type { AppSettings, Locale } from "./protocol.js";
+import type { WebNotificationStateSnapshot } from "./web-push/index.js";
 import type {
   ExtensionNotificationClick,
   ExtensionNotificationPayload,
@@ -81,6 +82,10 @@ export interface TaskNotificationPayload {
   taskId: string;
   status: "completed" | "failed" | "permission_request" | "elicitation_request" | "feedback_update";
   requestId?: string;
+  /** 同一事实的稳定事件键（@zcode/shared/web-push 的 build*EventKey）；Web 端据此与 Web Push 合并，桌面端忽略。 */
+  eventKey?: string;
+  workspacePath?: string;
+  workspaceIdentity?: string;
   title: string;
   body: string;
 }
@@ -1059,6 +1064,23 @@ export interface IPlatformService {
   /** 触发任务状态对应的系统通知，由宿主环境决定是否真正展示 */
   showTaskNotification(payload: TaskNotificationPayload): void;
 
+  /** Web 端读取当前浏览器通知权限与 Web Push 订阅状态；桌面端不实现 */
+  getWebNotificationState?(): Promise<WebNotificationStateSnapshot>;
+
+  /** Web 端监听浏览器通知权限或 Web Push 订阅状态变化，返回 disposer；桌面端不实现 */
+  onWebNotificationStateChanged?(
+    handler: (state: WebNotificationStateSnapshot) => void,
+  ): () => void;
+
+  /** Web 端在用户交互手势中申请浏览器通知权限；桌面端不实现 */
+  requestWebNotificationPermission?(): Promise<WebNotificationStateSnapshot>;
+
+  /** Web 端切换当前浏览器设备的 Web Push 离线推送订阅；桌面端不实现 */
+  setWebPushSubscribed?(
+    subscribed: boolean,
+    options?: { locale?: Locale; soundEnabled?: boolean },
+  ): Promise<WebNotificationStateSnapshot>;
+
   /**
    * 扩展的系统通知（docs/plugins/extension-host.md §18.1 H8）：Main 判断窗口焦点与平台支持后弹出，
    * 返回是否弹出与原因。Web 与手机远控不实现。
@@ -1257,7 +1279,12 @@ export interface IPlatformService {
   onDesktopZoomLevelChanged?(handler: (state: DesktopZoomState) => void): () => void;
 
   /** 注册用户点击系统通知后跳转到对应任务的回调，返回 disposer */
-  onTaskNotificationClick(handler: (taskId: string) => void): () => void;
+  onTaskNotificationClick(
+    handler: (
+      taskId: string,
+      context?: { workspacePath?: string; workspaceIdentity?: string },
+    ) => void,
+  ): () => void;
 
   /** 显式 App 导航能力：只在桌面导航 owner 挂载时注册，返回真实导航提交结果。 */
   onAppControlNavigation?(handler: AppNavigationHandler): () => void;

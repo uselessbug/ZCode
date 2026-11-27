@@ -47,9 +47,24 @@ import { getDataBaseDir } from "#src/paths.js";
 import { createGitWorktreeRepo } from "#src/git/managed-worktree/index.js";
 import { createGitCommandProvider } from "#src/git/providers/gitCommandProvider.js";
 import { HOST_WORKTREE_COMMAND } from "#src/zcode-agent/zcodeAgent.js";
-import { createTaskGroupService, ITaskGroupService, groupTaskKey } from "#src/task-groups/index.js";
+import {
+  TRUSTED_FROZEN_EXECUTION_SNAPSHOT,
+  type ProjectRepositoryOptions,
+} from "#src/project-storage/contract.js";
+import {
+  createTaskGroupService,
+  ITaskGroupService,
+  groupTaskKey,
+  resolveTaskGroupOwnerHostId,
+} from "#src/task-groups/index.js";
 import { IGenUiService } from "./gen-ui/contract.js";
 import { createGenUiService } from "./gen-ui/node.js";
+import {
+  IWebPushService,
+  createWebPushService,
+  type CreateWebPushServiceOptions,
+} from "./web-push/index.js";
+export { createWebPushService, type CreateWebPushServiceOptions } from "./web-push/index.js";
 // import { channelReplyHostRequestSchema, channelReplyResultSchema } from "@zcode/shared";
 /* eslint-disable max-lines -- host process 服务注册和启动装配需要集中维护，拆散后会更难追踪依赖注入顺序 */
 // Node.js service implementations — NOT safe to import in browser code
@@ -107,6 +122,12 @@ export {
   type TopicResourcePeers,
 } from "./zcode-agent/topicResourcePeers.js";
 export { createTopicResourceRelayChannel } from "./zcode-agent/topicResourceRelayChannel.js";
+import {
+  closeTaskBrowserSessionsBestEffort,
+  type BrowserAmbientContextExecutor,
+} from "./zcode-agent/zcodeAgentBrowserAmbientContext.js";
+
+export type BrowserControlExecutor = BrowserAmbientContextExecutor;
 
 export { createFileService } from "./file/fileService.js";
 export {
@@ -173,7 +194,16 @@ export { GitCommitMessageGenerator } from "./git/gitCommitMessageGenerator.js";
 export { createGitCheckpointService } from "./git/gitCheckpointService.js";
 export { createSystemService } from "./system/systemService.js";
 export { listSSHConfigAliasesFromLocalConfig } from "./system/sshConfigAlias.js";
-export { createTerminalService } from "./terminal/terminalService.js";
+export {
+  createTerminalService,
+  createTerminalScope,
+  createStandaloneTerminalOwners,
+  DEFAULT_STANDALONE_TERMINAL_OWNER_GRACE_MS,
+  type StandaloneTerminalOwnerBindRequest,
+  type StandaloneTerminalConnectionLease,
+  type StandaloneTerminalOwners,
+  type StandaloneTerminalOwnersOptions,
+} from "./terminal/terminalService.js";
 export {
   createSettingService,
   createSettingServiceWithMigrations,
@@ -406,12 +436,47 @@ export {
   isOneShotAutomation,
   isValidCronExpr,
 } from "./session/automationCron.js";
+export {
+  AUTOMATION_MANUAL_CLAIM_HEARTBEAT_MS,
+  AUTOMATION_MISFIRE_GRACE_MS,
+  AUTOMATION_POLL_INTERVAL_MS,
+  AutomationPermanentDispatchError,
+  createAutomationExecutor,
+  createAutomationRuntime,
+  createAutomationScheduler,
+  type AutomationBotDeliveryPort,
+  type AutomationCronPort,
+  type AutomationDispatchRequest,
+  type AutomationDispatchSettlement,
+  type AutomationExecutorHandle,
+  type AutomationExecutorRepoPort,
+  type AutomationLoggerPort,
+  type AutomationModelSelectionPort,
+  type AutomationRepoPort,
+  type AutomationRunExecutorTargetServices,
+  type AutomationRuntimeHandle,
+  type AutomationSchedulerDispatchPort,
+  type AutomationSchedulerHandle,
+  type AutomationSchedulerRepoPort,
+  type AutomationTaskServicePort,
+  type AutomationTimersPort,
+  type CreateAutomationExecutorOptions,
+  type CreateAutomationRuntimeOptions,
+  type CreateAutomationSchedulerOptions,
+} from "./automation-runtime/index.js";
 
 import {
+  buildRemoteHostWorkspaceIdentity,
   buildServerRemoteWorkspaceIdentity,
   DEFAULT_APP_TOOL_SEARCH_MODE,
   remoteHostIdFromWorkspaceIdentity,
+  resolveWorkspaceKey,
 } from "@zcode/shared";
+import {
+  createAutomationRuntime,
+  type AutomationRuntimeHandle,
+} from "./automation-runtime/index.js";
+import { computeAutomationNextRunAt, isOneShotAutomation } from "./session/automationCron.js";
 import { SourceServerWorkspaceAliasRepo } from "./session/sourceServerWorkspaceAliasRepo.js";
 import { SourceServerWorkspaceIdentityMapper } from "./source-server-workspace/sourceServerWorkspaceIdentityChannelServer.js";
 import { ServiceCollection } from "./collection.js";
@@ -479,10 +544,12 @@ import {
 import { createOnboardingRecordService } from "./onboarding/onboardingRecordService.js";
 import { createLegacyTeamOrganizationResolver } from "./model-provider/legacyTeamOrganizationResolver.js";
 import { createObservableSettingService } from "./setting/observableSettingService.js";
+import { normalizeSettingsPatch } from "./setting/normalizeSettingsPatch.js";
 import { createCredentialService } from "./credential/credentialService.js";
 import { createBroadcastService } from "./broadcast/broadcastService.js";
 import {
   createZCodeAgentService,
+  getInProcessPendingInteractionDetail,
   getInProcessPluginUserOptionsReader,
 } from "./zcode-agent/zcodeAgentService.js";
 import type { PluginUserOptionsReader } from "./zcode-agent/pluginHostQueriesClient.js";
@@ -493,7 +560,10 @@ import { createZCodeTaskServiceAdapter } from "./zcode-agent/zcodeTaskServiceAda
 import { createZCodeSessionService } from "./zcode-session/zcodeSessionService.js";
 import { createZCodeTaskIndexSyncer } from "./zcode-agent/zcodeTaskIndexSyncer.js";
 import { TaskIndexRepo } from "./session/taskIndexRepo.js";
-import { AutomationRepo } from "#src/session/automationRepo.js";
+import {
+  AutomationRepo,
+  readWorkspaceAliasCanonicalKeyFromDatabase,
+} from "#src/session/automationRepo.js";
 import type { AppSettings } from "@zcode/shared";
 import { createBotsService } from "./bots/botsService.js";
 import { BotsRepo } from "#src/bots/repo.js";
@@ -683,9 +753,6 @@ import {
   type ServiceAuthorityMode,
   resolveRuntimeZCodeEndpointOrigin,
   resolveSafeTelemetryHostname,
-  type BrowserBackendDescriptor,
-  type BrowserClientMode,
-  type BrowserCommand,
   isZCodeCuaMcpCommand,
   isZCodeCuaMcpPackageArg,
   isZCodeCuaInternalFeatureEnabled,
@@ -700,6 +767,7 @@ import {
   ZCODE_VERSION,
   ZCODE_ENV,
   buildRuntimeZCodeApiUrl,
+  isRemoteWorkspaceIdentity,
 } from "@zcode/shared";
 
 // 这些 conversation-share 实现依赖 Node 文件系统；仅通过 @zcode/services/node 暴露，
@@ -769,6 +837,10 @@ const providerProvisioningTriggerDisposers = new WeakMap<
 >();
 // 自动归档定时扫描器不是 IPC 服务，随 services 释放时停掉定时器与设置监听。
 const taskAutoArchiveDisposers = new WeakMap<ServiceCollection, () => void>();
+const replyLanguageSyncDisposers = new WeakMap<ServiceCollection, () => void>();
+// 独立 HTTP 定时任务运行时：随 services 释放先停新 admission 与轮询，再等待在途 ACK 后关库。
+const automationRuntimes = new WeakMap<ServiceCollection, AutomationRuntimeHandle>();
+const automationRuntimeDisposers = new WeakMap<ServiceCollection, AutomationRuntimeHandle>();
 // TaskIndexRepo / OffPeakTaskRepo 等各自持有 tasks-index.sqlite 的连接句柄；
 // dispose 链必须统一关闭：Windows 上句柄悬着会让宿主回收后临时目录 rm 撞 EBUSY
 // （stdioDesktopPresentationSurface 单测稳定复现），Linux 的 unlink-while-open 语义掩盖了泄漏。
@@ -1318,6 +1390,14 @@ export function createLocalServices(options: {
     automation: ZCodeAutomation;
     run: ZCodeAutomationRun;
   }) => Promise<void>;
+  onAutomationChanged?: (automationId?: string) => void;
+  /** 仅独立 HTTP Host 显式开启进程内定时任务调度与直派；默认 false 避免远端误起第二调度器。 */
+  automationExecutionEnabled?: boolean;
+  /** standalone 只读查询到 canonical 身份后同步登记进传输层映射表，不触发批量别名迁移。 */
+  onStandaloneWorkspaceIdentityResolved?: (mapping: {
+    stableIdentity: string;
+    canonicalIdentity: string;
+  }) => void;
   /** 闲时任务翻 schedulable 后请求宿主立即唤醒 scheduler（desktop host 注入 parentPort 转发）。 */
   onOffPeakSchedulerWakeRequested?: () => void;
   // 注入点：默认 resolver 已能覆盖 dev/桌面/SSH 远端三类形态；
@@ -1343,6 +1423,15 @@ export function createLocalServices(options: {
   serviceAuthorityMode?: ServiceAuthorityMode;
   /** 可信 Server Core 注入，区分物理持库 Host 与历史 workspace canonical route。 */
   projectStorageHostId?: string;
+  /**
+   * 独立云端 Web 显式开启时，允许无 projectId 的非项目工作模式，
+   * 并允许在 standaloneWorkspaceRoot 下为 0 目录新建项目自动分配唯一 root。
+   */
+  allowStandaloneCloudWorkspaces?: boolean;
+  /** 独立云端工作区根；缺省 /workspace。 */
+  standaloneWorkspaceRoot?: string;
+  /** 独立云端 Web 多 root：允许项目拥有多个 root 并允许移动任务增补 root；普通远端仍单 root。 */
+  allowStandaloneMultiRoot?: boolean;
   sourceServerWorkspaceService?: ISourceServerWorkspaceService;
   resolveProjectHostService?: (hostId: string) => Promise<IProjectService>;
   /** 只取已在线来源的原始项目快照，不触发 identity 迁移、连接或 Agent 启动。 */
@@ -1365,36 +1454,14 @@ export function createLocalServices(options: {
    * docs/plugins/extension-host.md §17.2）。它不注册进 ServiceCollection，也不在任何 RPC 频道上。
    */
   onAppControlServiceCreated?: (handle: AppControlServiceHandle) => void;
-  /** browser-use 执行桥（host→main WebContentsView+CDP）；desktop host 注入，缺省则 browser 不可用。 */
-  browserControlExecutor?: {
-    list(input: {
-      requestId: string;
-      sessionId: string;
-      turnId?: string;
-      workspaceKey: string;
-      workspacePath: string;
-      workspaceIdentity?: string;
-      remoteSessionId?: string;
-      clientMode: BrowserClientMode;
-      sessionContext: "live" | "cached";
-    }): Promise<BrowserBackendDescriptor[]>;
-    execute(input: {
-      requestId: string;
-      browserId?: string;
-      browserGeneration?: number;
-      sessionId: string;
-      turnId?: string;
-      workspaceKey: string;
-      workspacePath: string;
-      workspaceIdentity?: string;
-      remoteSessionId?: string;
-      clientMode: BrowserClientMode;
-      sessionContext: "live" | "cached";
-      command: BrowserCommand;
-    }): Promise<{ ok: boolean; [k: string]: unknown }>;
-  };
+  /** browser-use 执行桥；desktop host 或独立 HTTP server 注入，缺省则 browser 不可用。 */
+  browserControlExecutor?: BrowserControlExecutor;
   /** Windows desktop-local Host 的 CUA turn 状态投影；其它 authority 会在装配层拒绝。 */
   cuaOperationStateReporter?: CuaOperationStateReporter;
+  /** standalone-server 默认 5 分钟空闲回收插件控制面进程；测试可注入短超时。 */
+  pluginManagementIdleTimeoutMs?: number;
+  /** 仅独立 HTTP Host 注入标准 Web Push 服务实例，桌面端保持未注入。 */
+  webPushService?: IWebPushService;
 }): ServiceCollection {
   const isDesktopAttachedRemote = options?.serviceAuthorityMode === "desktop-attached-remote";
   // host / remote server 以前直接沿用当前进程环境启动后续服务。
@@ -1425,6 +1492,55 @@ export function createLocalServices(options: {
   const settingService = createObservableSettingService(
     options?.settingService ?? localSettings!.service,
   );
+  let resolveStandaloneReplyLanguage: (() => string | null | Promise<string | null>) | undefined;
+  let stopReplyLanguageSync: (() => void) | undefined;
+  if (!options?.resolveReplyLanguage && options?.allowStandaloneCloudWorkspaces) {
+    let replyLanguageDisposed = false;
+    let cachedReplyLanguage: string | null | undefined;
+    let pendingReplyLanguageRead: Promise<string | null> | null = null;
+    let replyLanguageEpoch = 0;
+    const loadStandaloneReplyLanguage = (): Promise<string | null> => {
+      if (pendingReplyLanguageRead) return pendingReplyLanguageRead;
+      const epoch = ++replyLanguageEpoch;
+      const read = settingService
+        .get()
+        .then((nextSettings) => {
+          const next = nextSettings.replyLanguage ?? null;
+          if (!replyLanguageDisposed && epoch === replyLanguageEpoch) {
+            cachedReplyLanguage = next;
+          }
+          return next;
+        })
+        .finally(() => {
+          if (pendingReplyLanguageRead === read) pendingReplyLanguageRead = null;
+        });
+      pendingReplyLanguageRead = read;
+      return read;
+    };
+    void loadStandaloneReplyLanguage().catch(() => {});
+    const originalSettingUpdate = settingService.update.bind(settingService);
+    settingService.update = async (patch, expectedAccountSettings) => {
+      if (expectedAccountSettings) await originalSettingUpdate(patch, expectedAccountSettings);
+      else await originalSettingUpdate(patch);
+      if (!replyLanguageDisposed && "replyLanguage" in patch) {
+        replyLanguageEpoch += 1;
+        pendingReplyLanguageRead = null;
+        cachedReplyLanguage = normalizeSettingsPatch(patch).replyLanguage ?? null;
+      }
+    };
+    const unsubscribeReplyLanguage = settingService.onDidUpdate((event) => {
+      if (!replyLanguageDisposed && event.keys.includes("replyLanguage")) {
+        void loadStandaloneReplyLanguage().catch(() => {});
+      }
+    });
+    resolveStandaloneReplyLanguage = () =>
+      cachedReplyLanguage !== undefined ? cachedReplyLanguage : loadStandaloneReplyLanguage();
+    stopReplyLanguageSync = () => {
+      replyLanguageDisposed = true;
+      pendingReplyLanguageRead = null;
+      unsubscribeReplyLanguage();
+    };
+  }
   const resolveCurrentZCodeEndpointOrigin = async () =>
     resolveRuntimeZCodeEndpointOrigin(process.env, {
       overrideOrigin: (await settingService.get()).zcodeEndpointOrigin,
@@ -2339,6 +2455,15 @@ export function createLocalServices(options: {
     database: () => taskIndexRepo.getOrganizationDatabase(),
     afterChange: publishProjectChange,
   });
+  // 独立云端 Web 的仓储策略：只在装配层显式开启时传给 project 仓储与 project 服务。
+  const projectRepositoryOptions: ProjectRepositoryOptions | undefined =
+    options?.allowStandaloneCloudWorkspaces
+      ? {
+          allowStandaloneCloudWorkspaces: true,
+          standaloneWorkspaceRoot: options.standaloneWorkspaceRoot?.trim() || "/workspace",
+          allowStandaloneMultiRoot: Boolean(options.allowStandaloneMultiRoot),
+        }
+      : undefined;
   const projectService = createProjectService({
     directories: {
       home: async () => (await systemService.info()).homedir,
@@ -2346,9 +2471,38 @@ export function createLocalServices(options: {
     },
     ownerHostId: options?.projectStorageHostId,
     resolveHost: options?.resolveProjectHostService,
-    repository: () => taskIndexRepo.getProjectRepository(),
-    workspaceDirectory: join(projectDataRoot(), "workspace"),
+    repository: () => taskIndexRepo.getProjectRepository(projectRepositoryOptions),
+    // 独立云端 Web 0 目录项目在首次 prepareSession 时懒创建 /workspace/.zcode/workspace/<projectId>，
+    // 非 standalone 仍保持原 <projectDataRoot>/workspace/<projectId>。
+    workspaceDirectory:
+      options?.serviceAuthorityMode === "standalone-server" &&
+      options?.allowStandaloneCloudWorkspaces
+        ? join(options.standaloneWorkspaceRoot?.trim() || "/workspace", ".zcode", "workspace")
+        : join(projectDataRoot(), "workspace"),
     afterChange: publishProjectChange,
+    // 独立云端 Web 的工作区策略：装配层显式开启时才允许非项目会话与 0 目录新建项目。
+    allowStandaloneCloudWorkspaces: options?.allowStandaloneCloudWorkspaces,
+    standaloneWorkspaceRoot: options?.standaloneWorkspaceRoot,
+    // 独立云端 Web 多 root：与工作区策略同源显式开启，普通远端保持单 root。
+    allowStandaloneMultiRoot: options?.allowStandaloneMultiRoot,
+    // 独立云端 Web 项目数据估算与清理：仅 standalone-server 且显式开启独立云端工作区时开放，
+    // 并按每个目录独立解析 canonical workspaceIdentity。
+    ...(options?.serviceAuthorityMode === "standalone-server" &&
+    options?.allowStandaloneCloudWorkspaces
+      ? {
+          allowStandaloneProjectData: true,
+          ...(options?.sourceServerWorkspaceService
+            ? {
+                resolveDirectoryWorkspaceIdentity: async (workspacePath: string) =>
+                  (
+                    await options.sourceServerWorkspaceService!.resolveWorkspace({
+                      workspacePath,
+                    })
+                  ).canonicalWorkspaceKey,
+              }
+            : {}),
+        }
+      : {}),
     // zcodeAgentService 在下方创建；端口只在命令执行时取用它。
     data: {
       repository: () => taskIndexRepo.getProjectDataRepository(),
@@ -2369,25 +2523,45 @@ export function createLocalServices(options: {
   });
   const taskGroupService = createTaskGroupService({
     database: () => taskIndexRepo.getOrganizationDatabase(),
+    // 独立云端 Web 的 owner Host 与本地别名只在装配层显式开启时生效。
+    ownerHostId: options?.projectStorageHostId,
+    allowStandaloneLocalHostAlias: Boolean(options?.allowStandaloneCloudWorkspaces),
     resolveTasks: async (refs) => {
       // 只读所属 Host 的权威目录；项目路由不会为分组建立连接或启动 Agent。
-      const hostIds = [...new Set(refs.map((task) => task.hostId))];
+      const allowAlias = Boolean(options?.allowStandaloneCloudWorkspaces);
+      const ownerHostId = options?.projectStorageHostId;
+      const ownerHostIdOf = (hostId: string) =>
+        resolveTaskGroupOwnerHostId(hostId, ownerHostId, allowAlias);
+      const hostIds = [...new Set(refs.map((ref) => ownerHostIdOf(ref.hostId)))];
       const results = await Promise.all(
-        hostIds.map(async (hostId) => {
-          const tree = await projectService.readTree({ hostId, includeDeletedTasks: true });
-          const facts = new Map(
-            [
-              ...tree.tasks,
-              ...(tree.deletedTasks ?? []).map((task) => ({ ...task, deleted: true })),
-            ].map((task) => [groupTaskKey(task), task]),
-          );
+        hostIds.map(async (targetHostId) => {
+          const tree = await projectService.readTree({
+            hostId: targetHostId,
+            includeDeletedTasks: true,
+          });
+          const facts = [
+            // 两个分支都显式带 deleted，避免联合类型上访问不到该字段。
+            ...tree.tasks.map((task) => ({ ...task, deleted: false })),
+            ...(tree.deletedTasks ?? []).map((task) => ({ ...task, deleted: true })),
+          ];
           return refs
-            .filter((ref) => ref.hostId === hostId)
+            .filter((ref) => ownerHostIdOf(ref.hostId) === targetHostId)
             .flatMap((ref) => {
-              const fact = facts.get(groupTaskKey(ref));
-              return fact && fact.hostId === ref.hostId && fact.workspacePath === ref.workspacePath
-                ? [{ ...fact, ...ref }]
-                : [];
+              const key = groupTaskKey(ref);
+              let fact = facts.find((task) => groupTaskKey(task) === key);
+              if (!fact && allowAlias)
+                fact = facts.find(
+                  (task) => task.taskId === ref.taskId && task.workspacePath === ref.workspacePath,
+                );
+              if (!fact) return [];
+              // 只回传 Host 的权威事实：绝不用请求侧 hostId/identity 覆盖存储键，
+              // 否则仓储写入的 workspace_key 与前端 tree.tasks 的 taskGroupKey 会分叉。
+              if (
+                ownerHostIdOf(fact.hostId) !== targetHostId ||
+                fact.workspacePath !== ref.workspacePath
+              )
+                return [];
+              return [{ ...fact, deleted: Boolean(fact.deleted) }];
             });
         }),
       );
@@ -2395,17 +2569,154 @@ export function createLocalServices(options: {
     },
     afterChange: () => broadcastService.send({ channel: "state:task-groups", payload: {} }),
   });
-  const prepareProjectExecution = async (projectId: string) => ({
-    ...(await projectService.prepareSession({ projectId })),
-    hostId: options?.projectStorageHostId ?? "local",
-    workspaceIdentity: undefined,
-  });
+  const prepareProjectExecution = async (projectId: string) => {
+    const prepared = await projectService.prepareSession({ projectId });
+    if (
+      options?.serviceAuthorityMode === "standalone-server" &&
+      !options?.allowStandaloneCloudWorkspaces
+    ) {
+      // 纯远端 Source Server 模式下固化当前服务器 canonical workspaceIdentity 与可信 hostId，
+      // 避免新建定时任务落盘缺失 identity 或退回 local。
+      const resolved = await sourceServerWorkspaceService.resolveWorkspace({
+        workspacePath: prepared.workspacePath,
+      });
+      return {
+        ...prepared,
+        hostId: options?.projectStorageHostId ?? "local",
+        workspaceIdentity: resolved.canonicalWorkspaceKey,
+      };
+    }
+    return {
+      ...prepared,
+      hostId: options?.projectStorageHostId ?? "local",
+      workspaceIdentity: undefined,
+    };
+  };
+  const resolveAutomationExecutionContext =
+    options?.serviceAuthorityMode === "standalone-server"
+      ? async (target: {
+          workspacePath: string;
+          workspaceIdentity?: string;
+          targetTaskId?: string;
+        }) => {
+          const hostId = options?.projectStorageHostId ?? "local";
+          const identity = target.workspaceIdentity?.trim();
+          const stableIdentity =
+            hostId !== "local"
+              ? buildRemoteHostWorkspaceIdentity(hostId, target.workspacePath)
+              : undefined;
+          let cachedAliasCanonicalKey: string | null | undefined;
+          const readAliasCanonicalKey = async () => {
+            if (cachedAliasCanonicalKey === undefined) {
+              const orgDb = await taskIndexRepo.getOrganizationDatabase();
+              cachedAliasCanonicalKey = readWorkspaceAliasCanonicalKeyFromDatabase(
+                orgDb,
+                target.workspacePath,
+              );
+            }
+            return cachedAliasCanonicalKey;
+          };
+          // 先使用纯无副作用的只读逻辑完成归属校验：任何异域请求必须在触发
+          // sourceServerWorkspaceService.resolveWorkspace 前立即拒绝，确保零写入、零合并。
+          if (identity) {
+            if (isRemoteWorkspaceIdentity(identity)) {
+              const aliasCanonicalKey =
+                identity === stableIdentity ? null : await readAliasCanonicalKey();
+              if (identity !== stableIdentity && identity !== aliasCanonicalKey) {
+                throw new Error("Automation workspace does not belong to this server");
+              }
+            } else if (identity !== target.workspacePath) {
+              throw new Error("Automation workspace does not belong to this server");
+            }
+          }
+          if (options?.allowStandaloneCloudWorkspaces) {
+            const targetTaskId = target.targetTaskId?.trim();
+            if (targetTaskId && identity && isRemoteWorkspaceIdentity(identity)) {
+              const existingCanonicalTask = await taskIndexRepo.getTaskMeta({
+                workspacePath: target.workspacePath,
+                workspaceIdentity: identity,
+                taskId: targetTaskId,
+              });
+              if (existingCanonicalTask) {
+                return {
+                  hostId,
+                  workspaceIdentity: identity,
+                };
+              }
+            }
+            return {
+              hostId,
+              workspaceIdentity: undefined,
+            };
+          }
+          const aliasCanonicalKey = await readAliasCanonicalKey();
+          if (aliasCanonicalKey) {
+            if (stableIdentity) {
+              options?.onStandaloneWorkspaceIdentityResolved?.({
+                stableIdentity,
+                canonicalIdentity: aliasCanonicalKey,
+              });
+            }
+            return {
+              hostId,
+              workspaceIdentity: aliasCanonicalKey,
+            };
+          }
+          const resolved = await sourceServerWorkspaceService.resolveWorkspace({
+            workspacePath: target.workspacePath,
+          });
+          return {
+            hostId,
+            workspaceIdentity: resolved.canonicalWorkspaceKey,
+          };
+        }
+      : undefined;
+  const automationRuntimeRef: { current: AutomationRuntimeHandle | undefined } = {
+    current: undefined,
+  };
   let appControlService: AppControlService | undefined;
   // 受管 worktree 的删除租约：worktree 服务取得，Agent 服务与终端服务据此拒绝新操作（§8.3）。
   // 租约只在本 Host 内生效，前提是一台机器只有一个本地 Host：应用持有单实例锁，主窗口只经
   // primaryWindowCoordinator 创建并复用已有窗口，renderer 刷新复用原 Host。以后支持多个主窗口时，
   // 删除需要改由 main 跨 Host 协调（docs/git/worktree.md §8.3）。
+  const isLocalProjectHost =
+    !options?.projectStorageHostId || options.projectStorageHostId === "local";
+  const isStandaloneManagedWorktreeHost =
+    options?.serviceAuthorityMode === "standalone-server" &&
+    Boolean(options?.allowStandaloneCloudWorkspaces);
+  // 独立 Web（standalone-server + allowStandaloneCloudWorkspaces）同样运行在服务器本机目录，
+  // 共享桌面受管 worktree 能力，但数据根目录落在 <standaloneWorkspaceRoot>/.zcode/worktrees 下。
+  const allowHostManagedWorktrees = isLocalProjectHost || isStandaloneManagedWorktreeHost;
+  const isOwnedStandaloneWorktreeTarget = async (target: {
+    workspacePath: string;
+    workspaceIdentity?: string;
+    remoteSessionId?: string;
+  }): Promise<boolean> => {
+    const identity = target.workspaceIdentity?.trim();
+    if (!identity) return allowHostManagedWorktrees;
+    if (!isStandaloneManagedWorktreeHost || target.remoteSessionId) return false;
+    const stableIdentity =
+      options?.projectStorageHostId && options.projectStorageHostId !== "local"
+        ? buildRemoteHostWorkspaceIdentity(options.projectStorageHostId, target.workspacePath)
+        : undefined;
+    if (stableIdentity && identity === stableIdentity) return true;
+    if (!options?.sourceServerWorkspaceService) return false;
+    try {
+      const resolved = await options.sourceServerWorkspaceService.resolveWorkspace({
+        workspacePath: target.workspacePath,
+      });
+      return resolved.canonicalWorkspaceKey === identity;
+    } catch {
+      return false;
+    }
+  };
   const worktreeRemovalGate = createWorktreeRemovalGate();
+  let resolveSessionSummaryRef:
+    | ((
+        workspace: { workspacePath: string; workspaceIdentity?: string },
+        sessionId: string,
+      ) => ReturnType<ReturnType<typeof createZCodeTaskIndexSyncer>["getSessionSummary"]>)
+    | undefined;
   const zcodeAgentService = createZCodeAgentService({
     credentialCipherProvider,
     reportPluginTelemetryEvent: options?.reportPluginTelemetryEvent,
@@ -2413,35 +2724,75 @@ export function createLocalServices(options: {
       worktreeRemovalGate.runSessionOperation(
         target.sessionId,
         async () => {
-          // 只有本地任务可能运行在受管 worktree 中；cwd 只经 tasks-index 同一行得到（§2.1）。
-          // 没有任务行时返回 null（未知），由闸门在删除期间拒绝，不回退为 workspace 目录。
-          if (target.workspaceIdentity?.trim()) return target.workspacePath;
-          return (await taskIndexRepo.getProjectRepository()).readTaskCwd({
-            workspacePath: target.workspacePath,
-            taskId: target.sessionId,
-          });
+          // 本地桌面与归属当前 standalone 服务器的请求均可能指向受管 worktree 会话；
+          // cwd 只经 tasks-index 同一行得到（§2.1），没有任务行时返回 null 由闸门在删除期间拒绝。
+          if (!(await isOwnedStandaloneWorktreeTarget(target))) {
+            return target.workspacePath;
+          }
+          const repo = await taskIndexRepo.getProjectRepository(projectRepositoryOptions);
+          const identity = target.workspaceIdentity?.trim();
+          return (
+            repo.readTaskCwd({
+              workspacePath: target.workspacePath,
+              ...(identity ? { workspaceIdentity: identity } : {}),
+              taskId: target.sessionId,
+            }) ??
+            (identity
+              ? repo.readTaskCwd({
+                  workspacePath: target.workspacePath,
+                  taskId: target.sessionId,
+                })
+              : null)
+          );
         },
         operation,
       ),
     resolveAppControlService: () => appControlService,
     appControlSourceServerId: options?.projectStorageHostId ?? "local",
+    ...(options?.serviceAuthorityMode === "standalone-server" &&
+    options?.sourceServerWorkspaceService
+      ? {
+          isDeletionWorkspaceOwnedByCurrentHost: async (workspace) => {
+            if (workspace.remoteSessionId) return false;
+            const identity = workspace.workspaceIdentity?.trim();
+            if (!identity || !workspace.workspacePath) return false;
+            try {
+              const resolved = await options.sourceServerWorkspaceService!.resolveWorkspace({
+                workspacePath: workspace.workspacePath,
+              });
+              return resolved.canonicalWorkspaceKey === identity;
+            } catch {
+              return false;
+            }
+          },
+        }
+      : {}),
     useSharedTaskRuntime: async (target) => {
-      if (options?.projectStorageHostId && options.projectStorageHostId !== "local") return false;
-      return !(await taskIndexRepo.getProjectRepository()).hasProjectWorkspace(target);
+      if (!(isLocalProjectHost || isStandaloneManagedWorktreeHost)) return false;
+      if (target.workspaceIdentity?.trim()) return false;
+      return !(
+        await taskIndexRepo.getProjectRepository(projectRepositoryOptions)
+      ).hasProjectWorkspace(target);
     },
     prepareProjectExecution,
+    // fork 归属在 ACK 返回前交接；普通创建在 CLI 首发前预留。两者都透传独立云端仓储策略。
     prepareForkCreation: async (target) => {
-      (await taskIndexRepo.getProjectRepository()).reserveCreatedTask({
+      (await taskIndexRepo.getProjectRepository(projectRepositoryOptions)).reserveCreatedTask({
         task: { ...target, taskId: target.sessionId },
         parentTaskId: target.parentSessionId,
       });
     },
     prepareSessionCreation: async (target) => {
-      const prepared = (await taskIndexRepo.getProjectRepository()).reserveCreatedTask({
+      const prepared = (
+        await taskIndexRepo.getProjectRepository(projectRepositoryOptions)
+      ).reserveCreatedTask({
         task: { ...target, taskId: target.sessionId },
         projectId: target.projectId,
         creationCommand: target.creationCommand,
         additionalDirectories: target.additionalDirectories,
+        ...(target[TRUSTED_FROZEN_EXECUTION_SNAPSHOT]
+          ? { [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]: true as const }
+          : {}),
       });
       return { sessionId: prepared.taskId, additionalDirectories: prepared.additionalDirectories };
     },
@@ -2470,11 +2821,34 @@ export function createLocalServices(options: {
       serviceAuthorityMode: options?.serviceAuthorityMode,
       desktopContextPromptEnabled,
     }),
-    onAutomationManualRunRequested: options?.onAutomationManualRunRequested,
+    onAutomationManualRunRequested:
+      options?.automationExecutionEnabled === true
+        ? (params) => {
+            if (!automationRuntimeRef.current) {
+              return Promise.reject(new Error("Automation runtime is not initialized."));
+            }
+            return automationRuntimeRef.current.dispatchManualRun(params);
+          }
+        : options?.onAutomationManualRunRequested,
+    canDispatchAutomationManualRun:
+      options?.automationExecutionEnabled === true
+        ? () => Boolean(automationRuntimeRef.current?.canAcceptManualRun())
+        : undefined,
+    onAutomationChanged:
+      options?.automationExecutionEnabled === true
+        ? () => automationRuntimeRef.current?.wake()
+        : options?.onAutomationChanged,
+    resolveAutomationExecutionContext,
+    defaultAutomationHostId: options?.projectStorageHostId ?? "local",
     // createLocalServices 虽然暴露了 reporter 注入点，旧装配却没有继续传给
     // ZCodeAgentProcessManager，导致 host 永远不向 main 上报 Agent spawn/exit，进程监控器
     // 因而看不到实际运行的 Agent，也无法验证只读到可写升级是否复用同一进程。
     processLifecycleReporter: options?.processLifecycleReporter,
+    ...(options?.pluginManagementIdleTimeoutMs !== undefined
+      ? { pluginManagementIdleTimeoutMs: options.pluginManagementIdleTimeoutMs }
+      : options?.serviceAuthorityMode === "standalone-server"
+        ? { pluginManagementIdleTimeoutMs: 5 * 60_000 }
+        : {}),
     spawnFallbackCwd: options?.zcodeAgentSpawnFallbackCwd,
     // browser-use：host→main 执行桥透传给 agent service 的 onRequest browserExecute 路由。
     browserControlExecutor: options?.browserControlExecutor,
@@ -2556,6 +2930,15 @@ export function createLocalServices(options: {
           onCuaPipSessionLifecycle: (_workspace, event) => {
             void cuaPipSessionService.publishLifecycle(event);
           },
+        }
+      : {}),
+    ...(options?.webPushService
+      ? {
+          webPushService: options.webPushService,
+          resolveSessionSummary: (
+            workspace: { workspacePath: string; workspaceIdentity?: string },
+            sessionId: string,
+          ) => resolveSessionSummaryRef?.(workspace, sessionId),
         }
       : {}),
     // 设置页的 HTTP 代理、No Proxy + 自定义 CA 按 spawn 时读取注入 agent 子进程 env，
@@ -2647,8 +3030,9 @@ export function createLocalServices(options: {
           readSubagentRuntimeConfig: subagentsService.readRuntimeConfig,
         }
       : {}),
-    // 只有 Desktop Host 注入回复语言；远端与 Web 不注入，CLI 读到 null 后按对话语言回复。
-    resolveReplyLanguage: options?.resolveReplyLanguage,
+    // 桌面 Host 注入 options.resolveReplyLanguage；独立 Web 从 settingService 内存同步；
+    // 普通远控 Source Server 保持未注入，CLI 读到 null 后按对话语言回复。
+    resolveReplyLanguage: options?.resolveReplyLanguage ?? resolveStandaloneReplyLanguage,
     ...(isDesktopAttachedRemote
       ? { sessionRuntimePreferencesAuthority: "external" as const }
       : {
@@ -2691,7 +3075,17 @@ export function createLocalServices(options: {
       ? (runningTaskCount) =>
           options.taskRuntimeReporter?.onActiveSessionCountChanged?.({ runningTaskCount })
       : undefined,
+    browserControlExecutor: options?.browserControlExecutor,
+    ...(options?.webPushService
+      ? {
+          webPushService: options.webPushService,
+          resolveInteractionDetail: (interactionId) =>
+            getInProcessPendingInteractionDetail(zcodeAgentService, interactionId),
+        }
+      : {}),
   });
+  resolveSessionSummaryRef = zcodeTaskIndexSyncer.getSessionSummary;
+  const autoArchiveLogger = createServiceLogger("task-auto-archive");
   // 自动归档只由这里的定时扫描触发（启动首轮 + 每小时 + 设置变更补扫）；readTree 与任务点击
   // 都不再执行 archiveInactive。判据仍排除 syncer 观察到的非终态会话，不为扫描启动 CLI。
   const taskAutoArchiveScheduler = createTaskAutoArchiveScheduler({
@@ -2704,12 +3098,33 @@ export function createLocalServices(options: {
         activeTasks: zcodeTaskIndexSyncer.activeTaskRefs(),
       };
     },
-    repository: () => taskIndexRepo.getProjectRepository(),
+    repository: () => taskIndexRepo.getProjectRepository(projectRepositoryOptions),
     afterChange: async (archived) => {
       // Bug 根因：自动归档直接改 sqlite，只广播项目变更，不发 task_archived；
       // Controller 依赖任务事实流关闭已归档任务的 tab，缺事件会让出声的 Browser guest 留在后台。
+      const byWorkspace = new Map<
+        string,
+        { workspacePath: string; workspaceIdentity?: string; sessionIds: string[] }
+      >();
       for (const task of archived) {
         zcodeTaskIndexSyncer.emitWorkspaceTaskListChanged(task, undefined, "task_archived");
+        const key = resolveWorkspaceKey(task);
+        const entry = byWorkspace.get(key) ?? {
+          workspacePath: task.workspacePath,
+          ...(task.workspaceIdentity ? { workspaceIdentity: task.workspaceIdentity } : {}),
+          sessionIds: [],
+        };
+        entry.sessionIds.push(task.taskId);
+        byWorkspace.set(key, entry);
+      }
+      for (const group of byWorkspace.values()) {
+        await closeTaskBrowserSessionsBestEffort(options?.browserControlExecutor, group, (error) =>
+          autoArchiveLogger.warn(undefined, "自动归档后回收浏览器会话失败", {
+            workspacePath: group.workspacePath,
+            sessionIds: group.sessionIds,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
       }
       await publishProjectChange();
     },
@@ -2765,14 +3180,15 @@ export function createLocalServices(options: {
     settingService,
     isCwdBlocked: (cwd) => worktreeRemovalGate.isRemoving(cwd),
   });
-  const isLocalProjectHost =
-    !options?.projectStorageHostId || options.projectStorageHostId === "local";
+  const managedWorktreeDataBaseDir = isStandaloneManagedWorktreeHost
+    ? () => options?.standaloneWorkspaceRoot?.trim() || "/workspace"
+    : getDataBaseDir;
   const managedWorktreeService = createManagedWorktreeService({
-    isLocalHost: isLocalProjectHost,
-    repository: () => taskIndexRepo.getProjectRepository(),
+    isLocalHost: allowHostManagedWorktrees,
+    repository: () => taskIndexRepo.getProjectRepository(projectRepositoryOptions),
     git: createGitWorktreeRepo({
       commandProvider: createGitCommandProvider(),
-      dataBaseDir: getDataBaseDir,
+      dataBaseDir: managedWorktreeDataBaseDir,
     }),
     removalGate: worktreeRemovalGate,
     runtime: {
@@ -2808,6 +3224,7 @@ export function createLocalServices(options: {
     taskIndexSyncer: zcodeTaskIndexSyncer,
     settingService,
     cuaProductMcpServerResolver,
+    browserControlExecutor: options?.browserControlExecutor,
   });
   appControlService = createAppControlService({
     sourceServerId: options?.projectStorageHostId ?? "local",
@@ -2832,10 +3249,12 @@ export function createLocalServices(options: {
     navigation: options?.appControlNavigation,
     prepareCreation: ({ projectId }) => projectService.prepareSession({ projectId }),
     findCreationReceipts: async (creationCommand) =>
-      (await taskIndexRepo.getProjectRepository()).findCreationReceipts({ creationCommand }),
+      (await taskIndexRepo.getProjectRepository(projectRepositoryOptions)).findCreationReceipts({
+        creationCommand,
+      }),
     reserveFork: async (target) => {
       // 分叉正文由 CLI 创建；产品归属仍经 Host 的既有原子预留 owner。
-      (await taskIndexRepo.getProjectRepository()).reserveCreatedTask({
+      (await taskIndexRepo.getProjectRepository(projectRepositoryOptions)).reserveCreatedTask({
         task: target,
         projectId: target.projectId,
         forkedFromTaskId: target.forkedFromTaskId,
@@ -3362,6 +3781,9 @@ export function createLocalServices(options: {
   services
     .register(IProviderSettingsService, providerRuntime.providerSettings)
     .register(IModelSelectionService, providerRuntime.modelSelection);
+  if (options?.webPushService) {
+    services.register(IWebPushService, options.webPushService);
+  }
   if (isDesktopAttachedRemote || options.providerProvisioningTargetEnabled === true) {
     services.register(
       IProviderProvisioningTargetService,
@@ -3392,6 +3814,108 @@ export function createLocalServices(options: {
     },
   );
 
+  if (options?.automationExecutionEnabled === true) {
+    const automationRuntimeLogger = createServiceLogger("automation-runtime");
+    const automationRuntimeRepo = new AutomationRepo();
+    sqliteReposToClose.push(automationRuntimeRepo);
+    const ownerHostId = options?.projectStorageHostId ?? "local";
+    // 仅供 automationRuntime 使用的内部任务代理：先校验已持久化定时任务定义归属本 Host
+    // 且目录与定义一致，再赋予进程内不可序列化的可信冻结快照 Symbol，避免外部 RPC 伪造绕过 roots 校验。
+    const automationTaskService: typeof zcodeTaskService = {
+      ...zcodeTaskService,
+      async createTask(params) {
+        if (params.automationId) {
+          const persisted = await automationRuntimeRepo.get(
+            params.automationId,
+            resolveWorkspaceKey({
+              workspacePath: params.workspacePath,
+              workspaceIdentity: params.workspaceIdentity,
+            }),
+          );
+          if (
+            persisted &&
+            (persisted.hostId ?? "local") === ownerHostId &&
+            persisted.workspacePath === params.workspacePath &&
+            (persisted.workspaceIdentity ?? undefined) ===
+              (params.workspaceIdentity ?? undefined) &&
+            (persisted.projectId ?? null) === (params.projectId ?? null) &&
+            JSON.stringify(persisted.additionalDirectories ?? []) ===
+              JSON.stringify(params.additionalDirectories ?? [])
+          ) {
+            return zcodeTaskService.createTask({
+              ...params,
+              additionalDirectories: persisted.additionalDirectories ?? [],
+              [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]: true as const,
+            } as Parameters<typeof zcodeTaskService.createTask>[0]);
+          }
+        }
+        return zcodeTaskService.createTask(params);
+      },
+    };
+    const runtime = createAutomationRuntime({
+      repo: automationRuntimeRepo,
+      cron: {
+        computeNextRunAt: computeAutomationNextRunAt,
+        isOneShotAutomation,
+      },
+      resolveTargetServices: () => ({
+        taskService: automationTaskService,
+        modelSelectionService: providerRuntime.modelSelection,
+        botsService: services.getOptional(IBotsService),
+      }),
+      logger: {
+        info: (message, details) => automationRuntimeLogger.info(undefined, message, details),
+        warn: (message, error) => automationRuntimeLogger.warn(undefined, message, { error }),
+        error: (message, error) => automationRuntimeLogger.error(undefined, message, { error }),
+      },
+      ...(options?.webPushService
+        ? {
+            onTurnDispatched: ({ sessionId, runId }) => {
+              options.webPushService?.markAutomationOwnedSessionTurn?.(sessionId, runId);
+            },
+            onTurnCleared: ({ sessionId, runId }) => {
+              options.webPushService?.clearAutomationOwnedSessionTurn?.(sessionId, runId);
+            },
+            onRunSettled: (event) => {
+              options.webPushService?.notifyAutomationEvent(event);
+            },
+          }
+        : {}),
+      ...(options.serviceAuthorityMode === "standalone-server" &&
+      options.projectStorageHostId &&
+      options.projectStorageHostId !== "local"
+        ? {
+            standaloneAuthority: {
+              projectStorageHostId: options.projectStorageHostId,
+              localWorkspaceAliasEnabled: Boolean(options.allowStandaloneCloudWorkspaces),
+              // 使用无批量迁移副作用的只读 alias 查询 + 本服务器确定性 identity，
+              // 避免同目录并存本地历史定义与异域 SSH 定义时误触发全路径批量迁移。
+              resolveWorkspace: async (workspacePath) => {
+                const stableIdentity = buildRemoteHostWorkspaceIdentity(
+                  options.projectStorageHostId!,
+                  workspacePath,
+                );
+                const canonicalWorkspaceKey =
+                  (await automationRuntimeRepo.readWorkspaceAliasCanonicalKey(workspacePath)) ??
+                  stableIdentity;
+                options.onStandaloneWorkspaceIdentityResolved?.({
+                  stableIdentity,
+                  canonicalIdentity: canonicalWorkspaceKey,
+                });
+                return { canonicalWorkspaceKey };
+              },
+            },
+          }
+        : {}),
+    });
+    automationRuntimeRef.current = runtime;
+    automationRuntimes.set(services, runtime);
+    automationRuntimeDisposers.set(services, runtime);
+  }
+
+  if (stopReplyLanguageSync) {
+    replyLanguageSyncDisposers.set(services, stopReplyLanguageSync);
+  }
   // 见 sharedSqliteRepos 声明处注释：登记全部 tasks-index sqlite 句柄，dispose 链统一关闭
   sqliteReposToClose.push(taskIndexRepo);
   sharedSqliteRepos.set(services, sqliteReposToClose);
@@ -3478,6 +4002,9 @@ function readTelemetryOAuthUserId(rawUserInfo: string | null): string {
 }
 
 export function disposeServiceResources(services: ServiceCollection): void {
+  automationRuntimeDisposers.get(services)?.disposeSync();
+  automationRuntimeDisposers.delete(services);
+  automationRuntimes.delete(services);
   const content = services.getOptional(ICloudContentService);
   if (content && hasDisposeAllAndWait(content)) void content.disposeAllAndWait().catch(() => {});
   (
@@ -3517,10 +4044,24 @@ export function disposeServiceResources(services: ServiceCollection): void {
   providerProvisioningSources.delete(services);
   taskAutoArchiveDisposers.get(services)?.();
   taskAutoArchiveDisposers.delete(services);
+  replyLanguageSyncDisposers.get(services)?.();
+  replyLanguageSyncDisposers.delete(services);
   managedHostApiNetworkTransports.get(services)?.dispose();
+  const webPush = services.getOptional(IWebPushService);
+  if (webPush) {
+    void webPush.dispose().catch(() => {});
+  }
 }
 
 export async function disposeServiceResourcesAndWait(services: ServiceCollection): Promise<void> {
+  // 先停止定时任务新调度/手动派发 admission 与轮询 timer 并等待在途 ACK 结算，
+  // 再关闭 Agent 进程树与共享 SQLite Repo，避免关库后异步写库报错。
+  const automationRuntime = automationRuntimeDisposers.get(services);
+  automationRuntimeDisposers.delete(services);
+  automationRuntimes.delete(services);
+  if (automationRuntime) {
+    await automationRuntime.dispose().catch(() => {});
+  }
   (
     services.getOptional(IGenUiService) as (IGenUiService & { dispose?(): void }) | undefined
   )?.dispose?.();
@@ -3562,10 +4103,16 @@ export async function disposeServiceResourcesAndWait(services: ServiceCollection
   providerProvisioningSources.delete(services);
   taskAutoArchiveDisposers.get(services)?.();
   taskAutoArchiveDisposers.delete(services);
+  replyLanguageSyncDisposers.get(services)?.();
+  replyLanguageSyncDisposers.delete(services);
   await managedHostApiNetworkTransports
     .get(services)
     ?.disposeAndWait()
     .catch(() => {});
+  const webPush = services.getOptional(IWebPushService);
+  if (webPush) {
+    await webPush.dispose().catch(() => {});
+  }
 }
 
 /** 所有应用入口在开放 RPC / 调度器前等待；失败不启动业务写者。 */
@@ -3609,6 +4156,13 @@ export async function createServerHostServices(options: {
   zcodeBuiltinProviderConfigFilePath: string;
   providerProvisioningTargetEnabled?: boolean;
   credentialCipherProvider?: CredentialCipher;
+  browserControlExecutor?: BrowserControlExecutor;
+  /** 默认 false；仅独立 HTTP 入口开启，避免 Desktop-attached remote 误起第二调度器。 */
+  automationExecutionEnabled?: boolean;
+  pluginManagementIdleTimeoutMs?: number;
+  /** 默认 false；仅独立 HTTP 入口开启标准 Web Push 服务。 */
+  webPushEnabled?: boolean;
+  webPushOptions?: CreateWebPushServiceOptions;
 }) {
   // 无桌面环境不能等到首次登录或 Provisioning 才发现系统库缺失。
   const credentialCipherProvider =
@@ -3646,6 +4200,10 @@ export async function createServerHostServices(options: {
     },
   });
   const migrationFailedPathCount = await workspaceAliasRepo.getFailedPathCount();
+  // 独立云端 Web 兼容开关：只在显式配置时开放非项目工作模式与 0 目录项目自动 root。
+  const standaloneWebCompat = process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1";
+  const webPushService =
+    options.webPushEnabled === true ? createWebPushService(options.webPushOptions) : undefined;
   const services = createLocalServices({
     credentialCipherProvider,
     zcodeBuiltinProviderConfigFilePath: options.zcodeBuiltinProviderConfigFilePath,
@@ -3654,7 +4212,28 @@ export async function createServerHostServices(options: {
     topicResourceRelayChannel: options.topicResourceRelayChannel,
     projectStorageHostId,
     sourceServerWorkspaceService,
+    allowStandaloneCloudWorkspaces: standaloneWebCompat,
+    standaloneWorkspaceRoot: process.env.ZCODE_DEFAULT_WORKSPACE_DIR?.trim() || "/workspace",
+    // 同一个 standalone 兼容开关显式开启多 root；未开启的远端 owner 仍单 root、root 不可变。
+    allowStandaloneMultiRoot: standaloneWebCompat,
+    browserControlExecutor: options.browserControlExecutor,
+    automationExecutionEnabled: options.automationExecutionEnabled === true,
+    ...(webPushService ? { webPushService } : {}),
+    ...(options.pluginManagementIdleTimeoutMs !== undefined
+      ? { pluginManagementIdleTimeoutMs: options.pluginManagementIdleTimeoutMs }
+      : {}),
+    onStandaloneWorkspaceIdentityResolved: (mapping) => {
+      workspaceIdentityMapper.register(mapping);
+    },
   });
+  if (options.automationExecutionEnabled === true) {
+    try {
+      await automationRuntimes.get(services)?.start();
+    } catch (error) {
+      await disposeServiceResourcesAndWait(services).catch(() => {});
+      throw error;
+    }
+  }
   return { services, workspaceIdentityMapper, migrationFailedPathCount };
 }
 

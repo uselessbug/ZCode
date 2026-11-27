@@ -912,8 +912,6 @@ export interface ExecuteToolsResult {
 
 export type ActiveTurnKind = "regular" | "compact" | "rewind";
 
-export const INLINE_TEXT_ATTACHMENT_MAX_BYTES = 64 * 1024;
-
 export const INLINE_MEDIA_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
 
 export const MAX_IMAGE_ATTACHMENT_DIMENSION = 2000;

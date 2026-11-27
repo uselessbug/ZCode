@@ -38,6 +38,7 @@ import { DirectoryBrowser } from "@/DirectoryBrowser.js";
 import { useRemoteBoundaryAcknowledgement } from "@/RemoteConnectionDialogContent.js";
 import { useProjectDirectoryServices } from "@/project-sidebar/useProjectDirectoryServices.js";
 import { useConfirmDialog } from "@/hooks/useConfirmDialog.js";
+import { useIsServerHostedSettingsScope } from "@/hooks/useFileContextActions.js";
 import { useOptionalPlatform } from "@/hooks/usePlatform.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { getPathLeaf } from "@/lib/path.js";
@@ -140,7 +141,20 @@ export function ProjectEditor({
   const hostId =
     project?.hostId ?? fixedFolder?.hostId ?? host?.id ?? (devices ? selectedDeviceId : undefined);
   const remote = Boolean(hostId && hostId !== "local");
+  // 能力必须来自当前平台而不是 hostId 标签：独立云端 Web 的 host alias 会把 owner 显示为
+  // "local"。是否限制为单 root 由下面的 singleRootMode 决定：只有真实远端 Source / 桌面远控
+  // 受限，独立云端 Web 由 standalone 装配开启多 root。缺少本机目录选择器即说明这是云端 Web。
+  const nativeDirectoryPicker = Boolean(platform?.selectDirectories);
+  const isStandaloneWeb = !nativeDirectoryPicker && !remote;
+  // 单 root 限制只属于真实远端 Source / 桌面远控：它们没有多 root 能力。
+  // 独立云端 Web 由 standalone 装配显式开启多 root（allowStandaloneMultiRoot），可在网页内增删 root。
+  const singleRootMode = remote;
   const msg = (id: string) => intl.formatMessage({ id: `project.${id}` });
+  // 独立 Web / 手机远控下“本地”设备实际是当前服务器 Host；桌面端保持“此电脑”。
+  const serverHosted = useIsServerHostedSettingsScope();
+  const localDeviceLabel = serverHosted
+    ? intl.formatMessage({ id: "settings.scope.server" })
+    : msg("thisComputer");
   const [name, setName] = useState(
     project?.name ?? (fixedFolder ? getPathLeaf(fixedFolder.path) : ""),
   );
@@ -207,11 +221,13 @@ export function ProjectEditor({
   };
   const addRoots = (values: string[]) => {
     if (remote && project) return;
-    const next = remote
+    // 真实远端 Source / 桌面远控最多保留 1 个目录，防止选多个目录触发后端 remote-single-root-required；
+    // 独立云端 Web 允许累积多个 root（后端 allowStandaloneMultiRoot 同步放开）。
+    const next = singleRootMode
       ? values.filter(Boolean).slice(0, 1)
       : [...new Set([...roots, ...values.filter(Boolean)])];
     setRoots(next);
-    if (remote || !roots.length) setPrimary(next[0] ?? "");
+    if (singleRootMode || !roots.length) setPrimary(next[0] ?? "");
     setBrowsing(false);
   };
   const browse = async () => {
@@ -396,6 +412,12 @@ export function ProjectEditor({
   };
   const browserEpoch = epoch.current;
   const needsConnection = remote && Boolean(devices) && selectedDevice?.status !== "online";
+  // 目录编辑入口：真实远端既有项目 root 固定不可改；本地 / 独立 Web 可增删。
+  const canEditFolders = !fixedFolder && (!singleRootMode || !project);
+  // 修复原因：与官方桌面一致，允许把最后一个目录移除后保存为 0 目录空态；
+  // 后端已按 roots: [] 清空目录，不再需要屏蔽独立 Web 的最后一个移除入口。
+  // 真实远端 remote 的 canEditFolders 为 false，仍不可移除。
+  const canRemoveRoot = canEditFolders;
   return (
     <Dialog
       open={!suspended}
@@ -442,6 +464,8 @@ export function ProjectEditor({
                 data-testid="virtual-project-directory-browser"
               >
                 <DirectoryBrowser
+                  // 独立云端的项目位于 /workspace；只指定浏览起点，保留 HOME 和远端目录语义。
+                  initialPath={isStandaloneWeb ? "/workspace" : undefined}
                   embedded
                   showSelectionActions
                   selectLabel={msg("browse")}
@@ -503,7 +527,7 @@ export function ProjectEditor({
                           <DeviceOption
                             label={
                               selectedDeviceId === "local"
-                                ? msg("thisComputer")
+                                ? localDeviceLabel
                                 : (selectedDevice?.label ?? selectedDeviceId)
                             }
                             status={
@@ -516,7 +540,7 @@ export function ProjectEditor({
                       </SelectTrigger>
                       <SelectContent position="popper" className="w-(--radix-select-trigger-width)">
                         <SelectItem value="local" data-device-id="local" className={DEVICE_ITEM}>
-                          <DeviceOption label={msg("thisComputer")} />
+                          <DeviceOption label={localDeviceLabel} />
                         </SelectItem>
                         {devices.map((device) => (
                           <SelectItem
@@ -605,7 +629,7 @@ export function ProjectEditor({
                             {msg("setPrimary")}
                           </Button>
                         )}
-                        {!fixedFolder && (!remote || !project) ? (
+                        {canRemoveRoot ? (
                           <Button
                             size="icon-sm"
                             variant="ghost"
@@ -623,7 +647,7 @@ export function ProjectEditor({
                         ) : null}
                       </div>
                     ))}
-                    {!fixedFolder && (!remote || !project) ? (
+                    {canEditFolders ? (
                       <button
                         type="button"
                         data-testid="virtual-project-browse"

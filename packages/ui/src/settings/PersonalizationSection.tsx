@@ -126,7 +126,7 @@ const usePersonalizationDraftStore = create<PersonalizationDraftState>((set, get
 /**
  * 个性化（用户自定义指令）编辑页，单层直达：标题（框架渲染）→ 说明 → 直接铺在页面上的编辑器。
  * 唯一事实源是 `~/.zcode/AGENTS.md`（CLI 用户级默认指令，注入所有会话）。
- * 仅桌面本地入口渲染编辑器（Web 远控给本地端指引，不发起任何读写）。
+ * 桌面与独立 Web 复用所属 Host 的编辑器；官方 relay 远控仍只给本地端指引。
  * 显式「保存/取消」：保存仅脏态且未超限可用，取消丢弃修改恢复基线；Ctrl/Cmd+S 等价保存。
  * 表单状态在模块级 store，保存中切走分区后写入失败草稿仍可恢复重试。
  * 读取成功前禁用编辑（失败给重试入口）；内容超过 Agent 读取上限（100KB）时阻断保存并提示。
@@ -135,19 +135,21 @@ const usePersonalizationDraftStore = create<PersonalizationDraftState>((set, get
 export function PersonalizationSection({
   settingService,
   isDesktop = false,
+  isStandaloneWeb = false,
 }: {
   settingService: PersonalizationSettingService;
-  /** 仅桌面本地入口可编辑：手机远控的 base services 可能归属远程 Source
-   *（remoteWorkspaceServiceCollection 把远程 Source 的 settingService 注册进该
-   * workspace 的服务集合，文件路径不是跨机器身份），编辑会写错机器。 */
   isDesktop?: boolean;
+  /** 独立 Web 的 base Host 属于服务器；官方 relay 远控不能启用该入口。 */
+  isStandaloneWeb?: boolean;
 }) {
-  // Web 远控不发起任何个性化读写，只给本地桌面端指引（同 WorkspaceFileSearchSection
-  // 的无 workspace 分层先例：提前返回，不挂服务解析 hook 链）。
-  if (!isDesktop) {
+  // 官方 relay 的 base services 可能归属远程 Source，保留上游边界；独立 Web
+  // 通过服务器 base Host 读写同一用户指令文件，无需桌面端或另一条写入路径。
+  if (!isDesktop && !isStandaloneWeb) {
     return <LocalOnlyPersonalizationHint />;
   }
-  return <DesktopPersonalizationEditor settingService={settingService} />;
+  return (
+    <HostPersonalizationEditor settingService={settingService} isStandaloneWeb={isStandaloneWeb} />
+  );
 }
 
 function LocalOnlyPersonalizationHint() {
@@ -159,10 +161,12 @@ function LocalOnlyPersonalizationHint() {
   );
 }
 
-function DesktopPersonalizationEditor({
+function HostPersonalizationEditor({
   settingService,
+  isStandaloneWeb,
 }: {
   settingService: PersonalizationSettingService;
+  isStandaloneWeb: boolean;
 }) {
   const { intl } = useZCodeIntl();
   const readState = usePersonalizationDraftStore((state) => state.readState);
@@ -221,7 +225,11 @@ function DesktopPersonalizationEditor({
     // 编辑器直接铺在页面背景上（同参照界面）；指令是自然语言，不用等宽字体。
     <div className="space-y-4">
       <p className="text-ui-base text-foreground-subtle">
-        {intl.formatMessage({ id: "settings.personalization.description" })}
+        {intl.formatMessage({
+          id: isStandaloneWeb
+            ? "settings.personalization.serverDescription"
+            : "settings.personalization.description",
+        })}
       </p>
       {readState === "error" ? (
         <div className="space-y-2">

@@ -4,7 +4,7 @@
  */
 export const webPlatformModule = {
   id: "web-platform",
-  requires: ["shared", "ui", "web"],
+  requires: ["shared", "ui", "web", "web-push-shared"],
   provides: ["web-platform"],
   publicEntrypoints: ["index.ts", "contract.ts"],
 } as const;

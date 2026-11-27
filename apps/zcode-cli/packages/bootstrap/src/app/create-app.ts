@@ -161,16 +161,9 @@ function decodePromptAttachmentDataUrl(
   ) {
     throw new Error("fault.attachment.previewArtifactInvalid");
   }
-  if (
-    !mediaType.startsWith("image/") &&
-    !mediaType.startsWith("video/") &&
-    mediaType !== "application/pdf" &&
-    // 根因：文本材料复用上传 artifact，但原 data URL 解码器仅接受媒体，合法预览被二次拒绝。
-    !(
-      mediaType === "text/plain" &&
-      fallbackMime.split(";", 1)[0]?.trim().toLowerCase() === "text/plain"
-    )
-  ) {
+  // 修复原因：仅白名单媒体和 text/plain 会拒绝 .zip/.docx/.json 等普通上传文件 artifact 的
+  // 内部字节解码；放开合法 type/subtype MIME 解码，媒体预览白名单继续由 v4-gateway.ts 把关。
+  if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mediaType)) {
     throw new Error("fault.attachment.previewNotMedia");
   }
   const bytes = Buffer.from(payload, "base64");

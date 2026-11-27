@@ -16,13 +16,15 @@
 
 ## 2. 删除模型反馈必须对应实际操作
 
-现象：删除模型成功后显示“保存成功”。当前 `InlineEditableProviderCard.tsx` 的删除路径复用了 `runSaveOperation` 的保存文案。
+现象：删除模型成功后显示“保存成功”。当前 `InlineEditableProviderCard.tsx` 的删除路径复用了 `runSaveOperation` 的保存文案。此外，从 `runSaveOperation` 实际逻辑可复现：当共享单一 `draftRevision` 时，连续删除两个不同模型（均成功）或在删除在途期间修改 Provider 草稿，后一次操作递增 `draftRevision` 会使前一次删除完成回调被抑制，导致旧 `正在删除模型…`（`pending`）横幅残留不消失（上游 3.18.2 未改动该处代码）。
 
 - 共用现有操作反馈机制，但为删除区分进行中、成功、失败文案，中英文一起调整；保存操作仍使用保存文案。
 - 保留目标 Provider／模型身份，不能删除了 A 却显示 B 的结果。
+- 反馈生命周期按目标 `provider/model` 通知 key（`provider-save:<providerId>`、`model-save:<providerId>:<modelId>`）及该 key 的操作实例拥有；Provider 表单的 `draftRevision` 仅保护草稿自身，不同通知 key 之间互不抑制，同一通知 key 下较早的旧操作完成不覆盖新操作实例。
 - 失败重试必须重试原删除操作，不转成保存，不影响其他操作的提示。
 - 只在删除确实成功后显示成功；失败时保留当前错误与既有可重试语义。
-- 不新增平行的 Toast 系统，不借文案修复重做保存事务。
+- 不新增平行的 Toast 系统，不借文案修复重做保存事务，不新增后端写入队列或超时机制。
+- 回归场景须覆盖：不同模型并发删除/保存（成功与失败组合）、同一模型重复操作/重试的旧完成隔离，以及模型操作在途期间发生 Provider 草稿修改不遗留 `pending` 提示。
 
 ## 3. 连接测试提示的关闭入口一致
 

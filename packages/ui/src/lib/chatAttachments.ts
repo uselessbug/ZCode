@@ -9,6 +9,7 @@ import { PROTOCOL_V4_LIMITS } from "@zcode/shared/zcode-protocol-v4";
 import {
   MissingInlineImageContentError,
   MissingInlinePdfContentError,
+  OversizedInlineFileAttachmentError,
   OversizedInlineImageAttachmentError,
   OversizedInlinePdfAttachmentError,
   OversizedInlineVideoAttachmentError,
@@ -18,12 +19,12 @@ import {
   countClipboardTextLines,
   createClipboardTextAttachmentFilename,
   inferAttachmentMimeType,
-  isTextLikeAttachment,
 } from "@/lib/chatAttachmentMetadata.js";
 
 export {
   MissingInlineImageContentError,
   MissingInlinePdfContentError,
+  OversizedInlineFileAttachmentError,
   OversizedInlineImageAttachmentError,
   OversizedInlinePdfAttachmentError,
   OversizedInlineVideoAttachmentError,
@@ -41,7 +42,6 @@ const INLINE_VIDEO_ATTACHMENT_MAX_BYTES = Math.min(
   VIDEO_INPUT_MAX_BYTES,
   PROTOCOL_V4_LIMITS.attachmentMaxBytes,
 );
-const INLINE_TEXT_ATTACHMENT_MAX_CHARS = 64 * 1024;
 
 export type ChatComposerAttachmentSourceKind = "clipboard-text" | "topic-history";
 
@@ -422,16 +422,24 @@ export async function serializeChatComposerAttachment(
     };
   }
 
-  const textContent =
-    attachment.file && isTextLikeAttachment(attachment)
-      ? await readAttachmentText(attachment.file)
-      : undefined;
+  // 修复原因：独立 Web / 手机网页没有 localPath 时，旧逻辑只对“文本类”扩展名读 textContent 并按 64K 字符截断，
+  // 其余二进制（.zip/.docx 等）只发送元信息，Agent 实际拿不到文件内容。
+  // 修复依据：与 image/video/pdf 一致，统一读取真实字节经 V4 begin/chunk/commit 上传，
+  // 大小以 V4 附件上限为界，超限在读取字节前抛结构化错误交给 UI 按 locale 展示。
+  if (attachment.sizeBytes > PROTOCOL_V4_LIMITS.attachmentMaxBytes) {
+    throw new OversizedInlineFileAttachmentError({
+      filename: attachment.filename,
+      maxSizeBytes: PROTOCOL_V4_LIMITS.attachmentMaxBytes,
+      sizeBytes: attachment.sizeBytes,
+    });
+  }
+  const dataBase64 = await readAttachmentBase64(attachment);
   return {
     kind: "file",
     filename: attachment.filename,
     mimeType,
+    dataBase64,
     sizeBytes: attachment.sizeBytes,
-    ...(textContent !== undefined ? { textContent } : {}),
     ...(attachment.sourceKind
       ? { sourceKind: attachment.sourceKind, messageCount: attachment.messageCount }
       : {}),
@@ -442,6 +450,10 @@ async function readAttachmentBase64(attachment: ChatComposerAttachment): Promise
   if (!attachment.file) {
     throw new Error("附件缺少可读取内容");
   }
+  // 修复原因：Chromium 的 FileReader.readAsDataURL 对 0 字节 Blob 返回不含逗号的 "data:"，
+  // 会被下面误判为“数据格式不正确”，导致 .gitkeep 等空文件无法发送。
+  // 修复依据：空文件的 base64 本就是空串，直接返回，由上传层按 totalBytes=0/totalChunks=0 处理。
+  if (attachment.file.size === 0) return "";
   const dataUrl = await readFileAsDataUrl(attachment.file);
   const base64MarkerIndex = dataUrl.indexOf(",");
   if (base64MarkerIndex === -1) {
@@ -472,11 +484,4 @@ export function isPdfChatComposerAttachment(attachment: ChatComposerAttachment):
 /** 图片与视频同属媒体组：输入框与消息流统一按媒体卡片渲染。 */
 export function isMediaChatComposerAttachment(attachment: ChatComposerAttachment): boolean {
   return isImageChatComposerAttachment(attachment) || isVideoChatComposerAttachment(attachment);
-}
-
-async function readAttachmentText(file: File): Promise<string> {
-  const text = await file.text();
-  return text.length > INLINE_TEXT_ATTACHMENT_MAX_CHARS
-    ? `${text.slice(0, INLINE_TEXT_ATTACHMENT_MAX_CHARS)}\n\n[内容过长，已截断]`
-    : text;
 }

@@ -40,6 +40,45 @@ export interface AutomationsNavigationTarget {
   automationTab?: AutomationsNavigationTab;
 }
 
+/** 系统通知点击后的任务导航请求：由 Root 解析目标 workspace 后发给工作台壳层执行。 */
+export interface NotificationTaskNavigationRequest {
+  workspacePath: string;
+  workspaceIdentity?: string;
+  taskId: string;
+  /** 窄屏单栏壳层需要同时从 Home 切到 Chat。 */
+  revealChat: boolean;
+}
+
+// 单槽缓冲：冷启动时 Root 可能早于工作台壳层挂载发出请求；壳层订阅时立即消费。
+// 只保留最后一次点击，更早未消费的请求已被用户新的点击取代。
+let pendingNotificationTaskNavigation: NotificationTaskNavigationRequest | null = null;
+let notificationTaskNavigationHandler:
+  | ((request: NotificationTaskNavigationRequest) => void)
+  | null = null;
+
+export function requestNotificationTaskNavigation(
+  request: NotificationTaskNavigationRequest,
+): void {
+  if (notificationTaskNavigationHandler) {
+    notificationTaskNavigationHandler(request);
+    return;
+  }
+  pendingNotificationTaskNavigation = request;
+}
+
+/** 注册唯一的通知导航执行者，并立即消费已缓冲的请求；返回取消订阅函数。 */
+export function subscribeNotificationTaskNavigation(
+  handler: (request: NotificationTaskNavigationRequest) => void,
+): () => void {
+  notificationTaskNavigationHandler = handler;
+  const pending = pendingNotificationTaskNavigation;
+  pendingNotificationTaskNavigation = null;
+  if (pending) handler(pending);
+  return () => {
+    if (notificationTaskNavigationHandler === handler) notificationTaskNavigationHandler = null;
+  };
+}
+
 export function useWorkspaceTaskNavigation({
   intl,
   workspaceAbsPath,

@@ -45,11 +45,16 @@ import type {
 import { ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE } from "./zcodeAgent.js";
 import { formatTaskMetaModelSelectionFromSnapshot } from "./zcodeConfigOptions.js";
 
+import {
+  closeTaskBrowserSessionsBestEffort,
+  type BrowserAmbientContextExecutor,
+} from "./zcodeAgentBrowserAmbientContext.js";
 import { createTaskFacts, type TaskFactMutation } from "#src/task-facts/index.js";
 import {
   assertV4CommandAckOk,
   createHostCommandEnvelope,
 } from "#src/zcode-agent/zcodeV4HostCommand.js";
+import type { IWebPushService } from "#src/web-push/contract.js";
 
 const logger = createServiceLogger("zcode-task-index-syncer");
 
@@ -60,6 +65,7 @@ const MAX_PENDING_TOPIC_BYTES = 32 * 1024 * 1024;
 const INITIAL_BASELINE_SEED_BATCH_SIZE = 64;
 const PROVIDER_NOT_READY_RETRY_MS = 5_000;
 const TOPIC_SUBSCRIBE_WARN_INTERVAL_MS = 60_000;
+const INTERACTION_DETAIL_WAIT_MS = 50;
 
 type TopicSubscribeReason =
   | "initial"
@@ -87,6 +93,13 @@ export interface ZCodeTaskIndexTerminalEvent {
   target: ZCodeAgentSessionTarget;
   /** v4 phase 终态映射：completedSuccess/completedInterrupted → turn.completed；error → turn.failed。 */
   kind: "turn.completed" | "turn.failed";
+  /** phase === "completedInterrupted" 时为 true，供定时任务区分正常完成与用户主动中断。 */
+  interrupted?: boolean;
+  /**
+   * 触发这次终态迁移的稳定终态时间戳（summary.terminalAt ?? summary.lastActivityAt）。
+   * 会话终态 Web Push 用同一个值构造事件键，定时任务结算沿用它，使二者与页内通知合并为同一回合。
+   */
+  terminalAt?: number;
 }
 
 export interface ZCodeTaskIndexReadyEvent {
@@ -168,6 +181,11 @@ export interface ZCodeTaskIndexSyncer {
   onSessionReadyEvent: Event<ZCodeTaskIndexReadyEvent>;
   /** 仅观察已经存在的订阅，不为自动归档创建 runtime 或第二份 phase 状态。 */
   activeTaskRefs(): Array<{ workspacePath: string; workspaceIdentity?: string; taskId: string }>;
+  /** 读取已缓存的 sessions-index 会话摘要（仅只读观察，不拉起 CLI）。 */
+  getSessionSummary(
+    workspace: ZCodeAgentWorkspaceTarget,
+    sessionId: string,
+  ): SessionSummary | undefined;
   /** 释放所有 v4 订阅和 workspace emitter；不关闭注入的 taskIndexRepo。 */
   disposeAll(): void;
 }
@@ -176,6 +194,15 @@ interface CreateZCodeTaskIndexSyncerOptions {
   agentService: IZCodeAgentService;
   taskIndexRepo: TaskIndexRepo;
   reportActiveSessionCount?: (count: number) => void;
+  browserControlExecutor?: BrowserAmbientContextExecutor;
+  webPushService?: Pick<
+    IWebPushService,
+    | "notifySessionEvent"
+    | "cancelPendingInteractionNotification"
+    | "clearAutomationOwnedSessionTurn"
+    | "consumeAutomationOwnedSessionTurn"
+  >;
+  resolveInteractionDetail?: (interactionId: string) => string | undefined;
 }
 
 /** phase 终态集合（sessions-index 的 conflated 最新态里判定迁移用）。 */
@@ -272,7 +299,7 @@ interface PendingTopicFrames<TFrame> {
 export function createZCodeTaskIndexSyncer(
   options: CreateZCodeTaskIndexSyncerOptions,
 ): ZCodeTaskIndexSyncer {
-  const { agentService, taskIndexRepo } = options;
+  const { agentService, taskIndexRepo, webPushService } = options;
   // task index 的事件摄入从旧协议 shadow 订阅（session/subscribe +
   // session/event + state.updated）整体迁到 v4 帧——sessions-index topic 提供
   // status(phase)/title/lastActivity 的 workspace 级 conflated 最新态，
@@ -306,7 +333,15 @@ export function createZCodeTaskIndexSyncer(
   const workspaceEmitters = new Map<string, Emitter<ZCodeWorkspaceEvent>>();
   const terminalEventEmitter = new Emitter<ZCodeTaskIndexTerminalEvent>();
   const readyEventEmitter = new Emitter<ZCodeTaskIndexReadyEvent>();
+  const pendingInteractionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let disposed = false;
+
+  const clearPendingInteractionTimer = (interactionId: string): void => {
+    const timer = pendingInteractionTimers.get(interactionId);
+    if (!timer) return;
+    clearTimeout(timer);
+    pendingInteractionTimers.delete(interactionId);
+  };
 
   const indexTopicFor = (state: WorkspaceIngestState) =>
     sessionsIndexTopic(resolveWorkspaceKey(state.target));
@@ -497,7 +532,7 @@ export function createZCodeTaskIndexSyncer(
     options?: {
       unreadSignal?: ZCodeWorkspaceTaskListChanged["unreadSignal"];
     },
-  ): Promise<void> {
+  ): Promise<ZCodeSessionStateSnapshot | null> {
     try {
       // task-index 是被动观察者，只能读取现有 runtime。调用 resumeSession
       // 会在用户下一轮 prompt 已被 Core 接受后重新 materialize/resume 同一 session，
@@ -517,12 +552,14 @@ export function createZCodeTaskIndexSyncer(
         ...(options?.unreadSignal ? { unreadSignal: options.unreadSignal } : {}),
         broadcastReason: "task_status_changed",
       });
+      return snapshot;
     } catch (error) {
       logger.warn(
         undefined,
         `回源同步 task index 行失败 reason=${reason} taskId=${target.sessionId}`,
         error,
       );
+      return null;
     }
   }
 
@@ -548,10 +585,14 @@ export function createZCodeTaskIndexSyncer(
   function emitTerminalAndReady(target: ZCodeAgentSessionTarget, summary: SessionSummary): void {
     const phase = summary.phase;
     const failed = phase === "error";
+    const interrupted = phase === "completedInterrupted";
+    const terminalAt = summary.terminalAt ?? summary.lastActivityAt;
     // 顺序保持旧协议语义：先 turn 终态（收口当前 input），再 prompt ready（放行下一条）。
     terminalEventEmitter.fire({
       target,
       kind: failed ? "turn.failed" : "turn.completed",
+      ...(interrupted ? { interrupted: true } : {}),
+      terminalAt,
     });
     readyEventEmitter.fire({
       target,
@@ -610,18 +651,32 @@ export function createZCodeTaskIndexSyncer(
 
   const refreshSessionFacts = (target: ZCodeAgentSessionTarget) =>
     taskFacts.refresh({ ...target, taskId: target.sessionId });
-  const mutateSessionFacts = (target: ZCodeAgentSessionTarget, intent: TaskFactMutation) =>
-    taskFacts.mutate({ ...target, taskId: target.sessionId }, intent);
+  const mutateSessionFacts = async (target: ZCodeAgentSessionTarget, intent: TaskFactMutation) => {
+    const meta = await taskFacts.mutate({ ...target, taskId: target.sessionId }, intent);
+    if (intent.type === "delete") {
+      await closeTaskBrowserSessionsBestEffort(
+        options.browserControlExecutor,
+        {
+          workspacePath: target.workspacePath,
+          ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+          sessionIds: [target.sessionId],
+        },
+        (error) =>
+          logger.warn(undefined, "任务删除后回收浏览器会话失败", {
+            taskId: target.sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+      );
+    }
+    return meta;
+  };
   const mirrorSummary = taskFacts.ingest;
 
   /** phase 终态迁移 → sqlite status 收敛 + 广播 + 回源正文索引。 */
-  function applyTerminalTransition(
-    target: ZCodeAgentSessionTarget,
-    summary: SessionSummary,
-    options?: { captureRepoSnapshot?: boolean },
-  ): void {
+  function applyTerminalTransition(target: ZCodeAgentSessionTarget, summary: SessionSummary): void {
     emitTerminalAndReady(target, summary);
     const failed = summary.phase === "error";
+    const terminalAt = summary.terminalAt ?? summary.lastActivityAt;
     const unreadSignal = resolveTerminalUnreadSignal(summary);
     logger.debug(undefined, "task 终态未读裁决", {
       goalStatus: summary.goalStatus ?? null,
@@ -629,6 +684,43 @@ export function createZCodeTaskIndexSyncer(
       taskId: target.sessionId,
       unreadSignal: unreadSignal ?? null,
     });
+    let suppressTaskFailedPush = false;
+    if (webPushService) {
+      if (summary.phase === "completedSuccess") {
+        const sessionTitle = summary.title.trim();
+        webPushService.notifySessionEvent({
+          kind: "task_completed",
+          eventId: `session:${target.sessionId}:${terminalAt}:task_completed`,
+          sessionId: target.sessionId,
+          ...(sessionTitle ? { sessionTitle } : {}),
+          workspacePath: target.workspacePath,
+          ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+          terminalAt,
+          occurredAt: summary.lastActivityAt,
+        });
+      } else if (failed && webPushService.consumeAutomationOwnedSessionTurn) {
+        suppressTaskFailedPush = webPushService.consumeAutomationOwnedSessionTurn(target.sessionId);
+      }
+    }
+    const emitTaskFailedWebPush = (detail?: string, snapshotTitle?: string): void => {
+      if (!webPushService || !failed || suppressTaskFailedPush) return;
+      const sessionTitle = summary.title.trim() || snapshotTitle?.trim() || "";
+      const cleanDetail = detail?.trim() || "";
+      webPushService.notifySessionEvent({
+        kind: "task_failed",
+        eventId: `session:${target.sessionId}:${terminalAt}:task_failed`,
+        sessionId: target.sessionId,
+        ...(sessionTitle ? { sessionTitle } : {}),
+        ...(cleanDetail ? { detail: cleanDetail } : {}),
+        workspacePath: target.workspacePath,
+        ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+        terminalAt,
+        occurredAt: summary.lastActivityAt,
+        ...(webPushService.consumeAutomationOwnedSessionTurn
+          ? { skipAutomationTurnCheck: true }
+          : {}),
+      });
+    };
     // 活动时间和终态来自 CLI；Host 收帧时间不能把历史任务重新排到顶部。
     void mirrorSummary(target, summary)
       .then((meta) => {
@@ -648,11 +740,18 @@ export function createZCodeTaskIndexSyncer(
         // 终态读取完整 snapshot：v4 命令路径（createSession/sendText 走 v4/command）
         // 不经过 zcodeSessionService 的 op 驱动 snapshot 同步，行缺失/正文搜索/lastError
         // 全靠这里收敛；readSession(existing-only) 只读现有 runtime，不重新恢复 session。
-        void resyncTaskIndexRowFromAgent(target, failed ? "phase.error" : "phase.completed", {
-          // 修复原因：patch 已广播时不能让随后的 snapshot 回源再次制造完成提醒；
-          // 行缺失时则把同一 signal 交给回源结果，保证提醒既不丢也不重复。
-          ...(meta || !unreadSignal ? {} : { unreadSignal }),
-        });
+        void resyncTaskIndexRowFromAgent(
+          target,
+          failed ? "phase.error" : "phase.completed",
+          meta || !unreadSignal ? {} : { unreadSignal },
+        ).then(
+          (snapshot) => {
+            emitTaskFailedWebPush(snapshot?.projection.lastError?.message, snapshot?.session.title);
+          },
+          () => {
+            emitTaskFailedWebPush();
+          },
+        );
       })
       .catch((error) => {
         logger.warn(
@@ -660,6 +759,7 @@ export function createZCodeTaskIndexSyncer(
           `同步 v4 phase 终态到 task index 失败 taskId=${target.sessionId}`,
           error,
         );
+        emitTaskFailedWebPush();
       });
   }
 
@@ -693,24 +793,108 @@ export function createZCodeTaskIndexSyncer(
     state: WorkspaceIngestState,
     previous: SessionSummary | undefined,
     next: SessionSummary,
-    _deliveryKind: TopicDeliveryKind,
+    deliveryKind: TopicDeliveryKind,
   ): void {
     state.summaries.set(next.sessionId, next);
+    if (webPushService) {
+      const prevPending = previous?.pendingInteraction;
+      const nextPending = next.pendingInteraction;
+      const requiresManualInteraction = (
+        pending: SessionSummary["pendingInteraction"] | undefined,
+      ): pending is NonNullable<SessionSummary["pendingInteraction"]> =>
+        Boolean(pending && (!pending.autoResolution || pending.autoResolution.state === "snoozed"));
+
+      const emitManualInteractionPush = (
+        session: SessionSummary,
+        pending: NonNullable<SessionSummary["pendingInteraction"]>,
+      ): void => {
+        const sessionTitle = session.title.trim();
+        const detail = options.resolveInteractionDetail?.(pending.interactionId)?.trim();
+        const kind =
+          pending.kind === "permission"
+            ? "approval"
+            : pending.toolName === "ExitPlanMode"
+              ? "plan"
+              : "question";
+        webPushService.notifySessionEvent({
+          kind,
+          eventId: `interaction:${pending.interactionId}:open`,
+          sessionId: session.sessionId,
+          ...(sessionTitle ? { sessionTitle } : {}),
+          ...(detail ? { detail } : {}),
+          interactionId: pending.interactionId,
+          workspacePath: state.target.workspacePath,
+          ...(state.target.workspaceIdentity
+            ? { workspaceIdentity: state.target.workspaceIdentity }
+            : {}),
+          occurredAt: session.lastActivityAt,
+        });
+      };
+
+      if (prevPending && prevPending.interactionId !== nextPending?.interactionId) {
+        clearPendingInteractionTimer(prevPending.interactionId);
+        webPushService.cancelPendingInteractionNotification(prevPending.interactionId);
+      }
+      if (isTerminalPhase(next.phase) && nextPending) {
+        clearPendingInteractionTimer(nextPending.interactionId);
+        webPushService.cancelPendingInteractionNotification(nextPending.interactionId);
+      } else if (requiresManualInteraction(nextPending)) {
+        const transitionedToManual =
+          prevPending?.interactionId === nextPending.interactionId &&
+          !requiresManualInteraction(prevPending);
+        const newlyOpenedManual =
+          prevPending?.interactionId !== nextPending.interactionId &&
+          (previous !== undefined || deliveryKind === "online");
+        if (transitionedToManual) {
+          clearPendingInteractionTimer(nextPending.interactionId);
+          emitManualInteractionPush(next, nextPending);
+        } else if (newlyOpenedManual) {
+          const hasImmediateDetail = Boolean(
+            options.resolveInteractionDetail?.(nextPending.interactionId)?.trim(),
+          );
+          if (
+            nextPending.toolName === "SuggestPluginInstall" ||
+            nextPending.autoResolution?.state === "snoozed" ||
+            hasImmediateDetail
+          ) {
+            clearPendingInteractionTimer(nextPending.interactionId);
+            emitManualInteractionPush(next, nextPending);
+          } else if (!pendingInteractionTimers.has(nextPending.interactionId)) {
+            const targetInteractionId = nextPending.interactionId;
+            const targetSessionId = next.sessionId;
+            const timer = setTimeout(() => {
+              pendingInteractionTimers.delete(targetInteractionId);
+              if (disposed || !isLiveState(state)) return;
+              const current = state.summaries.get(targetSessionId);
+              if (
+                current?.pendingInteraction?.interactionId === targetInteractionId &&
+                requiresManualInteraction(current.pendingInteraction) &&
+                !isTerminalPhase(current.phase)
+              ) {
+                emitManualInteractionPush(current, current.pendingInteraction);
+              }
+            }, INTERACTION_DETAIL_WAIT_MS);
+            timer.unref?.();
+            pendingInteractionTimers.set(targetInteractionId, timer);
+          }
+        }
+      }
+    }
     // Bug 根因：CLI 已按 persistence 过滤未提交草稿；已接受输入在初始化期间 phase
     // 仍为 draft。Host 再按执行 phase 过滤，会把新任务推迟到 Hook/TurnStarted 之后。
     const target = sessionTargetFrom(state.target, next.sessionId);
     const becameVisibleTask = previous === undefined;
-    // 终态迁移 = 基线里真实观察到非终态 → 终态。无基线的会话（冷恢复 hydration、
-    // 断档降级后新出现的历史会话）不回放终态；活跃会话必先以 running/prewarming
-    // 进入基线（gateway 每个事件都 fan-out），不会漏掉真实收口。
+    // 终态迁移 = 基线里真实观察到非终态 → 终态，或合并窗口内从上一轮终态进入具有新 terminalAt 的新终态。
+    // 无基线的会话（冷恢复 hydration、断档降级后新出现的历史会话）不回放终态。
     const becameTerminal =
-      previous !== undefined && !isTerminalPhase(previous.phase) && isTerminalPhase(next.phase);
+      previous !== undefined &&
+      isTerminalPhase(next.phase) &&
+      (!isTerminalPhase(previous.phase) ||
+        (previous.terminalAt !== undefined &&
+          next.terminalAt !== undefined &&
+          previous.terminalAt !== next.terminalAt));
     if (becameTerminal) {
-      applyTerminalTransition(target, next, {
-        // Bug 根因：deliveryKind 只描述传输方式，不能证明完成副作用已经执行。state.summaries
-        // 已提供 workspace 生命周期幂等边界；running -> terminal 的 recovery 必须补投。
-        captureRepoSnapshot: true,
-      });
+      applyTerminalTransition(target, next);
       return;
     }
     if (becameVisibleTask) {
@@ -1115,6 +1299,13 @@ export function createZCodeTaskIndexSyncer(
         continue;
       }
       // 只有 CLI 明确删除事件才写删除事实；snapshot 缺席不能据此删除任务。
+      const removedSummary = state.summaries.get(delta.sessionId);
+      if (removedSummary?.pendingInteraction) {
+        clearPendingInteractionTimer(removedSummary.pendingInteraction.interactionId);
+        webPushService?.cancelPendingInteractionNotification(
+          removedSummary.pendingInteraction.interactionId,
+        );
+      }
       state.summaries.delete(delta.sessionId);
       const target = sessionTargetFrom(state.target, delta.sessionId);
       void taskFacts
@@ -1123,6 +1314,21 @@ export function createZCodeTaskIndexSyncer(
           workspaceIdentity: target.workspaceIdentity,
           taskId: delta.sessionId,
         })
+        .then(() =>
+          closeTaskBrowserSessionsBestEffort(
+            options.browserControlExecutor,
+            {
+              workspacePath: target.workspacePath,
+              ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+              sessionIds: [delta.sessionId],
+            },
+            (error) =>
+              logger.warn(undefined, "同步 CLI 删除事实后回收浏览器会话失败", {
+                taskId: delta.sessionId,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+          ),
+        )
         .catch((error) => logger.warn(undefined, "同步 CLI 删除事实失败", error));
     }
     state.indexSeq = frame.toSeq;
@@ -1807,6 +2013,9 @@ export function createZCodeTaskIndexSyncer(
   }
 
   return {
+    getSessionSummary(workspace: ZCodeAgentWorkspaceTarget, sessionId: string) {
+      return workspaceIngests.get(resolveWorkspaceKey(workspace))?.summaries.get(sessionId);
+    },
     activeTaskRefs() {
       return [...workspaceIngests.values()].flatMap((state) =>
         [...state.summaries.values()]
@@ -1847,6 +2056,11 @@ export function createZCodeTaskIndexSyncer(
 
     disposeAll(): void {
       disposed = true;
+      for (const [interactionId, timer] of pendingInteractionTimers) {
+        clearTimeout(timer);
+        webPushService?.cancelPendingInteractionNotification(interactionId);
+      }
+      pendingInteractionTimers.clear();
       for (const state of workspaceIngests.values()) {
         state.indexSubscriptionGeneration += 1;
         state.configSubscriptionGeneration += 1;

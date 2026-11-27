@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -237,6 +237,38 @@ describe("归档永久删除执行面", () => {
     } finally {
       other.close();
     }
+  });
+
+  it("具名子目录同名附件按顶层 artifactId 精确保留与统计待删文件", async () => {
+    const { root, host, db, dir, execute } = await setup();
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(join(dir, "art-keep"), { recursive: true });
+    await mkdir(join(dir, "art-drop"), { recursive: true });
+    await writeFile(join(dir, "art-keep", "报告.txt"), "keep-report");
+    await writeFile(join(dir, "art-drop", "报告.txt"), "drop-report");
+    db.prepare("UPDATE part SET data=? WHERE id='p'").run(
+      JSON.stringify({ url: "zcode-artifact://root/art-keep" }),
+    );
+
+    const preview = await previewSessionDeletionWith(host, params);
+    expect(preview.retainedArtifacts).toHaveLength(1);
+    expect(preview.retainedArtifacts[0]).toMatchObject({
+      artifactId: "art-keep",
+      fileName: "报告.txt",
+    });
+    expect(preview.deletedFiles).toBe(1);
+
+    expect((await execute(preview.revision)).status).toBe("deleted");
+    expect(await readdir(dir)).toEqual(["art-keep"]);
+    expect(await readFile(join(dir, "art-keep", "报告.txt"), "utf8")).toBe("keep-report");
+    const artifacts = new NodeToolArtifactStore({
+      rootDir: join(root, "artifacts"),
+      imageCacheRootDir: join(root, "image-cache"),
+      videoCacheRootDir: join(root, "video-cache"),
+    });
+    expect(
+      (await artifacts.readToolResultArtifact({ uri: "zcode-artifact://root/art-keep" })).content,
+    ).toBe("keep-report");
   });
 });
 

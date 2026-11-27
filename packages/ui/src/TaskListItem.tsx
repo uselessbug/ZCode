@@ -909,6 +909,7 @@ export function TaskListItemContextMenuContent({
   onStartRenameTask,
   onArchiveTask,
   onMarkTaskAsUnread,
+  onOpenTaskFiles,
   disableTaskActions = false,
   disabledReason,
 }: {
@@ -923,6 +924,8 @@ export function TaskListItemContextMenuContent({
   onStartRenameTask: (taskId: string, currentTitle: string) => void;
   onArchiveTask: (taskId: string) => void;
   onMarkTaskAsUnread: (taskId: string) => void;
+  /** 无本机文件管理器（独立 Web）时，菜单「显示文件树」的回调；以菜单所属任务为参数，不传则隐藏。 */
+  onOpenTaskFiles?: (task: ZCodeTaskMeta) => void | Promise<void>;
   disableTaskActions?: boolean;
   disabledReason?: string;
 }) {
@@ -943,6 +946,7 @@ export function TaskListItemContextMenuContent({
     taskNativeSessionLogFile,
     providerConfigFile,
     fileManagerLabel,
+    canOpenLocalFiles,
     handleCopyText,
     handleOpenTaskPathInFileManager,
     handleOpenProviderConfig,
@@ -1007,6 +1011,8 @@ export function TaskListItemContextMenuContent({
       isPinned={isPinned}
       isArchived={isArchived}
       fileManagerLabel={fileManagerLabel}
+      canOpenLocalFiles={canOpenLocalFiles}
+      onOpenTaskFiles={onOpenTaskFiles ? () => void onOpenTaskFiles(task) : undefined}
       taskSessionFile={taskSessionFile}
       activeSessionId={task.taskId}
       taskNativeSessionLogFile={taskNativeSessionLogFile}

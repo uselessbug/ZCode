@@ -5,10 +5,11 @@ The UI package can render and coordinate MCP settings for desktop, web, and mobi
 
 ## Boundary
 
-- `packages/ui` depends on `IPlatformService` for native MCP operations.
-- Desktop implements the MCP platform methods by forwarding to the existing preload bridge.
-- Mobile `/remote` forwards MCP platform requests through the existing shared-host attachment app-payload path to the desktop window that owns the host.
-- Plain web without a desktop attachment returns empty/unsupported fallbacks and must not create an independent Agent runtime or local host.
+- `packages/ui` depends on `IPlatformService` for native MCP operations on local desktop targets, and on `IMcpSyncService` (`McpDirectoryService`) for remote or standalone server Host targets.
+- Desktop implements the MCP platform methods by forwarding to the existing preload bridge (`window.zcode`), preserving local legacy common MCP migration.
+- Mobile `/remote` forwards MCP platform requests through the existing shared-host attachment app-payload path (`platformProxy`) to the desktop window that owns the host.
+- Standalone server Host Web (`packages/web` connected to its own server Host) passes `mcpBaseHostDirectoryService={services.mcpSyncService}` to `<Root>` (bound via `useLayoutEffect` -> `setMcpStorePlatform` with three states: `undefined` for platform mode, `null` for base-required pending fail-closed, or the bound `IMcpSyncService`); targets without `workspaceIdentity` or `authorityKey` read and write the server Host's MCP directory through `IMcpSyncService` and skip browser-local legacy common MCP migration.
+- Plain web without a desktop attachment or bound server Host returns empty/unsupported fallbacks from `IPlatformService` and must not create an independent Agent runtime or local host.
 
 ## Methods
 

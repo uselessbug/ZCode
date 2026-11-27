@@ -1,4 +1,4 @@
-import { ProxyChannel, type IDisposable, type IChannelServer } from "@zcode/rpc";
+import { ProxyChannel, type IChannelServer } from "@zcode/rpc";
 import {
   ServiceCollection,
   type ITerminalService,
@@ -16,7 +16,10 @@ import {
   type ServiceExposurePolicy,
   type ZCodeAgentV4ClientMode,
 } from "@zcode/services";
+import { createTerminalScope } from "@zcode/services/node";
 import { ServiceChannels } from "@zcode/shared";
+
+export { createTerminalScope };
 
 const WEB_REMOTE_REPLAYABLE_ALLOWED_CHANNELS = new Set<string>([
   ServiceChannels.File,
@@ -236,78 +239,6 @@ export function createWindowHostTerminalOwners(onCleanupError: (error: unknown) 
         current.scopes.set(scopeKey, scope);
       }
       return scope.service;
-    },
-  };
-}
-
-/** 旧客户端没有页面 owner 时按 attachment 回收，避免继续产生无主 PTY。 */
-export function createTerminalScope(
-  base: ITerminalService,
-  onCleanupError: (error: unknown) => void,
-) {
-  let active = true;
-  const terminals = new Map<string, IDisposable>();
-  function assertActive(id?: string): void {
-    if (!active || (id !== undefined && !terminals.has(id))) {
-      throw new Error("Terminal owner has ended or does not own this terminal");
-    }
-  }
-  const release = async (id: string) => {
-    await base.dispose({ id });
-    terminals.get(id)?.dispose();
-    terminals.delete(id);
-  };
-  const service: ITerminalService = {
-    async create(params) {
-      assertActive();
-      const result = await base.create(params);
-      // create 跨 RPC/加载 await；owner 已结束时必须回收返回的真实 PTY，不能只丢响应。
-      if (!active) {
-        await base.dispose({ id: result.id });
-        throw new Error("Terminal owner has ended");
-      }
-      const subscription = base.onDynamicExit(result.id)(() => {
-        terminals.get(result.id)?.dispose();
-        terminals.delete(result.id);
-      });
-      terminals.set(result.id, subscription);
-      return result;
-    },
-    async write(params) {
-      assertActive(params.id);
-      await base.write(params);
-    },
-    async resize(params) {
-      assertActive(params.id);
-      await base.resize(params);
-    },
-    async dispose({ id }) {
-      if (!active || !terminals.has(id)) return;
-      await release(id);
-    },
-    async listTerminalIdsUnderPath(params) {
-      assertActive();
-      // attachment 只能看到自己创建的终端，不能借查询枚举 Host 上其他 owner 的终端。
-      return (await base.listTerminalIdsUnderPath(params)).filter((id) => terminals.has(id));
-    },
-    onDynamicData(id) {
-      assertActive(id);
-      return base.onDynamicData(id);
-    },
-    onDynamicExit(id) {
-      assertActive(id);
-      return base.onDynamicExit(id);
-    },
-  };
-  return {
-    service,
-    dispose(): void {
-      if (!active) return;
-      active = false;
-      for (const [id, subscription] of terminals) {
-        subscription.dispose();
-        void release(id).catch(onCleanupError);
-      }
     },
   };
 }

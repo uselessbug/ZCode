@@ -7,11 +7,21 @@ import {
   type RemoteTarget,
   type WebRemoteControlStatus,
 } from "@zcode/shared";
-import { playTaskNotificationSound } from "@zcode/ui";
+import {
+  isTaskNotificationEnabled,
+  isTaskNotificationSoundEnabled,
+  playTaskNotificationSound,
+} from "@zcode/ui";
 import { resolveWebCommunityUrl, resolveWebHelpConfig } from "#src/communityUrl.js";
 import type { WebRemoteControlPlatformProxy } from "#src/platform/contract.js";
 import { saveBrowserFile } from "#src/platform/saveBrowserFile.js";
+import {
+  createWebNotificationController,
+  type NotificationClickTarget,
+} from "#src/platform/webNotifications.js";
 export type { WebRemoteControlPlatformProxy } from "#src/platform/contract.js";
+export { consumeNotificationDeepLink } from "#src/platform/webNotifications.js";
+export type { NotificationClickTarget } from "#src/platform/webNotifications.js";
 
 async function resolveFeedbackUrl(): Promise<string | undefined> {
   return (await resolveWebHelpConfig()).feedback_url;
@@ -19,8 +29,21 @@ async function resolveFeedbackUrl(): Promise<string | undefined> {
 
 export function createWebPlatform(options?: {
   externalWebRemoteControlProxy?: WebRemoteControlPlatformProxy;
+  /** 通知深链带来的冷启动目标，Root 注册点击监听后派发。 */
+  initialNotificationTarget?: NotificationClickTarget | null;
+  /** 独立 Web 把 Agent 回复语言写回当前服务器；手机远控代理页不挂载，设置页保持“请在本机设置”。 */
+  setReplyLanguage?: (language: string) => Promise<void>;
 }): IPlatformService {
   const platformProxy = options?.externalWebRemoteControlProxy;
+  const settingsChangedListeners = new Set<() => void>();
+  // 远控页没有独立 Server 的 /api/web-push，只保留页内通知；独立 Web 由 /api/web-push/config 判断是否可用。
+  const notifications = createWebNotificationController({
+    pushEnabled: !platformProxy,
+    playSound: playTaskNotificationSound,
+    isEnabled: isTaskNotificationEnabled,
+    isSoundEnabled: isTaskNotificationSoundEnabled,
+    initialTarget: options?.initialNotificationTarget,
+  });
 
   return {
     canSelectFilePath: false,
@@ -144,7 +167,7 @@ export function createWebPlatform(options?: {
     onOAuthCallback: () => () => {},
     onPaymentCallback: () => () => {},
     onShareImport: () => () => {},
-    notifyRendererReady: () => {},
+    notifyRendererReady: notifications.notifyRendererReady,
     reportTelemetryEvent: async (event) => {
       // 手机只开放 session_create 和插件发现事件；管理结果仍由 Desktop Host 唯一上报。
       const parsed = sessionCreateTelemetrySchema
@@ -153,33 +176,33 @@ export function createWebPlatform(options?: {
       if (parsed.success) platformProxy?.reportTelemetryEvent?.(parsed.data);
     },
     reportArmsCustomEvent: () => Promise.resolve(),
-    showTaskNotification: (payload) => {
-      if (document.hasFocus()) {
-        return;
-      }
-
-      if (
-        typeof window.Notification === "undefined" ||
-        window.Notification.permission !== "granted"
-      ) {
-        return;
-      }
-
-      try {
-        new window.Notification(payload.title, {
-          body: payload.body,
-          silent: true,
-        });
-        void playTaskNotificationSound();
-      } catch {
-        // 浏览器通知不可用时静默忽略，避免打断主流程
-      }
-    },
-    // Web 端不需要跨窗口 tab 管理
-    syncWindowTabs: () => {},
+    showTaskNotification: notifications.showTaskNotification,
+    getWebNotificationState: notifications.getWebNotificationState,
+    onWebNotificationStateChanged: notifications.onWebNotificationStateChanged,
+    requestWebNotificationPermission: notifications.requestWebNotificationPermission,
+    ...(platformProxy ? {} : { setWebPushSubscribed: notifications.setWebPushSubscribed }),
+    // 未传回调（或远控代理页）时保持 undefined，设置页据此显示“请在本机设置”。
+    // 保存成功后通知 onSettingsChanged 监听者刷新设置页快照，对齐桌面端 applyReplyLanguage 行为。
+    ...(!platformProxy && options?.setReplyLanguage
+      ? {
+          setReplyLanguage: async (language: string) => {
+            await options.setReplyLanguage!(language);
+            for (const listener of settingsChangedListeners) listener();
+          },
+          onSettingsChanged: (callback: () => void) => {
+            settingsChangedListeners.add(callback);
+            return () => {
+              settingsChangedListeners.delete(callback);
+            };
+          },
+        }
+      : {}),
+    // Web 端没有跨窗口 tab 管理；这里只把本页的工作区快照交给通知控制器，用于通知点击路由
+    syncWindowTabs: notifications.syncWindowTabs,
     // Web 端没有宿主层 Dock / 任务栏徽标，保持空实现以兼容统一平台接口
     syncWindowUnreadCount: () => {},
-    syncActiveTaskSession: () => {},
+    // 本页正在查看的任务，用于按任务精确判断是否需要打扰
+    syncActiveTaskSession: notifications.syncActiveTaskSession,
     onFocusTab: () => () => {},
     onNewTab: () => () => {},
     onCloseActiveContextRequest: () => () => {},
@@ -187,7 +210,7 @@ export function createWebPlatform(options?: {
     onNewTask: () => () => {},
     onOpenWorkspace: () => () => {},
     onWindowFullscreenChanged: () => () => {},
-    onTaskNotificationClick: () => () => {},
+    onTaskNotificationClick: notifications.onTaskNotificationClick,
     exportLogs: () => Promise.resolve({ success: false, error: "Not supported in web mode" }),
     captureWindowScreenshot: () => Promise.resolve(null),
     importChromeBrowserData: (_options) =>

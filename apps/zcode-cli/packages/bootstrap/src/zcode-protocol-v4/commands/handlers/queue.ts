@@ -131,7 +131,7 @@ async function editQueueItem(
   }
   // 附件映射在写回前完成：引用失效要在改写队列项之前暴露。
   const attachments = payload.attachments
-    ? await mapAttachmentRefsToTurnAttachments(record.app, payload.attachments)
+    ? mapAttachmentRefsToTurnAttachments(payload.attachments)
     : undefined;
   // 用户在编辑态改了模型：入队时冻结的 Highspeed 卡与暂存凭据不能再覆盖新选择。
   const modelChanged =
@@ -197,7 +197,8 @@ async function applyQueueItemsConfig(
     });
     if (result !== "edited") continue;
     applied += 1;
-    if (modelChanged) host.deleteQueuedTurnExecution?.(record.app.sessionId, queueItem.sourceCommandId);
+    if (modelChanged)
+      host.deleteQueuedTurnExecution?.(record.app.sessionId, queueItem.sourceCommandId);
   }
   if (applied === 0) throw new V4CommandNoopError("queue.itemMissing");
   return undefined;
@@ -347,7 +348,7 @@ async function sendQueuedNow(
     const attachments =
       queueItem.kind === "compact"
         ? undefined
-        : await mapAttachmentRefsToTurnAttachments(record.app, queueItem.attachments);
+        : mapAttachmentRefsToTurnAttachments(queueItem.attachments);
     if (!autoDrainPromotion) acquirePromotionLease("after-current");
     if (!autoDrainPromotion) {
       await preemptActiveTurnAndWait(host, record, {

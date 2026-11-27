@@ -884,7 +884,8 @@ export const v4AttachmentPutParamsSchema = z
     fileName: z.string().min(1),
     mime: z.string().min(1),
     // base64（不带 data: 前缀）；解码后字节数 ≤ PROTOCOL_V4_LIMITS.attachmentMaxBytes。
-    dataBase64: z.string().min(1),
+    // 0 字节文件的 base64 为空串，与 begin 对 totalBytes=0/totalChunks=0 的约束一致，故不再要求非空。
+    dataBase64: z.string(),
   })
   .strict();
 export type V4AttachmentPutParams = z.infer<typeof v4AttachmentPutParamsSchema>;

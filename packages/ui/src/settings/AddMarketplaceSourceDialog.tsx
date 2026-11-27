@@ -6,9 +6,12 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/compone
 import { Input } from "@/components/ui/input.js";
 import { Label } from "@/components/ui/label.js";
 import { cn } from "@/components/lib/utils.js";
+import { DirectoryBrowser } from "@/DirectoryBrowser.js";
 import { useOptionalPlatform } from "@/hooks/usePlatform.js";
+import { useBaseWorkspaceServices } from "@/hooks/useWorkspaceServices.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { isImeComposingKeyEvent } from "@/lib/imeComposition.js";
+import type { IServiceAccessor } from "@zcode/services";
 
 /**
  * 顶栏 New 直接打开添加市场源对话框：收编原 AddMarketplacePopover 的
@@ -20,19 +23,29 @@ export function AddMarketplaceSourceDialog({
   onAddMarketplace,
   activeOperations,
   error,
+  services,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onAddMarketplace: (source: string) => Promise<boolean>;
   activeOperations: ReadonlyArray<{ id: string }>;
   error?: string | null;
+  /**
+   * 与 onAddMarketplace 同一 Host 的服务访问面（由调用方传入）。目录浏览必须和
+   * 写入 marketplace 的 pluginManagementService 同源，否则远端 workspace 下会在本机
+   * base host 浏览路径、却把该路径登记到远端。缺省回退 base host（应用根部）。
+   */
+  services?: IServiceAccessor;
 }) {
   const { intl } = useZCodeIntl();
   const platform = useOptionalPlatform();
-  // 仅桌面端能把拖拽 File / 目录选择框解析成 agent 可访问的本地绝对路径；Web 端隐藏这些入口。
+  // 仅桌面端能把拖拽 File / 目录选择框解析成 agent 可访问的本地绝对路径；Web 端改用页内服务端目录浏览。
   const canPickPath = platform?.canSelectFilePath ?? false;
+  const fallbackServices = useBaseWorkspaceServices();
+  const browseServices = services ?? fallbackServices;
   const [source, setSource] = useState("");
   const [dragActive, setDragActive] = useState(false);
+  const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
   const [riskAcknowledged, setRiskAcknowledged] = useState(false);
   const riskAcknowledgementId = useId();
   const trimmedSource = source.trim();
@@ -46,7 +59,10 @@ export function AddMarketplaceSourceDialog({
 
   useEffect(() => {
     // 风险确认仅属于本次弹框，关闭后不得沿用上次勾选。
-    if (!open) setRiskAcknowledged(false);
+    if (!open) {
+      setRiskAcknowledged(false);
+      setDirectoryPickerOpen(false);
+    }
   }, [open]);
 
   const handleAdd = async () => {
@@ -89,7 +105,7 @@ export function AddMarketplaceSourceDialog({
       <DialogContent
         data-testid="plugin-store-add-source-dialog"
         className={cn(
-          "w-[min(420px,calc(100vw-2rem))] max-w-none transition-colors",
+          "w-[min(420px,calc(100vw-2rem))] max-h-[calc(100dvh-2rem)] max-w-none overflow-y-auto transition-colors",
           canPickPath && dragActive ? "border-border-hover bg-surface-hover" : "",
         )}
         onDragOver={
@@ -134,6 +150,7 @@ export function AddMarketplaceSourceDialog({
           data-testid="plugin-store-add-source-input"
           size="lg"
           autoFocus
+          className="max-md:text-mobile-input-safe"
           aria-label={intl.formatMessage({ id: "settings.plugins.marketplaces.source" })}
           value={source}
           onChange={(event) => setSource(event.target.value)}
@@ -163,47 +180,82 @@ export function AddMarketplaceSourceDialog({
             {intl.formatMessage({ id: "settings.plugins.marketplaces.dropHint" })}
           </p>
         ) : null}
-        <div className="flex items-start gap-2">
-          <Checkbox
-            id={riskAcknowledgementId}
-            data-testid="plugin-store-add-source-risk-acknowledgement"
-            className="mt-0.5"
-            checked={riskAcknowledged}
-            onCheckedChange={(checked) => setRiskAcknowledged(checked === true)}
-            disabled={adding}
-          />
-          <Label htmlFor={riskAcknowledgementId} className="min-w-0 font-normal leading-relaxed">
-            {intl.formatMessage({ id: "settings.plugins.marketplaces.riskAcknowledgement" })}
-          </Label>
-        </div>
-        <div className="flex justify-end gap-2">
-          {canPickPath ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="lg"
-              onClick={() => void handleChooseDirectory()}
-            >
-              <FolderOpen data-icon="inline-start" aria-hidden="true" />
-              {intl.formatMessage({ id: "settings.plugins.marketplaces.chooseDirectory" })}
-            </Button>
-          ) : null}
-          <Button
-            type="button"
-            data-testid="plugin-store-add-source-submit"
-            variant="default"
-            size="lg"
-            disabled={!riskAcknowledged || trimmedSource.length === 0 || adding}
-            onClick={() => void handleAdd()}
-          >
-            {adding ? (
-              <LoaderCircle data-icon="inline-start" className="animate-spin" aria-hidden="true" />
-            ) : (
-              <Plus data-icon="inline-start" aria-hidden="true" />
-            )}
-            {intl.formatMessage({ id: "settings.plugins.marketplaces.add" })}
-          </Button>
-        </div>
+        {directoryPickerOpen ? (
+          <div className="flex max-h-[min(60dvh,26rem)] min-h-0 flex-col overflow-y-auto">
+            <DirectoryBrowser
+              embedded
+              showSelectionActions
+              services={browseServices}
+              onSelect={(path) => {
+                setSource(path);
+                setDirectoryPickerOpen(false);
+              }}
+              onCancel={() => setDirectoryPickerOpen(false)}
+            />
+          </div>
+        ) : (
+          <>
+            <div className="flex items-start gap-2">
+              <Checkbox
+                id={riskAcknowledgementId}
+                data-testid="plugin-store-add-source-risk-acknowledgement"
+                className="mt-0.5"
+                checked={riskAcknowledged}
+                onCheckedChange={(checked) => setRiskAcknowledged(checked === true)}
+                disabled={adding}
+              />
+              <Label
+                htmlFor={riskAcknowledgementId}
+                className="min-w-0 font-normal leading-relaxed"
+              >
+                {intl.formatMessage({ id: "settings.plugins.marketplaces.riskAcknowledgement" })}
+              </Label>
+            </div>
+            <div className="flex justify-end gap-2">
+              {canPickPath ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="lg"
+                  onClick={() => void handleChooseDirectory()}
+                >
+                  <FolderOpen data-icon="inline-start" aria-hidden="true" />
+                  {intl.formatMessage({ id: "settings.plugins.marketplaces.chooseDirectory" })}
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="lg"
+                  data-testid="plugin-store-add-source-choose-directory"
+                  onClick={() => setDirectoryPickerOpen(true)}
+                >
+                  <FolderOpen data-icon="inline-start" aria-hidden="true" />
+                  {intl.formatMessage({ id: "settings.plugins.marketplaces.chooseDirectory" })}
+                </Button>
+              )}
+              <Button
+                type="button"
+                data-testid="plugin-store-add-source-submit"
+                variant="default"
+                size="lg"
+                disabled={!riskAcknowledged || trimmedSource.length === 0 || adding}
+                onClick={() => void handleAdd()}
+              >
+                {adding ? (
+                  <LoaderCircle
+                    data-icon="inline-start"
+                    className="animate-spin"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <Plus data-icon="inline-start" aria-hidden="true" />
+                )}
+                {intl.formatMessage({ id: "settings.plugins.marketplaces.add" })}
+              </Button>
+            </div>
+          </>
+        )}
       </DialogContent>
     </Dialog>
   );

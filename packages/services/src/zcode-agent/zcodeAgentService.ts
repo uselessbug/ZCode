@@ -3,8 +3,11 @@ import {
   v4SessionDeletionPreviewSchema,
   v4SessionDeletionPreviewBatchResultSchema,
   v4SessionDeletionResultSchema,
+  type SessionSummary,
+  type V4SessionDeletionParams,
   type V4SessionDeletionPreviewBatchItem,
 } from "@zcode/shared/zcode-protocol-v4";
+import type { IWebPushService } from "#src/web-push/contract.js";
 import { sessionLifecycleSnapshotSchema, type SessionLifecycleSnapshot } from "@zcode/shared";
 import { credentialCipherRequestSchema } from "@zcode/shared";
 import {
@@ -354,6 +357,7 @@ import type {
   ZCodeAgentSessionsIndexSubscribeParams,
   ZCodeAgentWorkspaceConfigSubscribeParams,
 } from "./zcodeAgent.js";
+import { TRUSTED_FROZEN_EXECUTION_SNAPSHOT } from "#src/project-storage/contract.js";
 import { HOST_WORKTREE_COMMAND } from "./zcodeAgent.js";
 import {
   backgroundBashOutputResultSchema,
@@ -447,6 +451,7 @@ import {
 } from "./zcodeProtocolClient.js";
 import { getDataBaseDir } from "../paths.js";
 import {
+  closeTaskBrowserSessionsBestEffort,
   collectBrowserAmbientContext,
   type BrowserAmbientContextExecutor,
 } from "./zcodeAgentBrowserAmbientContext.js";
@@ -1155,6 +1160,8 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
   mcpStatusIdleTimeoutMs?: number;
   /** Desktop Host 注入：Agent 插件推荐事实在此单点转成插件业务埋点。 */
   reportPluginTelemetryEvent?: (event: RendererTelemetryEventPayload) => void;
+  /** 仅供插件/控制面进程使用（standalone-server 默认 5 分钟空闲回收），不能把空闲回收传给 chat。 */
+  pluginManagementIdleTimeoutMs?: number;
   accountProviderConfigSource?: ProviderSource<AccountProviderConfigSnapshot>;
   /** Desktop Host 请求 Main 登记 Agent 已授权的精确本地视频路径。 */
   authorizeLocalMediaPreviewPath?: (path: string) => Promise<string>;
@@ -1165,10 +1172,10 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
     workspaceIdentity?: string;
   }) => Promise<SubagentRuntimeConfig>;
   /**
-   * Agent 回复语言（同步、只读内存，null 为未设置），应答 CLI 的 session/readReplyLanguage。
-   * 只有 Desktop Host 注入（值由 Main 持有并推送）；未注入的 Host（远端、Web）回答 null。
+   * Agent 回复语言（null 为未设置），应答 CLI 的 session/readReplyLanguage。
+   * Desktop Host 同步读取 Main 推送的内存值；独立 Web 首读完成前等待单次读取、之后同步读内存；未注入的 Host 回答 null。
    */
-  resolveReplyLanguage?: () => string | null;
+  resolveReplyLanguage?: () => string | null | Promise<string | null>;
   sessionRuntimePreferencesAuthority?: "local" | "external";
   prepareProjectExecution?: (
     projectId: string,
@@ -1179,6 +1186,7 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
       projectId: string | null;
       creationCommand?: { clientId: string; commandId: string };
       additionalDirectories?: string[];
+      [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]?: true;
     },
   ) => Promise<{ sessionId: string; additionalDirectories: string[] }>;
   /** fork 提交后、ACK 返回前完成 Host 归属交接；duplicate 重放须幂等。 */
@@ -1202,6 +1210,17 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
     automation: ZCodeAutomation;
     run: ZCodeAutomationRun;
   }) => Promise<void>;
+  /** 校验当前 manual dispatcher 是否仍可接纳新请求（未关闭）。 */
+  canDispatchAutomationManualRun?: () => boolean;
+  /** 定时任务定义变更后唤醒进程内调度器。 */
+  onAutomationChanged?: (automationId?: string) => void;
+  /** standalone 下为无 projectId 创建及会话内 CronCreate 补齐可信 hostId 与 canonical workspaceIdentity。 */
+  resolveAutomationExecutionContext?: (target: {
+    workspacePath: string;
+    workspaceIdentity?: string;
+    targetTaskId?: string;
+  }) => Promise<{ hostId: string; workspaceIdentity?: string }>;
+  defaultAutomationHostId?: string;
   /**
    * Off-Peak 会话内创建。config 同时承担曝光门（enabled && Selection View 非空 →
    * session create/resume 下发 offPeakToolEnabled）与缺省解析（model=白名单末位 /
@@ -1234,6 +1253,13 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
   /** App 工具只在受信 Host 装配；handler 不接受模型自报权限。 */
   resolveAppControlService?: () => AppControlService | undefined;
   appControlSourceServerId?: string;
+  /**
+   * 仅用于归档永久删除（previewSessionDeletion / executeSessionDeletion）在目标工作区无活跃 CLI 时
+   * 判断是否属于当前独立 Host canonical 工作区；异域远端身份与 remoteSessionId 一律禁止回落控制面。
+   */
+  isDeletionWorkspaceOwnedByCurrentHost?: (
+    workspace: ZCodeAgentWorkspaceTarget,
+  ) => Promise<boolean> | boolean;
   channelReplyExecutor?: (request: ChannelReplyHostRequest) => Promise<ChannelReplyResult>;
   topicResourceExecutor?: (
     request: ZCodeTopicResourceReadParams &
@@ -1290,6 +1316,18 @@ interface CreateZCodeAgentServiceBaseOptions extends Omit<
     workspace: CuaOperationWorkspaceTarget,
     event: Exclude<PipSessionEvent, { kind: "focus-changed" }>,
   ) => void;
+  /** 仅独立 HTTP Host 注入标准 Web Push 通知端口；桌面端缺省为 undefined。 */
+  webPushService?: Pick<
+    IWebPushService,
+    "notifySessionEvent" | "cancelPendingInteractionNotification"
+  >;
+  /** 只读会话摘要缓存查询（由 task-index syncer 提供，不触发 CLI 启动）。 */
+  resolveSessionSummary?: (
+    workspace: ZCodeAgentWorkspaceTarget,
+    sessionId: string,
+  ) => Pick<SessionSummary, "title" | "pendingInteraction"> | undefined;
+  /** 交互通知投递前短暂确认未瞬间收口/自动批准的延迟（毫秒，默认 50）。 */
+  webPushInteractionCheckDelayMs?: number;
 }
 
 function toProtocolAutomation(automation: ZCodeAutomation) {
@@ -1439,14 +1477,27 @@ export function createZCodeAgentService(
       : undefined;
   // AutomationRepo 也持有 tasks-index.sqlite 连接，disposeAll 需一并收口（见下方 disposeAll 注释）
   const automationRepo = new AutomationRepo();
-  const automationService = new AutomationService(automationRepo, options?.prepareProjectExecution);
+  const automationService = new AutomationService(
+    automationRepo,
+    options?.prepareProjectExecution,
+    {
+      onWake: options?.onAutomationChanged,
+      resolveExecutionContext: options?.resolveAutomationExecutionContext,
+      defaultHostId: options?.defaultAutomationHostId,
+    },
+  );
   const automationTaskIndexRepo = new TaskIndexRepo();
   const pluginProcessManager = new ZCodeAgentProcessManager({
     commandResolver: options?.commandResolver,
     presentationSurface: options?.presentationSurface,
+    processLifecycleReporter: options?.processLifecycleReporter,
     requestTimeoutMs: options?.requestTimeoutMs,
     resolveSpawnEnv: options?.resolveSpawnEnv,
     waitForSpawnAdmission: options?.waitForSpawnAdmission,
+    lane: "plugin-management",
+    ...(options?.pluginManagementIdleTimeoutMs
+      ? { idleTimeoutMs: options.pluginManagementIdleTimeoutMs }
+      : {}),
   });
   // 合并时误删了独立进程：mcp/list 的慢握手会堵住串行 stdio 队列，连带卡住插件卸载。
   // 恢复专用控制面进程及空闲回收；共享 workspace 路径，不共享请求队列或 watchdog。
@@ -1642,6 +1693,9 @@ export function createZCodeAgentService(
           (typeof ref.workspaceIdentity === "string" && ref.workspaceIdentity.trim()) ||
           ref.workspacePath;
     }
+    if (!key && typeof data.workspaceKey === "string" && data.workspaceKey.trim()) {
+      key = data.workspaceKey.trim();
+    }
     if (!key && typeof data.workspacePath === "string") {
       key =
         (typeof data.workspaceIdentity === "string" && data.workspaceIdentity.trim()) ||
@@ -1682,6 +1736,36 @@ export function createZCodeAgentService(
   const clientDisposables = new WeakMap<ZCodeProtocolClient, IDisposable[]>();
   const pendingPermissions = new Map<string, PendingPermissionRequest>();
   const pendingUserInputs = new Map<string, PendingPermissionRequest>();
+  const DEFAULT_WEB_PUSH_INTERACTION_CHECK_DELAY_MS = 200;
+  const MAX_CACHED_WEB_PUSH_INTERACTIONS = 512;
+  const pendingInteractionPushes = new Map<
+    string,
+    {
+      interactionId: string;
+      sessionId: string;
+      workspaceKey: string;
+      client: ZCodeProtocolClient;
+    }
+  >();
+  const activeWebPushInteractions = new Map<
+    string,
+    {
+      interactionId: string;
+      sessionId: string;
+      workspaceKey: string;
+      client: ZCodeProtocolClient;
+    }
+  >();
+  const interactionDetailsById = new Map<
+    string,
+    {
+      detail: string;
+      sessionId: string;
+      workspaceKey: string;
+      client: ZCodeProtocolClient;
+    }
+  >();
+  const pendingInteractionPushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // 内存诊断计数器：只读各 per-session 镜像表的 size。
   const memoryDiagnostics = registerMemoryDiagnosticsProvider("agent", () => ({
     sessionEmitters: sessionEmitters.size,
@@ -1736,6 +1820,240 @@ export function createZCodeAgentService(
   const sessionRuntimePreferencesAuthority = options?.sessionRuntimePreferencesAuthority ?? "local";
   const resolveSessionRuntimePreferences = options?.resolveSessionRuntimePreferences;
 
+  async function resolveSessionTitleForWebPush(
+    workspace: ZCodeAgentWorkspaceTarget,
+    sessionId: string,
+  ): Promise<string | undefined> {
+    const cachedTitle = options?.resolveSessionSummary?.(workspace, sessionId)?.title?.trim();
+    if (cachedTitle) return cachedTitle;
+    try {
+      const meta = await automationTaskIndexRepo.getTaskMeta({
+        workspacePath: workspace.workspacePath,
+        workspaceIdentity: workspace.workspaceIdentity,
+        taskId: sessionId,
+      });
+      const metaTitle = meta?.title?.trim();
+      return metaTitle || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function rememberInteractionDetail(params: {
+    interactionId: string;
+    detail?: string;
+    sessionId: string;
+    workspaceKey: string;
+    client: ZCodeProtocolClient;
+  }): void {
+    const cleanDetail = params.detail?.trim();
+    if (!cleanDetail) return;
+    if (interactionDetailsById.has(params.interactionId)) {
+      interactionDetailsById.delete(params.interactionId);
+    }
+    interactionDetailsById.set(params.interactionId, {
+      detail: cleanDetail,
+      sessionId: params.sessionId,
+      workspaceKey: params.workspaceKey,
+      client: params.client,
+    });
+    while (interactionDetailsById.size > MAX_CACHED_WEB_PUSH_INTERACTIONS) {
+      const oldest = interactionDetailsById.keys().next().value;
+      if (oldest === undefined) break;
+      interactionDetailsById.delete(oldest);
+    }
+  }
+
+  function rememberActiveWebPushInteraction(
+    key: string,
+    entry: {
+      interactionId: string;
+      sessionId: string;
+      workspaceKey: string;
+      client: ZCodeProtocolClient;
+    },
+  ): void {
+    if (activeWebPushInteractions.has(key)) {
+      activeWebPushInteractions.delete(key);
+    }
+    activeWebPushInteractions.set(key, entry);
+    while (activeWebPushInteractions.size > MAX_CACHED_WEB_PUSH_INTERACTIONS) {
+      const oldest = activeWebPushInteractions.keys().next().value;
+      if (oldest === undefined) break;
+      activeWebPushInteractions.delete(oldest);
+    }
+  }
+
+  function scheduleWebPushInteractionOpen(params: {
+    kind: "approval" | "question" | "plan";
+    key: string;
+    pendingMap: Map<string, PendingPermissionRequest>;
+    workspace: ZCodeAgentWorkspaceTarget;
+    sessionId: string;
+    interactionId: string;
+    detail?: string;
+    client: ZCodeProtocolClient;
+  }): void {
+    const workspaceKey = resolveWorkspaceKey(params.workspace);
+    rememberInteractionDetail({
+      interactionId: params.interactionId,
+      detail: params.detail,
+      sessionId: params.sessionId,
+      workspaceKey,
+      client: params.client,
+    });
+    const webPush = options?.webPushService;
+    if (!webPush) return;
+    const prevTimer = pendingInteractionPushTimers.get(params.key);
+    if (prevTimer) {
+      clearTimeout(prevTimer);
+      pendingInteractionPushTimers.delete(params.key);
+    }
+    const entry = {
+      interactionId: params.interactionId,
+      sessionId: params.sessionId,
+      workspaceKey,
+      client: params.client,
+    };
+    pendingInteractionPushes.set(params.key, entry);
+    rememberActiveWebPushInteraction(params.key, entry);
+    const delayMs = Math.max(
+      0,
+      options?.webPushInteractionCheckDelayMs ?? DEFAULT_WEB_PUSH_INTERACTION_CHECK_DELAY_MS,
+    );
+    const canDeliverInteractionPush = (): boolean => {
+      if (pendingInteractionPushes.get(params.key) !== entry) return false;
+      if (!params.pendingMap.has(params.key)) return false;
+      if (options?.resolveSessionSummary) {
+        const summary = options.resolveSessionSummary(params.workspace, params.sessionId);
+        if (
+          summary?.pendingInteraction?.interactionId !== params.interactionId ||
+          (summary.pendingInteraction.autoResolution &&
+            summary.pendingInteraction.autoResolution.state !== "snoozed")
+        ) {
+          return false;
+        }
+      }
+      return true;
+    };
+    const runCheck = () => {
+      pendingInteractionPushTimers.delete(params.key);
+      void (async () => {
+        if (!canDeliverInteractionPush()) {
+          pendingInteractionPushes.delete(params.key);
+          return;
+        }
+        const sessionTitle = await resolveSessionTitleForWebPush(
+          params.workspace,
+          params.sessionId,
+        );
+        if (!canDeliverInteractionPush()) {
+          pendingInteractionPushes.delete(params.key);
+          return;
+        }
+        pendingInteractionPushes.delete(params.key);
+        webPush.notifySessionEvent({
+          kind: params.kind,
+          eventId: `interaction:${params.interactionId}:open`,
+          sessionId: params.sessionId,
+          ...(sessionTitle ? { sessionTitle } : {}),
+          ...(params.detail ? { detail: params.detail } : {}),
+          interactionId: params.interactionId,
+          workspacePath: params.workspace.workspacePath,
+          ...(params.workspace.workspaceIdentity
+            ? { workspaceIdentity: params.workspace.workspaceIdentity }
+            : {}),
+        });
+      })().catch(() => undefined);
+    };
+    const timer = setTimeout(runCheck, delayMs);
+    timer.unref?.();
+    pendingInteractionPushTimers.set(params.key, timer);
+  }
+
+  function cancelWebPushInteraction(params: {
+    workspace?: ZCodeAgentWorkspaceTarget;
+    sessionId?: string | null;
+    interactionId?: string;
+  }): void {
+    if (!params.interactionId) return;
+    interactionDetailsById.delete(params.interactionId);
+    const webPush = options?.webPushService;
+
+    if (params.workspace && params.sessionId) {
+      const target = {
+        ...params.workspace,
+        sessionId: params.sessionId,
+        requestId: params.interactionId,
+      };
+      pendingPermissions.delete(permissionRequestKey(target));
+      pendingUserInputs.delete(userInputRequestKey(target));
+    }
+
+    for (const [key, entry] of pendingInteractionPushes) {
+      const matchesId = entry.interactionId === params.interactionId;
+      const matchesSession = !params.sessionId || entry.sessionId === params.sessionId;
+      if (!matchesId || !matchesSession) continue;
+      const timer = pendingInteractionPushTimers.get(key);
+      if (timer) {
+        clearTimeout(timer);
+        pendingInteractionPushTimers.delete(key);
+      }
+      pendingInteractionPushes.delete(key);
+      pendingPermissions.delete(key);
+      pendingUserInputs.delete(key);
+    }
+
+    for (const [key, entry] of activeWebPushInteractions) {
+      const matchesId = entry.interactionId === params.interactionId;
+      const matchesSession = !params.sessionId || entry.sessionId === params.sessionId;
+      if (!matchesId || !matchesSession) continue;
+      activeWebPushInteractions.delete(key);
+      pendingPermissions.delete(key);
+      pendingUserInputs.delete(key);
+    }
+
+    webPush?.cancelPendingInteractionNotification(params.interactionId);
+  }
+
+  function cancelWebPushSessionInteractions(
+    workspace: ZCodeAgentWorkspaceTarget,
+    sessionId: string,
+  ): void {
+    const webPush = options?.webPushService;
+    const workspaceKey = resolveWorkspaceKey(workspace);
+    for (const [interactionId, detailEntry] of interactionDetailsById) {
+      if (detailEntry.workspaceKey === workspaceKey && detailEntry.sessionId === sessionId) {
+        interactionDetailsById.delete(interactionId);
+      }
+    }
+    const cancelledIds = new Set<string>();
+    for (const [key, entry] of pendingInteractionPushes) {
+      if (entry.workspaceKey !== workspaceKey || entry.sessionId !== sessionId) continue;
+      const timer = pendingInteractionPushTimers.get(key);
+      if (timer) {
+        clearTimeout(timer);
+        pendingInteractionPushTimers.delete(key);
+      }
+      pendingInteractionPushes.delete(key);
+      pendingPermissions.delete(key);
+      pendingUserInputs.delete(key);
+      cancelledIds.add(entry.interactionId);
+    }
+    for (const [key, entry] of activeWebPushInteractions) {
+      if (entry.workspaceKey !== workspaceKey || entry.sessionId !== sessionId) continue;
+      activeWebPushInteractions.delete(key);
+      pendingPermissions.delete(key);
+      pendingUserInputs.delete(key);
+      cancelledIds.add(entry.interactionId);
+    }
+    if (webPush) {
+      for (const interactionId of cancelledIds) {
+        webPush.cancelPendingInteractionNotification(interactionId);
+      }
+    }
+  }
+
   function invalidateWorkspaceClient(workspaceKey: string, client: ZCodeProtocolClient): void {
     for (const [key, pending] of pendingPermissions) {
       if (pending.client === client) {
@@ -1745,6 +2063,34 @@ export function createZCodeAgentService(
     for (const [key, pending] of pendingUserInputs) {
       if (pending.client === client) {
         pendingUserInputs.delete(key);
+      }
+    }
+    for (const [interactionId, detailEntry] of interactionDetailsById) {
+      if (detailEntry.client === client) {
+        interactionDetailsById.delete(interactionId);
+      }
+    }
+    const cancelledIds = new Set<string>();
+    for (const [key, entry] of pendingInteractionPushes) {
+      if (entry.client === client) {
+        const timer = pendingInteractionPushTimers.get(key);
+        if (timer) {
+          clearTimeout(timer);
+          pendingInteractionPushTimers.delete(key);
+        }
+        pendingInteractionPushes.delete(key);
+        cancelledIds.add(entry.interactionId);
+      }
+    }
+    for (const [key, entry] of activeWebPushInteractions) {
+      if (entry.client === client) {
+        activeWebPushInteractions.delete(key);
+        cancelledIds.add(entry.interactionId);
+      }
+    }
+    if (options?.webPushService) {
+      for (const interactionId of cancelledIds) {
+        options.webPushService.cancelPendingInteractionNotification(interactionId);
       }
     }
     for (const [key, pending] of pendingProviderRuntimeHeaders) {
@@ -2512,6 +2858,26 @@ export function createZCodeAgentService(
     if (!shouldDeliverLiveSessionEvent(workspace, normalizedEvent)) {
       return;
     }
+    if (options?.webPushService) {
+      if (
+        normalizedEvent.type === "permission.resolved" ||
+        normalizedEvent.type === "userInput.resolved"
+      ) {
+        const requestId = (normalizedEvent.payload as { requestId?: string }).requestId;
+        if (requestId) {
+          cancelWebPushInteraction({
+            workspace,
+            sessionId: normalizedEvent.sessionId,
+            interactionId: requestId,
+          });
+        }
+      } else if (
+        normalizedEvent.type === "turn.completed" ||
+        normalizedEvent.type === "turn.failed"
+      ) {
+        cancelWebPushSessionInteractions(workspace, normalizedEvent.sessionId);
+      }
+    }
     emitSessionEvent(workspace, normalizedEvent.sessionId, {
       type: "session.event",
       event: normalizedEvent,
@@ -2996,9 +3362,18 @@ export function createZCodeAgentService(
               .catch(() => {});
             return;
           }
-          // 注入的值已在 Host 收消息时按 replyLanguageSchema 校验，这里不再重复。
-          void client
-            .respond(request.id, { language: options?.resolveReplyLanguage?.() ?? null })
+          // 注入的值已在 Host 收消息或落盘时按 replyLanguageSchema 校验；读取失败返回错误让 CLI 按“未知”跳过，不误发清除公告。
+          void Promise.resolve()
+            .then(() => options?.resolveReplyLanguage?.() ?? null)
+            .then(
+              (language) => client.respond(request.id, { language }),
+              (error: unknown) =>
+                client.respondError(request.id, {
+                  code: -32603,
+                  message:
+                    error instanceof Error ? error.message : "Failed to resolve reply language",
+                }),
+            )
             .catch(() => {});
           return;
         }
@@ -3234,6 +3609,25 @@ export function createZCodeAgentService(
             protocolRequestId: request.id,
           });
           if (!wasPending) {
+            if (parsed.data.toolName !== "workspaceHookReview") {
+              const kind =
+                parsed.data.toolName === "ExitPlanMode"
+                  ? "plan"
+                  : parsed.data.toolName === "AskUserQuestion"
+                    ? "question"
+                    : "approval";
+              const detail = parsed.data.reason?.trim() || parsed.data.toolName;
+              scheduleWebPushInteractionOpen({
+                kind,
+                key,
+                pendingMap: pendingPermissions,
+                workspace,
+                sessionId: parsed.data.sessionId,
+                interactionId: parsed.data.requestId,
+                detail,
+                client,
+              });
+            }
             emitSessionEvent(workspace, parsed.data.sessionId, {
               type: "permission.request",
               request: parsed.data,
@@ -3260,6 +3654,29 @@ export function createZCodeAgentService(
           const wasPending = pendingUserInputs.has(key);
           pendingUserInputs.set(key, { client, protocolRequestId: request.id });
           if (!wasPending) {
+            if (parsed.data.toolName !== "workspaceHookReview") {
+              const schemaRecord =
+                typeof parsed.data.schema === "object" && parsed.data.schema !== null
+                  ? (parsed.data.schema as Record<string, unknown>)
+                  : null;
+              const isPlan =
+                parsed.data.toolName === "ExitPlanMode" ||
+                schemaRecord?.interaction === "plan_approval";
+              const detail =
+                parsed.data.questions?.[0]?.question?.trim() ||
+                parsed.data.prompt?.trim() ||
+                parsed.data.toolName;
+              scheduleWebPushInteractionOpen({
+                kind: isPlan ? "plan" : "question",
+                key,
+                pendingMap: pendingUserInputs,
+                workspace,
+                sessionId: parsed.data.sessionId,
+                interactionId: parsed.data.requestId,
+                ...(detail ? { detail } : {}),
+                client,
+              });
+            }
             // agent 为恢复丢失的 protocol id 会重发同一业务 requestId。
             // host 需要刷新可响应的 protocolRequestId，但不能重复广播给 UI，
             // 否则多问题 AskUserQuestion 会在用户翻到后续问题时被重置回第一页。
@@ -3457,8 +3874,19 @@ export function createZCodeAgentService(
             void client.respond(request.id, { browsers: [] });
             return;
           }
+          const browserWorkspaceIdentity =
+            workspace.workspaceIdentity ?? parsed.data.workspaceIdentity;
+          const browserRemoteSessionId = workspace.remoteSessionId ?? parsed.data.remoteSessionId;
           void executor
-            .list(parsed.data)
+            .list({
+              ...parsed.data,
+              // worktree 会话的 CLI directory 与主项目不同；统一归一到所属 CLI runtime 的主工作区，
+              // 确保浏览器上下文与 closeTaskSessions 按同一归属主仓库匹配。
+              workspaceKey: resolveWorkspaceKey(workspace),
+              workspacePath: workspace.workspacePath,
+              ...(browserWorkspaceIdentity ? { workspaceIdentity: browserWorkspaceIdentity } : {}),
+              ...(browserRemoteSessionId ? { remoteSessionId: browserRemoteSessionId } : {}),
+            })
             .then((browsers) => client.respond(request.id, { browsers }))
             .catch((error: unknown) => {
               void client.respondError(request.id, {
@@ -3497,6 +3925,9 @@ export function createZCodeAgentService(
             });
             return;
           }
+          const browserWorkspaceIdentity =
+            workspace.workspaceIdentity ?? parsed.data.workspaceIdentity;
+          const browserRemoteSessionId = workspace.remoteSessionId ?? parsed.data.remoteSessionId;
           void executor
             .execute({
               requestId: parsed.data.requestId,
@@ -3507,16 +3938,10 @@ export function createZCodeAgentService(
                 : {}),
               sessionId: parsed.data.sessionId,
               ...(parsed.data.turnId ? { turnId: parsed.data.turnId } : {}),
-              workspaceKey: parsed.data.workspaceKey ?? resolveWorkspaceKey(workspace),
-              workspacePath: parsed.data.workspacePath ?? workspace.workspacePath,
-              ...((parsed.data.workspaceIdentity ?? workspace.workspaceIdentity)
-                ? {
-                    workspaceIdentity: parsed.data.workspaceIdentity ?? workspace.workspaceIdentity,
-                  }
-                : {}),
-              ...(parsed.data.remoteSessionId
-                ? { remoteSessionId: parsed.data.remoteSessionId }
-                : {}),
+              workspaceKey: resolveWorkspaceKey(workspace),
+              workspacePath: workspace.workspacePath,
+              ...(browserWorkspaceIdentity ? { workspaceIdentity: browserWorkspaceIdentity } : {}),
+              ...(browserRemoteSessionId ? { remoteSessionId: browserRemoteSessionId } : {}),
               clientMode: parsed.data.clientMode ?? "desktop-continuous",
               sessionContext: parsed.data.sessionContext ?? "live",
               command: parsed.data.command,
@@ -4319,6 +4744,40 @@ export function createZCodeAgentService(
     return client;
   }
 
+  async function isWorkspaceOwnedByCurrentHostForSessionData(
+    workspace: ZCodeAgentWorkspaceTarget,
+  ): Promise<boolean> {
+    if (workspace.remoteSessionId) return false;
+    const hasWorkspaceIdentity = Boolean(workspace.workspaceIdentity?.trim());
+    if (!hasWorkspaceIdentity) {
+      return isLocalActiveWorkspaceClient(workspace);
+    }
+    return Boolean(await options?.isDeletionWorkspaceOwnedByCurrentHost?.(workspace));
+  }
+
+  async function resolveSessionDeletionClient(
+    workspace: ZCodeAgentWorkspaceTarget,
+  ): Promise<ZCodeProtocolClient> {
+    try {
+      return await getReadOnlyClient(workspace, "existing-only");
+    } catch (error) {
+      const runtimeUnavailable =
+        error instanceof Error &&
+        "code" in error &&
+        error.code === ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE;
+      if (!runtimeUnavailable) {
+        throw error;
+      }
+      // 保留 isLocalActiveWorkspaceClient 原边界不变；仅对无远端标识的本机工作区，或由装配层
+      // 确认属于当前 standalone Host canonical 身份且无 remoteSessionId 的工作区回落控制面。
+      const canFallback = await isWorkspaceOwnedByCurrentHostForSessionData(workspace);
+      if (!canFallback) {
+        throw error;
+      }
+      return getPluginManagementClient();
+    }
+  }
+
   // 全局工作流的载体运行时选择：
   // 调用方只给 `{ scope: "global" }` 不带 workspace 时，先复用任一已活跃的**本地** runtime
   // （existing-only 语义：只看 activeClientsByWorkspaceKey，绝不为此拉起新进程），否则回落到
@@ -4336,13 +4795,20 @@ export function createZCodeAgentService(
     );
   }
 
-  /** 归档永久删除的 CLI 载体：本机优先已有 runtime，没有就用管理面进程；远端只用已有连接。 */
-  async function sessionDeletionClient(
-    workspace: ZCodeAgentWorkspaceTarget,
-  ): Promise<ZCodeProtocolClient> {
-    return isLocalActiveWorkspaceClient(workspace)
-      ? await getReadOnlyClient(workspace, "existing-only").catch(() => getPluginManagementClient())
-      : await getReadOnlyClient(workspace, "existing-only");
+  function toSessionDeletionWireParams<
+    T extends { workspace: ZCodeAgentWorkspaceTarget; sessionDirectory?: string },
+  >(params: T): Omit<T, "sessionDirectory"> {
+    const { sessionDirectory, ...wireParams } = params;
+    const workspace: V4SessionDeletionParams["workspace"] = {
+      workspacePath: sessionDirectory ?? wireParams.workspace.workspacePath,
+      ...(wireParams.workspace.workspaceIdentity
+        ? { workspaceIdentity: wireParams.workspace.workspaceIdentity }
+        : {}),
+    };
+    return {
+      ...wireParams,
+      workspace,
+    } as Omit<T, "sessionDirectory">;
   }
 
   async function resolveGlobalSavedWorkflowCarrier(): Promise<{
@@ -4439,6 +4905,25 @@ export function createZCodeAgentService(
     sessionEventSequenceStates.clear();
     pendingPermissions.clear();
     pendingUserInputs.clear();
+    for (const timer of pendingInteractionPushTimers.values()) {
+      clearTimeout(timer);
+    }
+    pendingInteractionPushTimers.clear();
+    const disposeCancelledIds = new Set<string>();
+    for (const entry of pendingInteractionPushes.values()) {
+      disposeCancelledIds.add(entry.interactionId);
+    }
+    for (const entry of activeWebPushInteractions.values()) {
+      disposeCancelledIds.add(entry.interactionId);
+    }
+    if (options?.webPushService) {
+      for (const interactionId of disposeCancelledIds) {
+        options.webPushService.cancelPendingInteractionNotification(interactionId);
+      }
+    }
+    pendingInteractionPushes.clear();
+    activeWebPushInteractions.clear();
+    interactionDetailsById.clear();
     pendingProviderRuntimeHeaders.clear();
     for (const pending of pendingSessionRuntimePreferences.values()) {
       clearTimeout(pending.timeout);
@@ -4590,6 +5075,9 @@ export function createZCodeAgentService(
         projectId: params.projectId ?? null,
         creationCommand: { clientId: envelope.clientId, commandId: envelope.commandId },
         additionalDirectories: payload.additionalDirectories,
+        ...(params[TRUSTED_FROZEN_EXECUTION_SNAPSHOT]
+          ? { [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]: true as const }
+          : {}),
       });
       const sessionId = prepared?.sessionId ?? payload.sessionId;
       const additionalDirectories =
@@ -4751,6 +5239,9 @@ export function createZCodeAgentService(
         const prepared = await options.prepareSessionCreation({
           ...params,
           projectId: params.projectId ?? null,
+          ...(params[TRUSTED_FROZEN_EXECUTION_SNAPSHOT]
+            ? { [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]: true as const }
+            : {}),
         });
         params = {
           ...params,
@@ -5008,10 +5499,10 @@ export function createZCodeAgentService(
     },
 
     async previewSessionDeletion(params) {
-      const client = await sessionDeletionClient(params.workspace);
+      const client = await resolveSessionDeletionClient(params.workspace);
       return client.request(
         V4_METHODS.sessionDeletionPreview,
-        params,
+        toSessionDeletionWireParams(params),
         v4SessionDeletionPreviewSchema,
       );
     },
@@ -5022,13 +5513,15 @@ export function createZCodeAgentService(
       const clients = new Map<string, Promise<ZCodeProtocolClient>>();
       const groups = new Map<ZCodeProtocolClient, number[]>();
       for (const [index, item] of params.items.entries()) {
+        const workspaceTarget = item.workspace as ZCodeAgentWorkspaceTarget;
         const key = JSON.stringify([
-          item.workspace.workspacePath,
-          item.workspace.workspaceIdentity ?? "",
+          workspaceTarget.workspacePath,
+          workspaceTarget.workspaceIdentity ?? "",
+          workspaceTarget.remoteSessionId ?? "",
         ]);
         let client = clients.get(key);
         if (!client) {
-          client = sessionDeletionClient(item.workspace);
+          client = resolveSessionDeletionClient(workspaceTarget);
           clients.set(key, client);
         }
         try {
@@ -5041,13 +5534,15 @@ export function createZCodeAgentService(
       for (const [client, group] of groups)
         for (let start = 0; start < group.length; start += V4_SESSION_DELETION_PREVIEW_BATCH_MAX) {
           const indexes = group.slice(start, start + V4_SESSION_DELETION_PREVIEW_BATCH_MAX);
-          const items = indexes.map((index) => params.items[index]!);
+          const wireItems = indexes.map((index) =>
+            toSessionDeletionWireParams(params.items[index]!),
+          );
           let batch: V4SessionDeletionPreviewBatchItem[];
           try {
             batch = await client
               .request(
                 V4_METHODS.sessionDeletionPreviewBatch,
-                { items },
+                { items: wireItems },
                 v4SessionDeletionPreviewBatchResultSchema,
               )
               .then((result) => result.results)
@@ -5055,7 +5550,7 @@ export function createZCodeAgentService(
                 // 旧 CLI 不认识批量方法时逐项回退，结果语义不变。
                 if (!isProtocolMethodNotFoundError(error)) throw error;
                 const fallback: V4SessionDeletionPreviewBatchItem[] = [];
-                for (const item of items)
+                for (const item of wireItems)
                   fallback.push(
                     await client
                       .request(
@@ -5072,10 +5567,10 @@ export function createZCodeAgentService(
                   );
                 return fallback;
               });
-            if (batch.length !== items.length) throw new Error("session-data.unavailable");
+            if (batch.length !== wireItems.length) throw new Error("session-data.unavailable");
           } catch (error) {
             const code = sessionDeletionErrorCode(error);
-            batch = items.map(() => ({ error: { code } }));
+            batch = wireItems.map(() => ({ error: { code } }));
           }
           indexes.forEach((index, position) => {
             results[index] = batch[position]!;
@@ -5084,15 +5579,42 @@ export function createZCodeAgentService(
       return { results };
     },
     async executeSessionDeletion(params) {
-      const client = await sessionDeletionClient(params.workspace);
-      return client.request(
+      const client = await resolveSessionDeletionClient(params.workspace);
+      const result = await client.request(
         V4_METHODS.sessionDeletionExecute,
-        params,
+        toSessionDeletionWireParams(params),
         v4SessionDeletionResultSchema,
       );
+      if (result.status === "deleted" && result.sessionIds.length > 0) {
+        await closeTaskBrowserSessionsBestEffort(
+          options?.browserControlExecutor,
+          {
+            workspacePath: params.workspace.workspacePath,
+            ...(params.workspace.workspaceIdentity
+              ? { workspaceIdentity: params.workspace.workspaceIdentity }
+              : {}),
+            sessionIds: result.sessionIds,
+          },
+          (error) =>
+            logger.warn(undefined, "归档永久删除后回收浏览器会话失败", {
+              sessionIds: result.sessionIds,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+        );
+      }
+      return result;
     },
 
     async measureSessionData(params) {
+      // 携带 workspaceIdentity 的目录必须归属本机或当前 standalone Host，拒绝异域身份。
+      for (const directory of params.directories) {
+        if (
+          directory.workspaceIdentity?.trim() &&
+          !(await isWorkspaceOwnedByCurrentHostForSessionData(directory))
+        ) {
+          throw new Error("project.data-local-only");
+        }
+      }
       // 只读测量：和全局工作流同一载体选择（本机已活跃 runtime，否则管理面进程）。
       const { client } = await resolveGlobalSavedWorkflowCarrier();
       return client.request(
@@ -5103,13 +5625,51 @@ export function createZCodeAgentService(
     },
 
     async purgeSessionData({ workspace, ...params }) {
-      if (!isLocalActiveWorkspaceClient(workspace)) throw new Error("project.data-local-only");
-      // 会话可能已加载在该 cwd 的 Agent 进程里：必须由那个进程删除，它才能判断运行中并释放会话；
-      // 绝不为删除拉起该项目的 Agent（文件夹可能已不存在），没有进程时交给管理面进程。
-      const client = await getReadOnlyClient(workspace, "existing-only").catch(() =>
-        getPluginManagementClient(),
+      if (!(await isWorkspaceOwnedByCurrentHostForSessionData(workspace))) {
+        throw new Error("project.data-local-only");
+      }
+      for (const directory of params.directories) {
+        if (
+          directory.workspaceIdentity?.trim() &&
+          !(await isWorkspaceOwnedByCurrentHostForSessionData(directory))
+        ) {
+          throw new Error("project.data-local-only");
+        }
+      }
+      // 复用 resolveSessionDeletionClient 同源门禁：优先命中热运行 CLI 保护 busy 会话，
+      // 仅在 ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE 且归属当前 Host 时回落管理面进程，绝不吞掉其他异常。
+      const client = await resolveSessionDeletionClient(workspace);
+      const result = await client.request(
+        V4_METHODS.sessionDataPurge,
+        params,
+        v4SessionDataPurgeResultSchema,
       );
-      return client.request(V4_METHODS.sessionDataPurge, params, v4SessionDataPurgeResultSchema);
+      // 仅清理实际 deleted 会话树（含各自 owned 子会话），kept（运行中/被引用）与 failed 均保留。
+      const deletedSessionIds = [
+        ...new Set(
+          result.deleted.flatMap((entry) =>
+            entry.sessionIds?.length ? entry.sessionIds : [entry.sessionId],
+          ),
+        ),
+      ];
+      if (deletedSessionIds.length > 0) {
+        await closeTaskBrowserSessionsBestEffort(
+          options?.browserControlExecutor,
+          {
+            workspacePath: workspace.workspacePath,
+            ...(workspace.workspaceIdentity
+              ? { workspaceIdentity: workspace.workspaceIdentity }
+              : {}),
+            sessionIds: deletedSessionIds,
+          },
+          (error) =>
+            logger.warn(undefined, "项目数据清理后回收浏览器会话失败", {
+              sessionIds: deletedSessionIds,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+        );
+      }
+      return result;
     },
 
     async getTaskTokenUsage(params: ZCodeAgentTaskTokenUsageParams) {
@@ -6159,9 +6719,9 @@ export function createZCodeAgentService(
 
     async runAutomationNow(params: ZCodeAgentAutomationIdParams) {
       const dispatch = options?.onAutomationManualRunRequested;
-      if (!dispatch) {
+      if (!dispatch || options?.canDispatchAutomationManualRun?.() === false) {
         // runNow 会先写 manual run 并占用 single-flight claim；dispatcher
-        // 缺失是同步可判定的配置错误，必须在认领前失败，不能依赖 stale 崩溃回收。
+        // 缺失或已关闭是同步可判定的错误，必须在认领前失败，不能写库或依赖 stale 回收。
         throw new Error("Automation immediate dispatcher is unavailable.");
       }
       const claimed = await automationService.runNow(params.automationId, {
@@ -7282,6 +7842,18 @@ export function createZCodeAgentService(
       // timeout/watchdog。放宽到审核领域 deadline 只会掩盖串行协议队列死锁。
       // duplicate 只证明 commandId 曾处理过，不证明其目标仍是当前 session 配置。
       // 旧 B 命令在用户已切 C 后重放时，不能借 duplicate 把派生缓存再改回 B。
+      if (
+        envelope.type === "resolveInteraction" &&
+        (ack.status === "accepted" || ack.status === "duplicate" || ack.status === "noop")
+      ) {
+        const interactionId = (envelope.payload as { interactionId?: string } | null)
+          ?.interactionId;
+        cancelWebPushInteraction({
+          workspace: params,
+          sessionId: envelope.sessionId,
+          interactionId,
+        });
+      }
       return ack;
     },
 
@@ -8048,7 +8620,24 @@ export function createZCodeAgentService(
   inProcessPluginUserOptionsReaders.set(service, {
     readPluginUserOptions: (params) => pluginHostQueries.readPluginUserOptions(params),
   });
+  inProcessInteractionDetailReaders.set(
+    service,
+    (interactionId) => interactionDetailsById.get(interactionId)?.detail,
+  );
   return service;
+}
+
+const inProcessInteractionDetailReaders = new WeakMap<
+  IZCodeAgentService,
+  (interactionId: string) => string | undefined
+>();
+
+/** 只由 node.ts / 测试装配在进程内读取交互详情缓存，不经 RPC 暴露。 */
+export function getInProcessPendingInteractionDetail(
+  service: IZCodeAgentService,
+  interactionId: string,
+): string | undefined {
+  return inProcessInteractionDetailReaders.get(service)?.(interactionId);
 }
 
 /**
@@ -8078,7 +8667,6 @@ function sessionTargetOf(
   };
 }
 
-/** JSON-RPC method-not-found：旧 CLI 不认识新方法。 */
 /** 批量预检的单项错误码：取错误消息（如 session-data.identity-mismatch），读不到时记为不可用。 */
 function sessionDeletionErrorCode(error: unknown): string {
   return (error instanceof Error && error.message) || "session-data.unavailable";

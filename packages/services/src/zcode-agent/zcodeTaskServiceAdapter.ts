@@ -141,6 +141,7 @@ import type {
   SessionMessageDeliveryResult,
   SessionMessageSendRequested,
 } from "#src/session/sessionMailbox.js";
+import { TRUSTED_FROZEN_EXECUTION_SNAPSHOT } from "#src/project-storage/contract.js";
 import { TaskIndexRepo } from "#src/session/taskIndexRepo.js";
 import type {
   IZCodeAgentService,
@@ -181,6 +182,10 @@ import {
   normalizeAvailableZCodeMode,
   settingsToConfigOptions,
 } from "./zcodeConfigOptions.js";
+import {
+  closeTaskBrowserSessionsBestEffort,
+  type BrowserAmbientContextExecutor,
+} from "./zcodeAgentBrowserAmbientContext.js";
 import type { CuaProductMcpServerResolver } from "#src/cua-permission-broker/index.js";
 import { registerMemoryDiagnosticsProvider } from "#src/memoryDiagnostics.js";
 
@@ -192,6 +197,7 @@ interface CreateZCodeTaskServiceAdapterOptions {
   taskIndexSyncer: ZCodeTaskIndexSyncer;
   settingService?: Pick<ISettingService, "get">;
   cuaProductMcpServerResolver?: CuaProductMcpServerResolver;
+  browserControlExecutor?: BrowserAmbientContextExecutor;
 }
 
 interface TaskTarget {
@@ -1737,6 +1743,24 @@ export function createZCodeTaskServiceAdapter(
     agentService.disposeAll();
   }
 
+  async function resolveArchivedTaskSessionDirectory(params: {
+    taskId: string;
+    workspacePath: string;
+    workspaceIdentity?: string;
+  }): Promise<string | undefined> {
+    try {
+      const repo = await taskIndexRepo.getProjectRepository();
+      const cwd =
+        repo.readTaskCwd(params) ??
+        (params.workspaceIdentity
+          ? repo.readTaskCwd({ taskId: params.taskId, workspacePath: params.workspacePath })
+          : null);
+      return cwd && cwd !== params.workspacePath ? cwd : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   const service: IZCodeTaskService & {
     disposeAll(): void;
     disposeAllAndWait(): Promise<void>;
@@ -1764,6 +1788,10 @@ export function createZCodeTaskServiceAdapter(
 
     async createTask(params): Promise<ZCodeTaskCreateResult> {
       const target = normalizeWorkspaceParams(params);
+      const trustedFrozenSnapshot =
+        (params as { [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]?: true })[
+          TRUSTED_FROZEN_EXECUTION_SNAPSHOT
+        ] === true;
       const requestedSelection =
         params.modelSelection ??
         (params.model
@@ -1785,6 +1813,9 @@ export function createZCodeTaskServiceAdapter(
           await options.zcodeAgentService.sendConversationCommandV4({
             ...target,
             projectId: params.projectId ?? null,
+            ...(trustedFrozenSnapshot
+              ? { [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]: true as const }
+              : {}),
             envelope: createHostCommandEnvelope({
               type: "createSession",
               sessionId: null,
@@ -1820,6 +1851,7 @@ export function createZCodeTaskServiceAdapter(
           ...target,
           projectId: params.projectId ?? null,
           additionalDirectories: params.additionalDirectories,
+          ...(trustedFrozenSnapshot ? { [TRUSTED_FROZEN_EXECUTION_SNAPSHOT]: true as const } : {}),
           sessionTraceId: createSessionTraceId(),
           mode: toZCodeMode(params.mode),
           model: requestedSelection,
@@ -2980,9 +3012,11 @@ export function createZCodeTaskServiceAdapter(
       const preview = options.zcodeAgentService.previewSessionDeletion;
       if (!preview) throw new Error("session-data.unavailable");
       const archived = await taskIndexRepo.isTaskArchived(params);
+      const sessionDirectory = await resolveArchivedTaskSessionDirectory(params);
       const result = await preview({
         sessionId: params.taskId,
         workspace: normalizeWorkspaceParams(params),
+        ...(sessionDirectory ? { sessionDirectory } : {}),
       });
       if (!archived && !result.completed && !result.incomplete)
         return { ...result, blockedReason: "not-archived" as const };
@@ -2993,11 +3027,15 @@ export function createZCodeTaskServiceAdapter(
       const preview = options.zcodeAgentService.previewSessionDeletions;
       if (!preview) throw new Error("session-data.unavailable");
       if (!tasks.length) return { results: [] };
-      const archived = await Promise.all(tasks.map((task) => taskIndexRepo.isTaskArchived(task)));
+      const [archived, sessionDirectories] = await Promise.all([
+        Promise.all(tasks.map((task) => taskIndexRepo.isTaskArchived(task))),
+        Promise.all(tasks.map((task) => resolveArchivedTaskSessionDirectory(task))),
+      ]);
       const { results } = await preview({
-        items: tasks.map((task) => ({
+        items: tasks.map((task, index) => ({
           sessionId: task.taskId,
           workspace: normalizeWorkspaceParams(task),
+          ...(sessionDirectories[index] ? { sessionDirectory: sessionDirectories[index] } : {}),
         })),
       });
       // 未归档判定与单项预检一致：已在删除或已完成的续删不受归档状态影响。
@@ -3024,10 +3062,12 @@ export function createZCodeTaskServiceAdapter(
           retainedArtifacts: 0,
           reason: "not-archived",
         };
+      const sessionDirectory = await resolveArchivedTaskSessionDirectory(params);
       // 响应丢失时保留准入；重试向 CLI 查询同一身份的持久结果，不把未知结果当作可恢复会话。
       const result = await execute({
         sessionId: params.taskId,
         workspace: normalizeWorkspaceParams(params),
+        ...(sessionDirectory ? { sessionDirectory } : {}),
         revision: params.revision,
         operationId: params.operationId,
       });
@@ -3046,13 +3086,32 @@ export function createZCodeTaskServiceAdapter(
     },
 
     async deleteArchivedTask(params): Promise<boolean> {
-      const meta = await taskIndexRepo.deleteArchivedTask(params);
-      if (!meta) return false;
+      // Bug 根因：原顺序先 taskIndexRepo.deleteArchivedTask（立即把 deleted 置 1）再让 CLI 删除。
+      // mutateSessionFacts 抛错时 SQLite 已被改成 deleted=1，刷新后失败项消失且无法重试。
+      // 修复：先确认当前处于已归档且未删除，再让 CLI 接受删除事实，最后才写 tombstone。
+      if (!(await taskIndexRepo.isTaskArchived(params))) return false;
       await taskIndexSyncer.mutateSessionFacts(
         { ...params, sessionId: params.taskId },
         { type: "delete" },
       );
-      emitWorkspaceTaskListChanged(params, meta, "task_deleted");
+      // CLI 成功后写 tombstone 并置 handoff_pending。mutateSessionFacts 的对账可能已按
+      // CLI deleted 事实把该行置 deleted=1，此时 deleteArchivedTask 返回 null；
+      // 删除事实已成立，仍按成功处理并广播，避免刷新/重连把任务复活。
+      const meta = await taskIndexRepo.deleteArchivedTask(params);
+      emitWorkspaceTaskListChanged(params, meta ?? undefined, "task_deleted");
+      await closeTaskBrowserSessionsBestEffort(
+        options.browserControlExecutor,
+        {
+          workspacePath: params.workspacePath,
+          ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+          sessionIds: [params.taskId],
+        },
+        (error) =>
+          logger.warn(undefined, "删除归档任务后回收浏览器会话失败", {
+            taskId: params.taskId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+      );
       return true;
     },
 
@@ -3073,15 +3132,16 @@ export function createZCodeTaskServiceAdapter(
         };
         try {
           // 保留逐项事务与归档 guard：一项失败不能回滚其它成功项，也不能提前隐藏失败项。
-          const meta = await taskIndexRepo.deleteArchivedTask(target);
-          if (!meta) {
+          if (!(await taskIndexRepo.isTaskArchived(target))) {
             result.skippedTaskIds.push(taskId);
             continue;
           }
+          // 先 CLI 后 tombstone：CLI 抛错时 repo 未被写成 deleted=1，失败项刷新后仍在归档列表。
           await taskIndexSyncer.mutateSessionFacts(
             { ...target, sessionId: taskId },
             { type: "delete" },
           );
+          await taskIndexRepo.deleteArchivedTask(target);
           result.deletedTaskIds.push(taskId);
         } catch (error) {
           result.failedTaskIds.push(taskId);
@@ -3092,6 +3152,19 @@ export function createZCodeTaskServiceAdapter(
         // 根因：循环调用单条接口会逐项广播，驱动 Host 与 UI 各自全量重读。
         // 批次完成只发一次 workspace 事件，仍使所有观察端换代 deleted membership，防止任务复活。
         emitWorkspaceTaskListChanged(params, undefined, "task_deleted");
+        await closeTaskBrowserSessionsBestEffort(
+          options.browserControlExecutor,
+          {
+            workspacePath: params.workspacePath,
+            ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+            sessionIds: result.deletedTaskIds,
+          },
+          (error) =>
+            logger.warn(undefined, "批量删除归档任务后回收浏览器会话失败", {
+              taskIds: result.deletedTaskIds,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+        );
       }
       logger.info(undefined, "[ArchivedTaskDeletion] batch completed", {
         workspaceKey: resolveWorkspaceKey(params),
@@ -3149,6 +3222,19 @@ export function createZCodeTaskServiceAdapter(
     async archiveTask(params): Promise<ZCodeTaskMeta> {
       const meta = await updateIndexedTaskState(params, { archived: true });
       emitWorkspaceTaskListChanged(params, meta, "task_archived");
+      await closeTaskBrowserSessionsBestEffort(
+        options.browserControlExecutor,
+        {
+          workspacePath: params.workspacePath,
+          ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+          sessionIds: [params.taskId],
+        },
+        (error) =>
+          logger.warn(undefined, "手动归档任务后回收浏览器会话失败", {
+            taskId: params.taskId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+      );
       return meta;
     },
 
@@ -3180,11 +3266,14 @@ export function createZCodeTaskServiceAdapter(
             workspaceIdentity: terminal.target.workspaceIdentity,
           };
           const inputId = activePromptInputIds.get(taskKey(target));
-          listener({
+          const payload: ZCodeTaskTerminalOutcome & { interrupted?: boolean } = {
             taskId,
             ...(inputId ? { inputId } : {}),
             outcome: terminal.kind === "turn.failed" ? "failed" : "succeeded",
-          });
+            ...(terminal.interrupted ? { interrupted: true } : {}),
+            ...(terminal.terminalAt !== undefined ? { terminalAt: terminal.terminalAt } : {}),
+          };
+          listener(payload);
         });
     },
 

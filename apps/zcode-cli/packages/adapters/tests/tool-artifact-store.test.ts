@@ -1,14 +1,23 @@
-import { mkdtemp, readdir, readFile, rm, unlink } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createSessionId, createToolCallId } from "@zcode/contracts";
+import { createSessionId, createToolCallId, type SessionId } from "@zcode/contracts";
 import {
   createStorageFsFaultInjector,
   resetStorageFsFaultInjectorForTests,
   setStorageFsFaultInjectorForTests,
 } from "../src/storage/fs-fault-injection.js";
-import { createNodeToolArtifactStore } from "../src/storage/index.js";
+import { createNodeToolArtifactStore, sanitizeArtifactFileName } from "../src/storage/index.js";
 
 describe("Node tool artifact store", () => {
   afterEach(() => {
@@ -498,5 +507,260 @@ describe("Node tool artifact store", () => {
     } finally {
       await rm(rootDir, { force: true, recursive: true });
     }
+  });
+
+  it("具名二进制落盘保留中文空格原名、隔离同名冲突并在写入失败时清理目录", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "zcode-tool-artifacts-named-"));
+    const store = createNodeToolArtifactStore({
+      imageCacheRootDir: join(rootDir, "image-cache"),
+      rootDir,
+      videoCacheRootDir: join(rootDir, "video-cache"),
+    });
+    const sessionId = createSessionId("named-session");
+
+    try {
+      const docxBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x01, 0x02]);
+      const docx = await store.writeToolResultBinaryArtifact!({
+        sessionId,
+        toolCallId: createToolCallId("upload-1"),
+        toolName: "prompt-attachment:file",
+        content: docxBytes,
+        contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        fileName: "日本文学史 复习资料 (期末).docx",
+        retention: "session",
+      });
+      expect(basename(docx.path!)).toBe("日本文学史 复习资料 (期末).docx");
+      expect(docx.path!).toBe(join(rootDir, sessionId, docx.id, "日本文学史 复习资料 (期末).docx"));
+      expect(docx.uri).toBe(`zcode-artifact://${sessionId}/${docx.id}`);
+      expect((await store.statToolResultArtifact!({ uri: docx.uri })).bytes).toBe(
+        docxBytes.byteLength,
+      );
+      expect(
+        Buffer.from((await store.readToolResultBinaryArtifact!({ uri: docx.uri })).bytes),
+      ).toEqual(docxBytes);
+
+      // 同名不同内容不覆盖
+      const firstReport = await store.writeToolResultBinaryArtifact!({
+        sessionId,
+        toolCallId: createToolCallId("upload-r1"),
+        toolName: "prompt-attachment:file",
+        content: Buffer.from("报告版本 A", "utf8"),
+        contentType: "text/plain",
+        fileName: "报告.txt",
+        retention: "session",
+      });
+      const secondReport = await store.writeToolResultBinaryArtifact!({
+        sessionId,
+        toolCallId: createToolCallId("upload-r2"),
+        toolName: "prompt-attachment:file",
+        content: Buffer.from("报告版本 B", "utf8"),
+        contentType: "text/plain",
+        fileName: "报告.txt",
+        retention: "session",
+      });
+      expect(firstReport.path).not.toBe(secondReport.path);
+      expect((await store.readToolResultArtifact({ uri: firstReport.uri })).content).toBe(
+        "报告版本 A",
+      );
+      expect((await store.readToolResultArtifact({ uri: secondReport.uri })).content).toBe(
+        "报告版本 B",
+      );
+
+      // 恶意路径与多字节超长名安全清洗
+      const traversal = await store.writeToolResultBinaryArtifact!({
+        sessionId,
+        toolCallId: createToolCallId("upload-evil"),
+        toolName: "prompt-attachment:file",
+        content: Buffer.from("evil"),
+        contentType: "application/octet-stream",
+        fileName: "../../etc/passwd",
+        retention: "session",
+      });
+      expect(traversal.path!).toBe(join(rootDir, sessionId, traversal.id, "passwd"));
+
+      const winDrive = await store.writeToolResultBinaryArtifact!({
+        sessionId,
+        toolCallId: createToolCallId("upload-win"),
+        toolName: "prompt-attachment:file",
+        content: Buffer.from([0x50, 0x4b]),
+        contentType: "application/zip",
+        fileName: "C:\\temp\\evil.zip",
+        retention: "session",
+      });
+      expect(winDrive.path!).toBe(join(rootDir, sessionId, winDrive.id, "evil.zip"));
+
+      // 符号链接子目录不可跟随读取
+      const outsideFile = join(rootDir, "outside.txt");
+      await writeFile(outsideFile, "secret");
+      await symlink(outsideFile, join(rootDir, sessionId, "tool-result-symlink-dir"));
+      await expect(
+        store.readToolResultArtifact({
+          uri: `zcode-artifact://${sessionId}/tool-result-symlink-dir`,
+        }),
+      ).rejects.toThrow(/not found/);
+
+      // 写入失败或 rename 发布失败时清理同级暂存目录，不留脏文件或空目录
+      const entriesBeforeFail = await readdir(join(rootDir, sessionId));
+      setStorageFsFaultInjectorForTests(
+        createStorageFsFaultInjector([
+          {
+            id: "named-write-enospc",
+            code: "ENOSPC",
+            operations: ["writeFile"],
+            pathIncludes: ".zcode-staging-",
+          },
+        ]),
+      );
+      await expect(
+        store.writeToolResultBinaryArtifact!({
+          sessionId,
+          toolCallId: createToolCallId("upload-fail"),
+          toolName: "prompt-attachment:file",
+          content: Buffer.from("boom"),
+          contentType: "text/plain",
+          fileName: "fail.txt",
+          retention: "session",
+        }),
+      ).rejects.toMatchObject({ code: "ENOSPC" });
+      expect(await readdir(join(rootDir, sessionId))).toEqual(entriesBeforeFail);
+
+      setStorageFsFaultInjectorForTests(
+        createStorageFsFaultInjector([
+          {
+            id: "named-rename-eprem",
+            code: "EPERM",
+            operations: ["rename"],
+            pathEndsWith: "/fail-rename.txt",
+          },
+        ]),
+      );
+      await expect(
+        store.writeToolResultBinaryArtifact!({
+          sessionId,
+          toolCallId: createToolCallId("upload-fail-rename"),
+          toolName: "prompt-attachment:file",
+          content: Buffer.from("boom"),
+          contentType: "text/plain",
+          fileName: "fail-rename.txt",
+          retention: "session",
+        }),
+      ).rejects.toMatchObject({ code: "EPERM" });
+      expect(await readdir(join(rootDir, sessionId))).toEqual(entriesBeforeFail);
+
+      // 具名子目录含多个文件、子目录或符号链接条目时必须明确报错（不静默返回任意文件）
+      const multiDir = join(rootDir, sessionId, "tool-result-multi");
+      await mkdir(multiDir, { recursive: true });
+      await writeFile(join(multiDir, "a.txt"), "A");
+      await writeFile(join(multiDir, "b.txt"), "B");
+      await expect(
+        store.readToolResultArtifact({ uri: `zcode-artifact://${sessionId}/tool-result-multi` }),
+      ).rejects.toThrow(/Ambiguous/);
+
+      const nestedDir = join(rootDir, sessionId, "tool-result-nested");
+      await mkdir(join(nestedDir, "inner"), { recursive: true });
+      await writeFile(join(nestedDir, "ok.txt"), "ok");
+      await expect(
+        store.readToolResultArtifact({ uri: `zcode-artifact://${sessionId}/tool-result-nested` }),
+      ).rejects.toThrow(/Invalid/);
+
+      // 上传名为 .zcode-tmp-report.txt 的合法文件必须完整 write -> read -> stat 往返
+      const tmpNamed = await store.writeToolResultBinaryArtifact!({
+        sessionId,
+        toolCallId: createToolCallId("upload-tmp-name"),
+        toolName: "prompt-attachment:file",
+        content: Buffer.from("TMP_NAME_REPORT", "utf8"),
+        contentType: "text/plain",
+        fileName: ".zcode-tmp-report.txt",
+        retention: "session",
+      });
+      expect(basename(tmpNamed.path!)).toBe(".zcode-tmp-report.txt");
+      expect((await store.readToolResultArtifact({ uri: tmpNamed.uri })).content).toBe(
+        "TMP_NAME_REPORT",
+      );
+      expect((await store.statToolResultArtifact!({ uri: tmpNamed.uri })).path).toBe(tmpNamed.path);
+
+      // sessionDir 为符号链接时，读取与写入（具名 + 平铺）均拒绝，且不在链接指向的外部目录创建任何文件
+      const symlinkSessionDir = join(rootDir, "symlink-session");
+      const externalDir = await mkdtemp(join(tmpdir(), "zcode-outside-session-"));
+      try {
+        await writeFile(join(externalDir, "tool-result-ext.txt"), "SECRET");
+        await symlink(externalDir, symlinkSessionDir);
+        await expect(
+          store.readToolResultArtifact({ uri: "zcode-artifact://symlink-session/tool-result-ext" }),
+        ).rejects.toThrow(/not found/);
+        await expect(
+          store.writeToolResultBinaryArtifact!({
+            sessionId: "symlink-session" as SessionId,
+            toolCallId: createToolCallId("sym-named"),
+            toolName: "prompt-attachment:file",
+            content: Buffer.from("nope"),
+            contentType: "text/plain",
+            fileName: "evil.txt",
+            retention: "session",
+          }),
+        ).rejects.toThrow(/Unsafe tool artifact session directory/);
+        await expect(
+          store.writeToolResultBinaryArtifact!({
+            sessionId: "symlink-session" as SessionId,
+            toolCallId: createToolCallId("sym-flat-bin"),
+            toolName: "prompt-attachment:file",
+            content: Buffer.from("nope"),
+            contentType: "application/octet-stream",
+            retention: "session",
+          }),
+        ).rejects.toThrow(/Unsafe tool artifact session directory/);
+        await expect(
+          store.writeToolResultArtifact({
+            sessionId: "symlink-session" as SessionId,
+            toolCallId: createToolCallId("sym-flat-text"),
+            toolName: "BigTool",
+            content: "nope",
+            contentType: "text/plain",
+            retention: "session",
+          }),
+        ).rejects.toThrow(/Unsafe tool artifact session directory/);
+        expect(await readdir(externalDir)).toEqual(["tool-result-ext.txt"]);
+      } finally {
+        await rm(externalDir, { force: true, recursive: true });
+      }
+
+      // ".." sessionId 被 sanitizePathSegment 隔离到 rootDir 内，不逃出根目录
+      const dotDotWritten = await store.writeToolResultBinaryArtifact!({
+        sessionId: ".." as SessionId,
+        toolCallId: createToolCallId("dotdot"),
+        toolName: "prompt-attachment:file",
+        content: Buffer.from("safe"),
+        contentType: "text/plain",
+        fileName: "safe.txt",
+        retention: "session",
+      });
+      expect(dotDotWritten.path!.startsWith(join(rootDir, "unknown"))).toBe(true);
+
+      // 旧平铺回退匹配按严格 artifactId 边界，不误匹配 prefix-10
+      await writeFile(join(rootDir, sessionId, "call-tool-result-10.txt"), "TEN");
+      await expect(
+        store.readToolResultArtifact({ uri: `zcode-artifact://${sessionId}/tool-result-1` }),
+      ).rejects.toThrow(/not found/);
+    } finally {
+      await rm(rootDir, { force: true, recursive: true });
+    }
+  });
+
+  it("sanitizeArtifactFileName 清洗控制字符、超长多字节名与 Windows 保留字", () => {
+    expect(sanitizeArtifactFileName("../../etc/passwd", ".bin", "linux")).toBe("passwd");
+    expect(sanitizeArtifactFileName("C:\\temp\\evil.zip", ".bin", "linux")).toBe("evil.zip");
+    expect(sanitizeArtifactFileName("a\x00b\x1fc\u0085d.txt", ".txt", "linux")).toBe("a_b_c_d.txt");
+    expect(sanitizeArtifactFileName("..", ".bin", "linux")).toBe("attachment.bin");
+    expect(sanitizeArtifactFileName(".", ".txt", "linux")).toBe("attachment.txt");
+    expect(sanitizeArtifactFileName("", ".pdf", "linux")).toBe("attachment.pdf");
+    expect(sanitizeArtifactFileName("CON.txt", ".txt", "win32")).toBe("_CON.txt");
+    expect(sanitizeArtifactFileName("a<b:c>?.txt. ", ".txt", "win32")).toBe("a_b_c__.txt");
+
+    const longChinese = `${"测".repeat(100)}.docx`;
+    const truncated = sanitizeArtifactFileName(longChinese, ".bin", "linux");
+    expect(Buffer.byteLength(truncated, "utf8")).toBeLessThanOrEqual(240);
+    expect(truncated.endsWith(".docx")).toBe(true);
+    // 确保按 Unicode 码点截断不产生孤立代理或替换字符
+    expect(Buffer.from(truncated, "utf8").toString("utf8")).toBe(truncated);
   });
 });

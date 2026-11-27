@@ -17,7 +17,16 @@ import {
   RequestSecurityWorkspaceBridge,
   setRequestSecurityReporter,
 } from "@/request-security-edition/index.js";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { LucideProvider, RefreshCw } from "lucide-react";
 import {
   APP_RUNTIME_PREFERENCES_CHANGED_BROADCAST_CHANNEL,
@@ -30,7 +39,10 @@ import { PlatformProvider } from "@/hooks/usePlatform.js";
 import { ServiceProvider, useComposerClientNamespace } from "@/hooks/useServices.js";
 import {
   readComposerWorkspaceScope,
+  readPendingTaskDraft,
   readV4ComposerDraft,
+  resolveComposerScope,
+  transferStaleProjectDraftToProjectlessScope,
   V4_DRAFT_SCOPE_ROOT,
 } from "@/v4/composer/composerDraftStore.js";
 import {
@@ -92,7 +104,10 @@ import { useWebRemoteControlAuthSync } from "@/web-remote-control/app/useWebRemo
 import { useRootOAuthEffects } from "@/root/useRootOAuthEffects.js";
 import { consumeZcodeJwtInvalidRestartMarker } from "@/root/zcodeJwtInvalidRestartMarker.js";
 import { useDesktopNativeThemeSync } from "@/root/useDesktopNativeThemeSync.js";
-import { useRootPlatformEffects } from "@/root/useRootPlatformEffects.js";
+import {
+  persistStandaloneWebNavigationSnapshot,
+  useRootPlatformEffects,
+} from "@/root/useRootPlatformEffects.js";
 import { useRootWorkspaceActions } from "@/root/useRootWorkspaceActions.js";
 import { useBotBroadcastEffects } from "@/root/useBotBroadcastEffects.js";
 import { registerBaseWorkspaceServices } from "@/store/remoteWorkspaceSessionStore.js";
@@ -228,12 +243,26 @@ function RootInner({
   initialWebRemoteControlMobileNavigationIntent,
   webRemoteControlTerminalTransportState,
   initialWorkspaceLoadingFallback,
+  mcpBaseHostDirectoryService,
+  standaloneWebNavigation = false,
+  standaloneWebDefaultWorkspacePath,
 }: RootProps) {
   const credentialRecovery = useCredentialStoreRecovery(isDesktop === true);
   useInterfaceModeTelemetry(platform, isDesktop === true);
+  // MCP 归属绑定必须早于子组件的 passive 读取 effect：父 layout effect 虽在子 layout 之后，
+  // 但同一 commit 内所有 layout effect 都先于任何 passive effect 执行，因此单独用
+  // useLayoutEffect 绑定，不能和下面的 telemetry 上报 effect（passive）混在一起。
+  useLayoutEffect(() => {
+    setMcpStorePlatform(platform, mcpBaseHostDirectoryService);
+    return () => {
+      // 保持入口归属、只清空平台引用：独立 Web base Host 需要保持 base-required，
+      // 避免卸载/重绑间隙回退成 platform 模式读到假空。
+      setMcpStorePlatform(null, mcpBaseHostDirectoryService === undefined ? undefined : null);
+    };
+  }, [platform, mcpBaseHostDirectoryService]);
+
   useEffect(() => {
     setRequestSecurityReporter(platform);
-    setMcpStorePlatform(platform);
     // 对话 UI perf 只属于 desktop-continuous；Web/mobile 即使能看到权威状态也不装 reporter。
     setUiPerfArmsReporter(isDesktop ? platform : null);
     setSessionOpenArmsReporter(isDesktop ? platform : null);
@@ -241,7 +270,6 @@ function RootInner({
     setSendFunnelArmsReporter(isDesktop ? platform : null);
     return () => {
       setRequestSecurityReporter(null);
-      setMcpStorePlatform(null);
       setUiPerfArmsReporter(null);
       setSessionOpenArmsReporter(null);
       setSendFunnelArmsReporter(null);
@@ -334,7 +362,7 @@ function RootInner({
   const { connectionLogs: remoteConnectionLogs, resetConnectionLogs: resetRemoteConnectionLogs } =
     useRemoteConnectionLogs(remoteConnectionRequestId);
   const [isBootstrappingInitialWorkspace, setIsBootstrappingInitialWorkspace] = useState(
-    Boolean(initialWorkspaceAbsPath),
+    Boolean(initialWorkspaceAbsPath || standaloneWebNavigation),
   );
   const acknowledgingReleaseNotesVersionRef = useRef<string | null>(null);
   const previousRemoteConnectionInProgressRef = useRef(false);
@@ -628,7 +656,6 @@ function RootInner({
     });
   const isResolvingProviderStartupState = shouldResolveProviderStartupState({
     isWebRemoteControlRoot,
-    providerStartupSyncPending,
     providerAvailabilityStartupCheckCompleted,
   });
   const isStartupProviderLoginEntryOpen = welcomeScreenOpenReason === "startup-provider-required";
@@ -700,6 +727,7 @@ function RootInner({
     setWelcomeScreenOpenReason("session-expired");
   }, []);
   const {
+    workspaceActionError,
     setWorkspaceActionError,
     startDraftInWorkspace,
     startNewTaskFromActiveWorkspace,
@@ -845,6 +873,7 @@ function RootInner({
     });
   }
 
+  const composerClientNamespace = useComposerClientNamespace();
   const handleResolveConversationWorkspaceForShell = useCallback(
     async () =>
       // Bug 原因：此前只回传 workspacePath，Shell 再按路径反查 identity；多设备 conversation 路径
@@ -853,9 +882,18 @@ function RootInner({
         getTabs: () => tabStoreApi.getState().tabs,
         activeWorkspacePath,
         activeWorkspaceIdentity,
+        getManagedPendingDraftWorkspacePath: () =>
+          readPendingTaskDraft(resolveComposerScope(null, undefined, composerClientNamespace))
+            ?.workspacePath ?? null,
         resolveLocalConversationWorkspacePath: handleResolveConversationWorkspace,
       }),
-    [activeWorkspacePath, activeWorkspaceIdentity, handleResolveConversationWorkspace, tabStoreApi],
+    [
+      activeWorkspacePath,
+      activeWorkspaceIdentity,
+      composerClientNamespace,
+      handleResolveConversationWorkspace,
+      tabStoreApi,
+    ],
   );
 
   useEffect(() => {
@@ -902,11 +940,40 @@ function RootInner({
     setWorkspaceActionError(null);
   }, [activeWorkspacePath, setWorkspaceActionError]);
 
-  const composerClientNamespace = useComposerClientNamespace();
   const restorePersistedSession = useCallback(
     async (...args: Parameters<typeof restoreWorkspaceTabs>) => {
       const restored = await restoreWorkspaceTabs(...args);
-      const restoreDraftIntents = () => {
+      const readLocalActiveProjectIds = async (): Promise<Set<string> | null> => {
+        const tabsSnapshot = tabStoreApi.getState().tabs;
+        const hasLocalScopedProject = tabsSnapshot.some((tab) => {
+          if (!isWorkspaceTab(tab) || tab.workspaceIdentity) return false;
+          const workspace = useZCodeSessionStore
+            .getState()
+            .getWorkspaceState(tab.workspacePath, tab.workspaceIdentity);
+          if (workspace.activeTaskId || workspace.draftProjectId !== undefined) return false;
+          const scope = readComposerWorkspaceScope(
+            tab.workspacePath,
+            tab.workspaceIdentity,
+            composerClientNamespace,
+          );
+          return Boolean(scope?.projectId);
+        });
+        if (!hasLocalScopedProject || !services.projectService) return null;
+        try {
+          const projects = await services.projectService.readProjects();
+          return new Set(
+            projects
+              .filter((project) => project.hostId === "local" && !project.deleted)
+              .map((project) => project.id),
+          );
+        } catch (error) {
+          // 读取失败不得当成项目已删除，保留原缓存作用域。
+          logger.warn("[Root] 冷恢复校验本地项目失败，保留原草稿归属", { error });
+          return null;
+        }
+      };
+      const activeLocalProjectIds = await readLocalActiveProjectIds();
+      const restoreDraftIntents = (validLocalProjectIds: Set<string> | null) => {
         // 桌面刷新通过历史 tab 恢复，不经过 initialWorkspace 入口。先恢复项目意图，
         // 再打开首屏门禁，避免 Composer 按未归类范围读取并预热同目录的项目草稿。
         for (const tab of tabStoreApi.getState().tabs) {
@@ -921,6 +988,31 @@ function RootInner({
             composerClientNamespace,
           );
           if (!scope) continue;
+          if (
+            !tab.workspaceIdentity &&
+            scope.projectId &&
+            validLocalProjectIds &&
+            !validLocalProjectIds.has(scope.projectId)
+          ) {
+            transferStaleProjectDraftToProjectlessScope({
+              staleWorkspacePath: tab.workspacePath,
+              workspaceIdentity: tab.workspaceIdentity,
+              staleProjectId: scope.projectId,
+              targetWorkspacePath: tab.workspacePath,
+              clientNamespace: composerClientNamespace,
+            });
+            useZCodeSessionStore
+              .getState()
+              .startDraft(tab.workspacePath, undefined, tab.workspaceIdentity, {
+                projectId: null,
+                taskGroupId: null,
+              });
+            logger.info("[Root] 冷恢复已清除失效项目归属并路由到无项目草稿", {
+              workspacePath: tab.workspacePath,
+              staleProjectId: scope.projectId,
+            });
+            continue;
+          }
           const draft = readV4ComposerDraft(
             tab.workspacePath,
             tab.workspaceIdentity,
@@ -940,20 +1032,20 @@ function RootInner({
           });
         }
       };
-      restoreDraftIntents();
+      restoreDraftIntents(activeLocalProjectIds);
       return {
         ...restored,
         ...(restored.deferredRestore
           ? {
               deferredRestore: () => {
                 restored.deferredRestore!();
-                restoreDraftIntents();
+                restoreDraftIntents(activeLocalProjectIds);
               },
             }
           : {}),
       };
     },
-    [restoreWorkspaceTabs, composerClientNamespace, tabStoreApi],
+    [restoreWorkspaceTabs, composerClientNamespace, services.projectService, tabStoreApi],
   );
 
   const { isRestoring, hasCompletedInitialRestore, hasCompletedFullRestore } = useTabPersistence({
@@ -1029,6 +1121,8 @@ function RootInner({
 
   useRootPlatformEffects({
     clientMode: isWebRemoteControlRoot ? "web-remote-replayable" : "desktop-continuous",
+    standaloneWebNavigation,
+    standaloneWebDefaultWorkspacePath,
     initialWorkspaceAbsPath,
     initialWorkspaceIdentity,
     initialWorkspacePurpose,
@@ -1183,6 +1277,51 @@ function RootInner({
     onRemoteWorkspaceTabsClosed: handleRemoteWorkspaceUserClose,
   });
 
+  const standaloneActiveTaskId = useZCodeSessionStore((state) =>
+    standaloneWebNavigation && workspaceShellPath
+      ? state.getWorkspaceState(workspaceShellPath, workspaceShellIdentity).activeTaskId
+      : null,
+  );
+  const standaloneDraftProjectId = useZCodeSessionStore((state) =>
+    standaloneWebNavigation && workspaceShellPath
+      ? state.getWorkspaceState(workspaceShellPath, workspaceShellIdentity).draftProjectId
+      : undefined,
+  );
+  useEffect(() => {
+    if (
+      !standaloneWebNavigation ||
+      !canRestoreWorkspaceSession ||
+      isBootstrappingInitialWorkspace ||
+      isCreatingFallbackWorkspace ||
+      !workspaceShellPath
+    ) {
+      return;
+    }
+    const targetTab = windowWorkspaceTabs.find(
+      (tab) =>
+        (tab.workspaceIdentity?.trim() || tab.workspacePath) ===
+        (workspaceShellIdentity?.trim() || workspaceShellPath),
+    );
+    if (!targetTab) return;
+    persistStandaloneWebNavigationSnapshot({
+      workspacePath: targetTab.workspacePath,
+      ...(targetTab.workspaceIdentity ? { workspaceIdentity: targetTab.workspaceIdentity } : {}),
+      ...(targetTab.workspacePurpose ? { workspacePurpose: targetTab.workspacePurpose } : {}),
+      taskId: standaloneActiveTaskId ?? null,
+      ...(standaloneActiveTaskId ? {} : { projectId: standaloneDraftProjectId ?? null }),
+    });
+  }, [
+    canRestoreWorkspaceSession,
+    isBootstrappingInitialWorkspace,
+    isCreatingFallbackWorkspace,
+    standaloneActiveTaskId,
+    standaloneDraftProjectId,
+    standaloneWebNavigation,
+    windowWorkspaceTabs,
+    workspaceShellIdentity,
+    workspaceShellPath,
+  ]);
+
   useEffect(() => {
     if (
       shouldBlockRootRender({
@@ -1195,6 +1334,7 @@ function RootInner({
       workspaceShellPath ||
       isSettingsTabActive ||
       !allowOpenWorkspace ||
+      (standaloneWebNavigation && Boolean(workspaceActionError)) ||
       didRequestFallbackWorkspaceRef.current
     ) {
       return;
@@ -1208,6 +1348,22 @@ function RootInner({
     // 这里不能用当前 effect 的 cleanup 作为异步取消标记：setIsCreatingFallbackWorkspace
     // 或 addTab 后的 workspaceShellPath 变化都会让 React 先跑 cleanup，若因此跳过 finally，
     // 启动 loading gate 会永远保持 true。
+    if (!isDesktop && !isWebRemoteControlRoot) {
+      void handleEnsureConversationWorkspace()
+        .catch((error) => {
+          if (!rootInnerMountedRef.current) {
+            return;
+          }
+          logger.error("[Root] 启动兜底创建默认 workspace 失败", { error });
+          setWorkspaceActionError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          if (rootInnerMountedRef.current) {
+            setIsCreatingFallbackWorkspace(false);
+          }
+        });
+      return;
+    }
     services.fileService
       .ensureConversationWorkspace()
       .then((result) => {
@@ -1237,16 +1393,21 @@ function RootInner({
       });
   }, [
     allowOpenWorkspace,
+    handleEnsureConversationWorkspace,
     handleSelectConversationWorkspace,
     isBootstrappingInitialWorkspace,
+    isDesktop,
     isResolvingProviderStartupState,
     isResolvingStartupAuthState,
     isRestoring,
     isSettingsTabActive,
     isStartupProviderLoginEntryOpen,
+    isWebRemoteControlRoot,
     services.fileService,
     setWorkspaceActionError,
+    standaloneWebNavigation,
     tabStoreApi,
+    workspaceActionError,
     workspaceShellPath,
   ]);
 

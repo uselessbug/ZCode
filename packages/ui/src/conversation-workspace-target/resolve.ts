@@ -27,7 +27,12 @@ export async function resolveConversationWorkspaceTarget(
   ) {
     throw new Error("Remote projects require a project workspace");
   }
-  if (activeTab?.workspacePurpose === "conversation")
+  const managedPendingDraftWorkspacePath = params.getManagedPendingDraftWorkspacePath?.();
+  if (
+    activeTab?.workspacePurpose === "conversation" &&
+    (!managedPendingDraftWorkspacePath ||
+      activeTab.workspacePath !== managedPendingDraftWorkspacePath)
+  )
     return { workspacePath: activeTab.workspacePath };
   return { workspacePath: await params.resolveLocalConversationWorkspacePath() };
 }

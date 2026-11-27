@@ -697,3 +697,21 @@ Composer PDF 使用独立的 `TurnAttachment.type = "pdf"` 和 shared
 omit PDF data 并保留 `[PDF: source: <path>]`，切回支持模型时从同一 artifact 恢复。Composer 和
 已发送 row 维持文档卡片形态，但统一使用 PdfViewer 与精确 row/part 授权的 attachment range
 read；relay/main 不保存 PDF bytes 或 session 业务状态。
+
+## 普通上传文件具名落盘与桌面预读对齐（2026-11-16）
+
+- 协议边界（`attachment-refs.ts`）：对于 `zcode-artifact://` URI 形态的普通文件引用（非本地路径、非 `image`/`video`/`pdf`），统一保留 `{ content: ref.ref, type: "file", ...displayMeta }`（保留 `sourceKind` 与 `messageCount`），不在协议映射层提前按 UTF-8 解码，也不因大小丢弃 `ref.ref` 或将 `ref.fileName` 冒充本地磁盘路径 `path`。
+- 具名落盘契约（`ToolBinaryArtifactWriteRequest` / `NodeToolArtifactStore`）：
+  - `ToolBinaryArtifactWriteRequest` 增加可选 `fileName?: string`。未传 `fileName` 时完全保持既有平铺文件布局；传入 `fileName` 时写入 `<rootDir>/<sanitizedSessionId>/<artifactId>/<safeFileName>` 子目录，返回的 `uri` 保持 `zcode-artifact://<sessionId>/<artifactId>` 不变，`path` 为该真实具名文件完整路径。
+  - 安全文件名清洗在 storage adapter 内统一完成：先同时按 `/` 与 `\` 取最后一段 basename 并剥离 `^[A-Za-z]:` 盘符前缀；Linux 下完整保留 UTF-8 中文、日韩俄文、字母数字、空格与常规标点，将 `/`、`\`、NUL 及 C0/C1 控制字符替换为 `_`（Windows 额外替换 `<>:"|?*` 并去除末尾点/空格与保留设备名）；禁止 `.` 或 `..`；按 UTF-8 字节上限（`<= 240` bytes）按 Unicode 码点安全截断并尽量保留原扩展名；为空时回退 `attachment<normalizedExtension>`；写入失败时清理本次新建的 `<artifactId>` 目录，不留脏文件。
+  - `readArtifactFile` 与 `statToolResultArtifact` 共用统一定位 helper：先检查精确非符号链接目录 `<sessionDir>/<artifactId>` 内的合法普通文件（按叶子文件名推断 `contentType`，`stat` 不读取整文件），不存在目录时回退既有顶层平铺文件匹配逻辑。`ensureMediaAttachmentPath` 现有 URI 哈希缓存不变。
+- core 解析与预读统一（`attachments.ts` / `attachment-path-reference.ts`）：
+  - `clipboard-text` / `topic-history` 上传分支调用 `writeToolResultBinaryArtifact` 时传入 `fileName: attachment.filename || "pasted-text.txt"`，落盘为 `<artifactId>/<safeFileName>`，保持延迟读取 `local_ref` 与双 `zcode-artifact://` URI。
+  - 普通上传文件（`attachment.type === "file"` 且 `attachment.content?.startsWith("zcode-artifact://")`）：
+    1. 通过 `artifactStore.readToolResultArtifact` 读回原上传 `data:` artifact 并解码真实字节，然后调用 `writeToolResultBinaryArtifact`（`retention: "session"`，`fileName: attachment.filename`）写入 `<artifactId>/<safeFileName>`；不再使用 64 KiB 硬切分内联分支。
+    2. 按严格 UTF-8（`new TextDecoder("utf-8", { fatal: true })` 且无 NUL 或除 `\t`/`\n`/`\r` 外的 C0 控制字节）配合 `hasPositiveTextAttachmentType`（排除 `.zip`/`.docx` 等显式二进制扩展名，支持无扩展名显式安全文本 MIME）分类：
+       - **安全 UTF-8 文本**（含 0 字节空文本、`.json`、`.vue`、70 KiB–256 KiB 日志、>256 KiB 超大文本等）：直接将具名 `written.path` 交给桌面同款 `resolveLocalFileAttachment` / `readTextFileForModel`（无扩展名文本传入已知文本提示避免误判二进制），与桌面端共享同一套 256 KiB + 25,000 token 上限、超限前段部分视图与路径提示、`mime: "text/plain"`、`source` 与 `preview`。
+       - **二进制、未知格式或含非法 UTF-8/控制字节**：复用 `resolvedPathReferenceAttachment` 生成 `binary_file` 本地引用（`path` 即带真实原文件名的 `written.path`）。
+    3. 无论文本内联预览还是 `local_ref`，统一合并保留双 `zcode-artifact://` URI：`url` 存新原始字节 URI（`written.uri ?? attachment.content`），`metadata.artifactUri` 与 `metadata.originalUrl` 存原上传 URI，保障冷恢复与 `listArtifactReferrers` / `purgeSessionDataWith` / 永久删除的引用保护。
+    4. `artifactStore` 缺失、原 URI 读取/解码失败或落盘失败/无有效路径时，返回 `attachment_read_failed` 占位结果。
+- 内部字节解码与网关边界：`create-app.ts` 的 `decodePromptAttachmentDataUrl` 放开合法 `type/subtype` MIME 的 base64 data URL 解码，保证上传的 `.zip`/`.docx`/`.json` 等 artifact 在内部字节读取时不被拒绝；`v4-gateway.ts` 原有的媒体预览白名单边界保持不变。

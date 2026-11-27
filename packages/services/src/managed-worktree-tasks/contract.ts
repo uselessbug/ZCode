@@ -28,7 +28,7 @@ export type StartManagedWorktreeCreationResult =
   | { ok: false; error: ManagedWorktreeError };
 
 /**
- * 受管 worktree 的唯一管理者（docs/git/worktree.md §5.1）。仅本地桌面 Host。
+ * 受管 worktree 的唯一管理者（docs/git/worktree.md §5.1）。本地桌面 Host 与显式开启的独立 Web Server 可用。
  * worktree 事实 = git worktree list + 受管布局；任务归属 = tasks-index worktree_root；
  * 正在进行的创建 = 本服务内存中的创建记录。
  */

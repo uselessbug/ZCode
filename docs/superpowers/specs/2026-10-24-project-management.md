@@ -80,7 +80,7 @@
 
 不删除：用户的项目文件夹（包括 ZCode 自建的 `~/.zcode/workspace/<id>`）、应用与 CLI 日志（已有 14 天 / 7 天轮转）、git 仓库里的检查点引用、远程设备上的数据。
 
-项目的会话 = Host 树中该项目的全部任务（含已归档、已软删除）。目录集合 = 项目 roots ∪ 这些会话的 cwd，减去仍被范围外的项目作为 root（**含已软删除的项目**：它们可以恢复，2026-10-25 裁决宁可保留不删）、或被不在本次删除范围内的会话作为 cwd 使用的目录（共享目录的记忆与检查点保留）。「范围外的会话」= 本 Host 上 `tasks.deleted=0` 的任务行：移除项目只软删除项目行，其任务行保持 `deleted=0`，因此已移除项目的会话 cwd 照样受保护；`deleted=1` 只表示会话本身已删除（用户删除会话，或本流程目录失败时标记的行），已删除的会话无法恢复，其 cwd 不再保护。目录集合在删除任务索引行**之前**计算，否则已删任务曾用的 cwd（如项目 roots 变更前的旧目录）会漏删。
+项目的会话 = Host 树中该项目的全部任务（含已归档、已软删除）。目录集合 = 项目 roots ∪ 这些会话的目录（受管 worktree 任务的 `cwd` 位于临时 `worktree_root` 下，其记忆与检查点归属主 `workspacePath`，不把已删除或临时 worktree 子目录当作独立记忆目录），减去仍被范围外的项目作为 root（**含已软删除的项目**：它们可以恢复，2026-10-25 裁决宁可保留不删）、或被不在本次删除范围内的会话作为 cwd 使用的目录（共享目录的记忆与检查点保留）。「范围外的会话」= 本 Host 上 `tasks.deleted=0` 的任务行：移除项目只软删除项目行，其任务行保持 `deleted=0`，因此已移除项目的会话 cwd 照样受保护；`deleted=1` 只表示会话本身已删除（用户删除会话，或本流程目录失败时标记的行），已删除的会话无法恢复，其 cwd 不再保护。目录集合在删除任务索引行**之前**计算，否则已删任务曾用的 cwd（如项目 roots 变更前的旧目录）会漏删。
 
 **数据库文件不收缩（2026-10-24 裁决）**：CLI 库 `auto_vacuum = none`，删除行只把页留给库内复用，文件大小不变。切换增量 vacuum 需要一次整库 VACUUM，持有写锁约 10 s/2 GB，超过其他进程 5 s 的锁等待，会让运行中的会话写入失败；属于 CLI 存储维护的独立决策，本期不做。因此所有展示的大小只统计**真正从磁盘删除的文件**；数据库行照样删除但不计入大小。
 
@@ -98,9 +98,9 @@
 
 `IProjectService.measureProjectData(ids, hostId?)` → `{ projects: { id, sessions, sessionBytes, checkpointBytes, memoryBytes }[] }`；`IProjectService.deleteProjectData(id, hostId?)` → `{ freedBytes, deletedSessions, runningSessions, referencedSessions, failed }`（`runningSessions` / `referencedSessions` = 因运行中 / 附件被引用而保留的会话数；`failed` = 删除失败的会话数 + 目录数）。
 
-- 只在本机 Host 执行；路由到远程 Host 报 `project.data-local-only`，legacy 单 root 只读。
+- 只在本机 Host 与显式开启的独立 Web Server（`serviceAuthorityMode === "standalone-server"` 且 `allowStandaloneCloudWorkspaces === true`）执行；路由到普通远程 Host、未开启独立数据开关或跨 Host 调用仍报 `project.data-local-only`，legacy 单 root 只读。
 - `deleteProjectData` 只接受**已软删除**的项目（否则 `project.data-requires-removed`），保证不会删到仍在使用的项目。
-- 会话按 cwd 分组：该 cwd 已有运行中的 Agent 进程时交给该进程执行（它持有会话运行态，能判断运行中并释放已加载的会话）；否则交给不寄居真实项目的管理面进程（与全局工作流、插件管理同一进程）。测量只读，与全局工作流同一载体选择：本机已有活跃 Agent 进程时用它，否则用管理面进程。
+- 会话按 `resolveWorkspaceKey(session)`（优先 canonical `workspaceIdentity`，缺省回退 `workspacePath`）分组：该 workspace 已有运行中的 Agent 进程时交给该进程执行（它持有会话运行态，能判断运行中并释放已加载的会话）；否则仅当属于本机或当前 standalone Host canonical 身份时交给不寄居真实项目的管理面进程（与全局工作流、插件管理同一进程），其他非 runtime-unavailable 异常原样透传不降级。目录集合在 standalone 下对每个可删目录（含 0 会话项目 root）独立解析 canonical `workspaceIdentity` 并传给 CLI `v4/storage/sessionData/*`（确保命中 `project-<sha256(identity).slice(0,16)>` 记忆目录），测量同样校验携带 `workspaceIdentity` 的目录归属当前 Host。测量只读，与全局工作流同一载体选择：本机已有活跃 Agent 进程时用它，否则用管理面进程。
 - CLI 删除：运行中的会话（已加载且有在途 turn）保留并返回 `kept`（`reason: "running"`）。附件仍被本次不删除的未删除会话引用的会话树整棵保留（`reason: "referenced"`）：fork、回退与工作流转录按值复制 part，`zcode-artifact://<源会话>/…` 仍指向源会话的附件目录，删掉会让存活的 fork 读不到图片与工具产物；引用按 part 内容中的 artifact URI 判定（覆盖所有复制路径，不依赖 fork 谱系），保留一棵会让引用它的树也变成「本次不删除」，按不动点迭代。已加载的空闲会话按 `deleteSession` 的释放顺序关闭，但**不**发布 `session.removed`（只释放运行态）；随后删除文件，再在一个事务里删除会话行（`pragma foreign_keys = on`，级联 message/part/usage 等；无外键的 `input_history`、`dwf_run`、`workflow_run` 显式删除），最后才从 sessions-index 移除。文件删除失败不删行，记入 `failed`，sessions-index 与 Host 镜像保持原样，下次重试仍能找到。
 - Host 在 CLI 返回后计算目录集合（保留或失败会话的 cwd 不删记忆与检查点），删除目录，再处理已删会话的任务索引行：目录全部删除成功时删除这些行，项目不再被任何任务、自动化、闲时任务引用时删除项目行；有目录删除失败时只把这些行标为 CLI 已删除（`deleted=1, cli_deleted=1`，列表不再显示），项目保持软删除，重试时仍能按这些行找回目录。命令正常返回部分结果，不因保留而抛错（释放量要计入进度）；UI 对 `runningSessions > 0` 记原因 `project.data-session-running`、对 `referencedSessions > 0` 记 `project.data-session-referenced`、对 `failed > 0` 记 `project.data-delete-failed`。
 - 结果以 `state:projects` 广播；sessions-index 的 `session.removed` 迟到时，对已不存在的行是空操作。

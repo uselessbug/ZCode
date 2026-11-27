@@ -173,6 +173,8 @@ export interface ZCodeTaskTerminalOutcome {
   outcome: "succeeded" | "failed" | "stopped";
   /** 失败时的错误信息。 */
   error?: string;
+  /** 会话进入该终态的稳定时间戳（terminalAt ?? 终态帧 lastActivityAt），供通知构造同一回合的事件键。 */
+  terminalAt?: number;
 }
 
 /** 一次输入轮次已经真正收口，session 可以安全接受下一条输入。 */

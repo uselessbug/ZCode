@@ -11,6 +11,7 @@ import { createNodeWebSocket } from "@hono/node-ws";
 import type { WebSocket } from "ws";
 import {
   Emitter,
+  Event,
   VSBuffer,
   SocketProtocol,
   ChannelServer,
@@ -25,13 +26,33 @@ import {
   IZCodeAgentService,
   createZCodeAgentConnectionScope,
   IBotsService,
+  IManagedWorktreeService,
   IProviderProvisioningTargetService,
+  IProjectService,
+  ITerminalService,
+  IWebPushService,
+  WebPushValidationError,
 } from "@zcode/services";
 import {
+  WEB_PUSH_API_CONFIG_PATH,
+  WEB_PUSH_API_SUBSCRIPTIONS_PATH,
+  WEB_PUSH_API_UNSUBSCRIBE_PATH,
+  WEB_PUSH_MANIFEST_PATH,
+  WEB_PUSH_SERVICE_WORKER_PATH,
+  webPushSubscribeRequestSchema,
+  webPushUnsubscribeRequestSchema,
+} from "@zcode/shared/web-push";
+import {
   botProviders,
+  buildServerRemoteWorkspaceIdentity,
+  remoteHostIdFromWorkspaceIdentity,
   formatLogPrefix,
   serverRemoteInfoOutputSchema,
   SERVER_REMOTE_PROTOCOL_VERSION,
+  STANDALONE_TERMINAL_OWNER_CLOSE_API_PATH,
+  STANDALONE_TERMINAL_OWNER_CLOSE_CODE,
+  STANDALONE_TERMINAL_OWNER_SUBPROTOCOL,
+  STANDALONE_TERMINAL_OWNER_SUBPROTOCOL_PREFIX,
   ZCODE_RPC_HOST_CAPABILITY_HEADER,
   ZCODE_COMPATIBILITY_MANIFEST,
   ZCODE_VERSION,
@@ -40,7 +61,12 @@ import {
   type ServerRemoteWorkspaceInfo,
 } from "@zcode/shared";
 import {
+  createStandaloneTerminalOwners,
+  createTerminalScope,
   SourceServerWorkspaceIdentityChannelServer,
+  type StandaloneTerminalConnectionLease,
+  type StandaloneTerminalOwnerBindRequest,
+  type StandaloneTerminalOwners,
   type SourceServerWorkspaceIdentityMapper,
 } from "@zcode/services/node";
 import { createHostCapabilityStore } from "./hostCapability.js";
@@ -87,12 +113,85 @@ function wrapWebSocket(ws: WebSocket): ISocket {
 const log = (...args: unknown[]) =>
   console.log(formatLogPrefix("zcode-server:http", process.pid), ...args);
 
+// Adapt only the standalone browser's "local" project label to this server.
+// Storage remains owned by the canonical remote host; other hosts still fail closed.
+function projectHost(value: unknown, from: string, to: string): any {
+  if (Array.isArray(value)) return value.map((item) => projectHost(item, from, to));
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      key === "hostId" && item === from ? to : projectHost(item, from, to),
+    ]),
+  );
+}
+
+function createStandaloneProjectAlias<T extends object>(service: T, ownerHostId: string): T {
+  if (!ownerHostId || ownerHostId === "local") throw new Error("Canonical remote owner required");
+  // 恢复项目与本服务器项目数据估算/清理同样以第二个位置参数传 Host，遗漏转换会把 local 错路由到离线 Host。
+  const positionalHostMethods = new Set([
+    "deleteProject",
+    "restoreProject",
+    "reorderProjects",
+    "resolveSessionDirectories",
+    "measureProjectData",
+    "deleteProjectData",
+  ]);
+  return new Proxy(service, {
+    get(target, property) {
+      const method = Reflect.get(target, property);
+      if (typeof method !== "function") return method;
+      return async (...args: unknown[]) => {
+        const input = args.map((arg) => projectHost(arg, "local", ownerHostId));
+        if (positionalHostMethods.has(String(property)) && input[1] === "local")
+          input[1] = ownerHostId;
+        const result = await method.apply(target, input);
+        return projectHost(result, ownerHostId, "local");
+      };
+    },
+  });
+}
+
+const STANDALONE_TERMINAL_WS_PING_INTERVAL_MS = 15_000;
+const STANDALONE_TERMINAL_TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+
+function parseStandaloneTerminalOwnerSubprotocol(
+  headerValue: string | undefined,
+): StandaloneTerminalOwnerBindRequest | { kind: "none" } | { kind: "invalid" } {
+  if (headerValue === undefined) {
+    return { kind: "none" };
+  }
+  const protocols = headerValue
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (protocols.length !== 1) {
+    return { kind: "invalid" };
+  }
+  const protocol = protocols[0];
+  if (protocol === STANDALONE_TERMINAL_OWNER_SUBPROTOCOL) {
+    return { kind: "fresh" };
+  }
+  if (!protocol?.startsWith(STANDALONE_TERMINAL_OWNER_SUBPROTOCOL_PREFIX)) {
+    return { kind: "invalid" };
+  }
+  const resumeToken = protocol.slice(STANDALONE_TERMINAL_OWNER_SUBPROTOCOL_PREFIX.length);
+  if (!STANDALONE_TERMINAL_TOKEN_PATTERN.test(resumeToken)) {
+    return { kind: "invalid" };
+  }
+  return { kind: "resume", resumeToken };
+}
+
 function setupChannelServer(
   ws: WebSocket,
   services: ServiceCollection,
   clientMode: "desktop-continuous" | "web-remote-replayable",
   workspaceIdentityMapper?: SourceServerWorkspaceIdentityMapper,
   resourcePeers?: TopicResourcePeers,
+  standaloneTerminalOwner?: {
+    owners: StandaloneTerminalOwners;
+    request: StandaloneTerminalOwnerBindRequest;
+  },
 ) {
   const socket = wrapWebSocket(ws);
   const protocol = new SocketProtocol(socket);
@@ -131,8 +230,142 @@ function setupChannelServer(
       },
     });
   }
+  // 受管 worktree 仅在受信 Desktop Host 或显式开启独立 Web 兼容的端上暴露；
+  // 未开启独立 Web 兼容的远控终端客户端一律拒绝 worktree.local-only。
+  if (
+    clientMode !== "desktop-continuous" &&
+    process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS !== "1" &&
+    services.getOptional(IManagedWorktreeService)
+  ) {
+    const rejectLocalOnly = async (): Promise<never> => {
+      throw new Error("worktree.local-only");
+    };
+    const disabledManagedWorktreeService: IManagedWorktreeService = {
+      startNewTask: rejectLocalOnly,
+      forkToWorktree: rejectLocalOnly,
+      retryCreation: rejectLocalOnly,
+      continueWithoutWorktree: rejectLocalOnly,
+      dismissCreation: rejectLocalOnly,
+      listCreations: rejectLocalOnly,
+      onDidChangeCreations: Event.None,
+      onDidSettleCreation: Event.None,
+      listWorktrees: rejectLocalOnly,
+      removeWorktree: rejectLocalOnly,
+      pruneWorktrees: rejectLocalOnly,
+      listStartRefs: rejectLocalOnly,
+      isWorktreeAvailable: rejectLocalOnly,
+      supportsWorktreeCwd: rejectLocalOnly,
+    };
+    overrides.set(IManagedWorktreeService.channelName, disabledManagedWorktreeService);
+  }
+  if (
+    clientMode === "web-remote-replayable" &&
+    process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"
+  ) {
+    const ownerHostId = remoteHostIdFromWorkspaceIdentity(
+      buildServerRemoteWorkspaceIdentity({
+        serverId: resolveHttpServerId(),
+        workspacePath: "/",
+      }),
+    );
+    const projectService = services.getOptional(IProjectService);
+    if (!ownerHostId || !projectService)
+      throw new Error("Standalone Web project authority unavailable");
+    overrides.set(
+      IProjectService.channelName,
+      createStandaloneProjectAlias(projectService, ownerHostId),
+    );
+  }
+  if (services.getOptional(IWebPushService)) {
+    // Web Push 管理只走同源鉴权 HTTP API，不允许 WebSocket RPC 触发内部推送或关闭服务。
+    overrides.set(IWebPushService.channelName, {});
+  }
+  let lease: StandaloneTerminalConnectionLease | undefined;
+  let legacyTerminalScope: ReturnType<typeof createTerminalScope> | undefined;
+  if (clientMode === "web-remote-replayable") {
+    const terminalService = services.getOptional(ITerminalService);
+    if (terminalService) {
+      if (standaloneTerminalOwner) {
+        lease = standaloneTerminalOwner.owners.bind(
+          standaloneTerminalOwner.request,
+          terminalService,
+          () => {
+            // 同页新连接已接管或显式结束该作用域，立即中止旧/半开 socket 释放 RPC 资源。
+            try {
+              ws.terminate();
+            } catch {
+              // ignore
+            }
+          },
+        );
+        overrides.set(ITerminalService.channelName, lease.service);
+      } else {
+        // 旧客户端或未带页面 owner 子协议的 /ws 连接按 attachment 生命周期隔离并随断线回收 PTY。
+        legacyTerminalScope = createTerminalScope(terminalService, (error) => {
+          log("failed to dispose attachment terminal scope", error);
+        });
+        overrides.set(ITerminalService.channelName, legacyTerminalScope.service);
+      }
+    }
+  }
   services.exposeOnChannelServer(server, overrides);
+  if (legacyTerminalScope && ws.readyState === ws.CLOSED) {
+    legacyTerminalScope.dispose();
+  }
+  let stopStandalonePing: (() => void) | undefined;
+  if (lease) {
+    let isAlive = true;
+    const onPong = () => {
+      isAlive = true;
+    };
+    const onMessage = () => {
+      isAlive = true;
+    };
+    ws.on("pong", onPong);
+    ws.on("message", onMessage);
+    const pingTimer = setInterval(() => {
+      if (ws.readyState !== ws.OPEN) return;
+      if (!isAlive) {
+        ws.terminate();
+        return;
+      }
+      isAlive = false;
+      try {
+        ws.ping();
+      } catch {
+        ws.terminate();
+      }
+    }, STANDALONE_TERMINAL_WS_PING_INTERVAL_MS);
+    pingTimer.unref?.();
+
+    let finalized = false;
+    const finalizeLease = (code?: number) => {
+      if (finalized) return;
+      finalized = true;
+      clearInterval(pingTimer);
+      ws.off("pong", onPong);
+      ws.off("message", onMessage);
+      lease.release({
+        explicitEnd: code === STANDALONE_TERMINAL_OWNER_CLOSE_CODE,
+      });
+    };
+    stopStandalonePing = () => {
+      clearInterval(pingTimer);
+      ws.off("pong", onPong);
+      ws.off("message", onMessage);
+    };
+
+    if (ws.readyState === ws.CLOSED) {
+      finalizeLease();
+    } else {
+      ws.once("close", (code) => {
+        finalizeLease(code);
+      });
+    }
+  }
   socket.onClose(() => {
+    stopStandalonePing?.();
+    legacyTerminalScope?.dispose();
     peer?.dispose();
     reverseClient?.dispose();
     void connectionScope?.dispose();
@@ -196,6 +429,9 @@ function createServerInfo(options: HttpServerOptions): ServerRemoteInfo {
       desktopContinuous: true,
       websocketRpc: true,
       ...(options.virtualProjects ? { virtualProjects: true } : {}),
+      ...(process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"
+        ? { managedWorktrees: true, standaloneTerminalOwners: true }
+        : {}),
       processResourceTelemetry: true,
       remoteConversationTelemetry: true,
     },
@@ -218,6 +454,7 @@ const staticMimeTypes: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".txt": "text/plain; charset=utf-8",
   ".wasm": "application/wasm",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".webp": "image/webp",
   ".woff": "font/woff",
   ".woff2": "font/woff2",
@@ -266,7 +503,72 @@ function isTokenProtectedPath(pathname: string): boolean {
 }
 
 function isStaticFallbackAllowed(pathname: string): boolean {
+  if (pathname === WEB_PUSH_SERVICE_WORKER_PATH || pathname === WEB_PUSH_MANIFEST_PATH) {
+    return false;
+  }
   return !isTokenProtectedPath(pathname);
+}
+
+function isNoCacheStaticAsset(filePath: string): boolean {
+  const fileName = basename(filePath);
+  return (
+    fileName === "index.html" ||
+    fileName === basename(WEB_PUSH_SERVICE_WORKER_PATH) ||
+    fileName === basename(WEB_PUSH_MANIFEST_PATH)
+  );
+}
+
+function isSameOriginRequest(c: Context): boolean {
+  const originHeader = c.req.header("origin")?.trim();
+  if (!originHeader) {
+    return true;
+  }
+  let originUrl: URL;
+  try {
+    originUrl = new URL(originHeader);
+  } catch {
+    return false;
+  }
+  if (
+    (originUrl.protocol !== "http:" && originUrl.protocol !== "https:") ||
+    originUrl.username ||
+    originUrl.password
+  ) {
+    return false;
+  }
+  const reqUrl = new URL(c.req.url);
+  const forwardedProto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
+  let effectiveProtocol: "http:" | "https:";
+  if (forwardedProto) {
+    if (forwardedProto !== "http" && forwardedProto !== "https") {
+      return false;
+    }
+    effectiveProtocol = `${forwardedProto}:`;
+  } else if (reqUrl.protocol === "http:" || reqUrl.protocol === "https:") {
+    effectiveProtocol = reqUrl.protocol;
+  } else {
+    return false;
+  }
+  if (originUrl.protocol !== effectiveProtocol) {
+    return false;
+  }
+  const rawHost = c.req.header("host")?.trim() || reqUrl.host;
+  if (!rawHost || /[\s/@?#]/.test(rawHost)) {
+    return false;
+  }
+  let hostUrl: URL;
+  try {
+    hostUrl = new URL(`${effectiveProtocol}//${rawHost}`);
+  } catch {
+    return false;
+  }
+  if (hostUrl.username || hostUrl.password) {
+    return false;
+  }
+  return (
+    originUrl.hostname.toLowerCase() === hostUrl.hostname.toLowerCase() &&
+    originUrl.port === hostUrl.port
+  );
 }
 
 // 盘符路径（"Z:/x"、"Z:\x"、"Z:x"）在 Windows 的 path.resolve 下会被当作绝对/盘符相对
@@ -349,6 +651,11 @@ export function createHttpServer(
   const app = new Hono();
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
   const hostCapabilities = createHostCapabilityStore();
+  const standaloneTerminalOwners = createStandaloneTerminalOwners({
+    onCleanupError: (error) => {
+      log("failed to dispose standalone terminal owner", error);
+    },
+  });
 
   const authToken = options.authToken?.trim();
   if (authToken) {
@@ -368,19 +675,68 @@ export function createHttpServer(
 
   // 普通 `/ws` 永远是 terminal-client；浏览器/任意客户端设置旧 mode header
   // 都不能再把自己提升为 trusted host。
+  app.use("/ws", async (c, next) => {
+    const subprotocol = parseStandaloneTerminalOwnerSubprotocol(
+      c.req.header("sec-websocket-protocol"),
+    );
+    if (subprotocol.kind === "none") {
+      await next();
+      return;
+    }
+    if (subprotocol.kind === "invalid") {
+      return c.json({ error: "Invalid WebSocket subprotocol" }, 400);
+    }
+    if (process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS !== "1") {
+      return c.json({ error: "Standalone terminal owners are disabled" }, 403);
+    }
+    if (!isSameOriginRequest(c)) {
+      return c.json({ error: "Forbidden cross-origin WebSocket request" }, 403);
+    }
+    await next();
+  });
   app.get(
     "/ws",
-    upgradeWebSocket(() => ({
-      onOpen(_event, ws) {
-        setupChannelServer(
-          ws.raw as WebSocket,
-          services,
-          "web-remote-replayable",
-          options.workspaceIdentityMapper,
-        );
-      },
-    })),
+    upgradeWebSocket((c) => {
+      const subprotocol = parseStandaloneTerminalOwnerSubprotocol(
+        c.req.header("sec-websocket-protocol"),
+      );
+      const standaloneTerminalOwnerRequest =
+        subprotocol.kind === "fresh" || subprotocol.kind === "resume" ? subprotocol : undefined;
+      return {
+        onOpen(_event, ws) {
+          setupChannelServer(
+            ws.raw as WebSocket,
+            services,
+            "web-remote-replayable",
+            options.workspaceIdentityMapper,
+            undefined,
+            standaloneTerminalOwnerRequest
+              ? {
+                  owners: standaloneTerminalOwners,
+                  request: standaloneTerminalOwnerRequest,
+                }
+              : undefined,
+          );
+        },
+      };
+    }),
   );
+
+  app.post(STANDALONE_TERMINAL_OWNER_CLOSE_API_PATH, async (c) => {
+    if (process.env.ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS !== "1") {
+      return c.json({ error: "Standalone terminal owners are disabled" }, 403);
+    }
+    if (!isSameOriginRequest(c)) {
+      return c.json({ error: "Forbidden cross-origin request" }, 403);
+    }
+    const rawBody = (await c.req.json().catch(() => null)) as { resumeToken?: unknown } | null;
+    const resumeToken = typeof rawBody?.resumeToken === "string" ? rawBody.resumeToken.trim() : "";
+    if (!STANDALONE_TERMINAL_TOKEN_PATTERN.test(resumeToken)) {
+      return c.json({ error: "Invalid terminal owner resume token" }, 400);
+    }
+    standaloneTerminalOwners.disposeByToken(resumeToken);
+    return c.json({ ok: true }, 200);
+  });
 
   const upgradeTrustedHostWebSocket = upgradeWebSocket(() => ({
     onOpen(_event, ws) {
@@ -449,6 +805,60 @@ export function createHttpServer(
   app.post("/api/bots/:provider", handleBotCallback);
   app.post("/api/bots/:provider/:botId", handleBotCallback);
 
+  app.get(WEB_PUSH_API_CONFIG_PATH, async (c) => {
+    const webPushService = services.getOptional(IWebPushService);
+    if (!webPushService) {
+      return c.json({ enabled: false, vapidPublicKey: null }, 200);
+    }
+    return c.json(await webPushService.getConfig(), 200);
+  });
+
+  app.post(WEB_PUSH_API_SUBSCRIPTIONS_PATH, async (c) => {
+    if (!isSameOriginRequest(c)) {
+      return c.json({ error: "Forbidden cross-origin request" }, 403);
+    }
+    const webPushService = services.getOptional(IWebPushService);
+    if (!webPushService) {
+      return c.json({ error: "Web push service is not available." }, 503);
+    }
+    const rawBody = await c.req.json().catch(() => null);
+    const parsed = webPushSubscribeRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json(
+        { error: "Invalid push subscription request", issues: parsed.error.flatten() },
+        400,
+      );
+    }
+    try {
+      const result = await webPushService.upsertSubscription(parsed.data);
+      return c.json(result, 200);
+    } catch (error) {
+      if (error instanceof WebPushValidationError) {
+        return c.json({ error: error.message }, 400);
+      }
+      throw error;
+    }
+  });
+
+  app.post(WEB_PUSH_API_UNSUBSCRIBE_PATH, async (c) => {
+    if (!isSameOriginRequest(c)) {
+      return c.json({ error: "Forbidden cross-origin request" }, 403);
+    }
+    const webPushService = services.getOptional(IWebPushService);
+    if (!webPushService) {
+      return c.json({ error: "Web push service is not available." }, 503);
+    }
+    const rawBody = await c.req.json().catch(() => null);
+    const parsed = webPushUnsubscribeRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json(
+        { error: "Invalid push unsubscribe request", issues: parsed.error.flatten() },
+        400,
+      );
+    }
+    return c.json(await webPushService.removeSubscription(parsed.data.endpoint), 200);
+  });
+
   // Bug 原因：旧 `/api/connect-remote` + `/ws/remote/:id` 会在 Server 内另起临时 stdio
   // runtime，绕过 R3 的 Window Host → Source Server attachment 主链；两个入口必须一起不可达。
 
@@ -461,7 +871,7 @@ export function createHttpServer(
         return c.notFound();
       }
       return c.body(await readFile(filePath), 200, {
-        "Cache-Control": filePath.endsWith("index.html")
+        "Cache-Control": isNoCacheStaticAsset(filePath)
           ? "no-cache"
           : "public, max-age=31536000, immutable",
         "Content-Type": staticContentType(filePath),
@@ -477,6 +887,9 @@ export function createHttpServer(
   });
 
   injectWebSocket(server);
+  server.on("close", () => {
+    standaloneTerminalOwners.disposeAll();
+  });
 
   return server;
 }

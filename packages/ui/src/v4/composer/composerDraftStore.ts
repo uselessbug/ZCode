@@ -98,6 +98,25 @@ export function bindPendingTaskDraft(
   if (current?.draftId === draftId && current.workspacePath !== workspacePath)
     writePendingTaskDraft(scope, { ...current, workspacePath });
 }
+/**
+ * 已绑定的无项目草稿目录被移走（project.draft-workspace-missing）后换绑新 draftId。
+ * 原因：旧 draftId 固定对应已不存在的 draft-<id> 目录，继续复用只会反复报 ENOENT。
+ * 正文草稿按 ComposerScope 存储，与 draftId 无关，换绑不会丢失用户已输入的内容。
+ * 必须先校验当前草稿与在途首发命令：不存在或已有 commandId（含已被其他入口换绑后发起的命令）时
+ * 一律返回 null，绝不覆盖在途命令。当前草稿已被其它入口换过且无在途命令时直接返回最新草稿，
+ * 由调用方按其当前绑定状态幂等重试。
+ */
+export function rotateMissingPendingTaskDraft(
+  scope: ComposerScope,
+  expectedDraftId: string,
+): PendingTaskDraft | null {
+  const current = readPendingTaskDraft(scope);
+  if (!current || current.commandId) return null;
+  if (current.draftId !== expectedDraftId) return current;
+  const next = { draftId: crypto.randomUUID() };
+  writePendingTaskDraft(scope, next);
+  return next;
+}
 export function completePendingTaskDraft(scope: ComposerScope, draftId: string): void {
   if (readPendingTaskDraft(scope)?.draftId === draftId) writePendingTaskDraft(scope, null);
 }
@@ -176,6 +195,74 @@ export function readComposerWorkspaceScope(
     /* 旧版没有导航身份，不能从目录猜项目。 */
   }
   return undefined;
+}
+export function clearComposerWorkspaceScope(
+  path: string,
+  identity: string | undefined,
+  clientNamespace = "desktop",
+  expectedProjectId?: string | null,
+): void {
+  try {
+    if (expectedProjectId !== undefined) {
+      const current = readComposerWorkspaceScope(path, identity, clientNamespace);
+      if (!current || current.projectId !== expectedProjectId) return;
+    }
+    getStorage()?.removeItem(workspaceScopeKey(path, identity, clientNamespace));
+  } catch (error) {
+    warnStorageFailure(workspaceScopeKey(path, identity, clientNamespace), error);
+  }
+}
+export function transferStaleProjectDraftToProjectlessScope(params: {
+  staleWorkspacePath: string;
+  workspaceIdentity?: string;
+  staleProjectId: string;
+  targetWorkspacePath: string;
+  clientNamespace?: string;
+}): V4ComposerDraft | null {
+  const clientNamespace = params.clientNamespace ?? "desktop";
+  const staleScope = resolveComposerScope(
+    params.staleProjectId,
+    params.workspaceIdentity,
+    clientNamespace,
+  );
+  const nullScope = resolveComposerScope(null, params.workspaceIdentity, clientNamespace);
+  clearComposerWorkspaceScope(
+    params.staleWorkspacePath,
+    params.workspaceIdentity,
+    clientNamespace,
+    params.staleProjectId,
+  );
+  const staleDraft = readV4ComposerDraft(
+    params.staleWorkspacePath,
+    params.workspaceIdentity,
+    V4_DRAFT_SCOPE_ROOT,
+    staleScope,
+  );
+  if (!staleDraft || !staleDraft.text.trim()) return null;
+  const existingNullDraft = readV4ComposerDraft(
+    params.targetWorkspacePath,
+    params.workspaceIdentity,
+    V4_DRAFT_SCOPE_ROOT,
+    nullScope,
+  );
+  if (!existingNullDraft?.text?.trim()) {
+    const preserved = persistV4ComposerDraft(
+      params.targetWorkspacePath,
+      params.workspaceIdentity,
+      V4_DRAFT_SCOPE_ROOT,
+      { ...staleDraft, projectId: null, taskGroupId: null },
+      nullScope,
+    );
+    if (preserved) {
+      clearV4ComposerDraft(
+        params.staleWorkspacePath,
+        params.workspaceIdentity,
+        V4_DRAFT_SCOPE_ROOT,
+        staleScope,
+      );
+    }
+  }
+  return staleDraft;
 }
 
 function draftStorageKey(

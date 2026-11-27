@@ -15,10 +15,12 @@
 
 - 「立即运行」是独立的 manual run，不是把 cron 的 `next_run_at` 改成当前时间；不得修改原计划的 `next_run_at`、`run_count`、启停状态或生命周期。
 - 定时调度实际触发和用户点击「立即运行」产生的 prompt，都必须在用户消息气泡上方展示与左侧任务列表一致的时钟图标和「由定时任务发送」来源文案。消息级来源以持久化 `userInput.sourceCommandId` 对应的 automation runId 为准：`automationId:scheduledAt`（`trigger=schedule`）与 `automationId:manual:uuid`（`trigger=manual`）均展示；同一 cron 会话内的普通手动输入不展示。该标识由 row 自身推导，桌面 continuous 与手机 Web replayable 恢复保持一致，不读取 task 上粘性的 `cronAutomationId`。
-- 当前 desktop host 必须在 `runAutomationNow` RPC 内直接恢复或创建目标会话并提交 prompt。正常路径不经过 scheduler 的轮询、wake 或二次认领；RPC 成功只表示 prompt 已被 host 接受，可能仍处于 runtime queue。
-- `runAutomationNow` 必须在认领前确认当前 service 已注入 manual dispatcher；dispatcher 缺失时直接失败，
+- 当前 host（Desktop window host 与开启 `automationExecutionEnabled` 的独立 HTTP server host）必须在 `runAutomationNow` RPC 内直接恢复或创建目标会话并提交 prompt。正常路径不经过 scheduler 的轮询、wake 或二次认领；RPC 成功只表示 prompt 已被 host 接受，可能仍处于 runtime queue。
+- `runAutomationNow` 必须在认领前确认当前 service 已注入且处于可接纳状态的 manual dispatcher；dispatcher 缺失或已关闭时直接失败，
   不创建 `automation_runs` 台账、不设置 `running` claim。能力确认后 manual run 才写入台账；若 host 在
   认领后的派发过程中崩溃，scheduler 只可在认领超时后回收该台账作为故障恢复，不得影响原 cron 节奏。
+- 独立 HTTP 服务端通过进程内 `automation-runtime` 共享模块执行与 Desktop 相同的 manual 直派、20s cron 轮询、5min misfire、按 `runId` 幂等结算及 60s manual claim 心跳续租；Desktop-attached remote source server 不开启进程内调度器，避免双调度。
+- manual run 首次被目标 host 成功接纳时只累加展示用 `runCount` 与 `lastRunAt`（按 `runId` 幂等），不递增 `scheduledRunCount`、不消耗 `maxRuns`、不推进 `nextRunAt` 或生命周期。
 - manual run 的 automation `running` single-flight 锁必须覆盖 queue 等待和实际 turn：`sendPrompt`
   admission 后继续持有，直到对应 `runId/inputId` 的 `turn.completed` / `turn.failed` 终态才释放。
   同一 automation 在锁持有期间再次 Run Now 必须拒绝，不得向同一 task 追加第二条 queued prompt。

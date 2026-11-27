@@ -2,6 +2,7 @@
   "name": "zcode",
   "version": "4.0.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "imports": {
     "#libreoffice/*": "./scripts/preinstalled-tools/libreoffice/*.mjs",
@@ -57,7 +58,7 @@
     "test:native-search:e2e": "node scripts/test-native-search-tools-e2e.mjs",
     "test:sea-runtime-tools:e2e": "node scripts/test-sea-runtime-tools-e2e.mjs",
     "clean": "node scripts/clean.mjs",
-    "typecheck": "pnpm --filter @zcode/session-control typecheck && tsc -b packages/shared/tsconfig.testing.json packages/rpc packages/provider packages/provider-node packages/shared packages/design-runtime packages/services packages/client packages/server packages/zcode-server-cli packages/ui packages/web apps/dev-docs packages/e2e-report packages/desktop/tsconfig.main.json packages/desktop/tsconfig.host.json packages/desktop/tsconfig.renderer-services.json packages/desktop/tsconfig.e2e.json packages/plugin-api && tsc -p packages/desktop/tsconfig.remote-main.json --noEmit && tsc -p packages/zcode-cua --noEmit",
+    "typecheck": "pnpm --filter @zcode/session-control typecheck && pnpm --filter @zcode/contracts build && pnpm --filter @zcode/adapters exec tsc -p tsconfig.browser.json && tsc -b packages/shared/tsconfig.testing.json packages/rpc packages/provider packages/provider-node packages/shared packages/design-runtime packages/services packages/client packages/server packages/zcode-server-cli packages/ui packages/web apps/dev-docs packages/e2e-report packages/desktop/tsconfig.main.json packages/desktop/tsconfig.host.json packages/desktop/tsconfig.renderer-services.json packages/desktop/tsconfig.e2e.json packages/plugin-api && tsc -p packages/desktop/tsconfig.remote-main.json --noEmit && tsc -p packages/zcode-cua --noEmit",
     "bundle:desktop": "pnpm --filter @zcode/desktop run bundle --",
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
@@ -152,6 +153,5 @@
       "@extend-ai/react-xlsx@0.16.0": "patches/@extend-ai__react-xlsx@0.16.0.patch",
       "@radix-ui/react-menu@2.1.16": "patches/@radix-ui__react-menu@2.1.16.patch"
     }
-  },
-  "license": "Apache-2.0"
+  }
 }

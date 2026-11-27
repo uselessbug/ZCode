@@ -69,7 +69,7 @@ export { IGitCheckpointService } from "./git/gitCheckpoint.js";
 export { ISystemService } from "./system/system.js";
 
 // Terminal service — ITerminalService is both a type (interface) and value (descriptor)
-export { ITerminalService } from "./terminal/terminal.js";
+export { ITerminalService, type IStandaloneTerminalService } from "./terminal/terminal.js";
 
 // Setting service — ISettingService is both a type (interface) and value (descriptor)
 export { ISettingService } from "./setting/setting.js";
@@ -233,9 +233,15 @@ export { IHooksService } from "./hooks/hooks.js";
 export {
   IMemoryService,
   PROJECT_MEMORY_FILE_CHANGED_ERROR_CODE,
+  PROJECT_MEMORY_FILE_MAX_BYTES,
+  PROJECT_MEMORY_FILE_WRITE_LIMIT_EXCEEDED_ERROR_CODE,
   PROJECT_MEMORY_PREVIEW_LIMIT_EXCEEDED_ERROR_CODE,
 } from "./memory/memory.js";
-export type { ProjectMemoryFileSummary, ProjectMemoryWorkspaceSummary } from "./memory/memory.js";
+export type {
+  ProjectMemoryFileContent,
+  ProjectMemoryFileSummary,
+  ProjectMemoryWorkspaceSummary,
+} from "./memory/memory.js";
 
 // OutputStyle service — IOutputStyleService is both a type (interface) and value (descriptor).
 export { IOutputStyleService } from "./output-style/outputStyle.js";
@@ -425,3 +431,14 @@ export type {
   GroupNode,
   MoveGroupNode,
 } from "#src/task-groups/contract.js";
+
+export {
+  IWebPushService,
+  WebPushValidationError,
+  type CreateWebPushServiceOptions,
+  type WebPushAutomationEventInput,
+  type WebPushOutboundRequest,
+  type WebPushOutboundResponse,
+  type WebPushSendImpl,
+  type WebPushSessionEventInput,
+} from "./web-push/contract.js";

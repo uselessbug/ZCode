@@ -24,6 +24,7 @@ import {
   X,
 } from "lucide-react";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+import { useIsServerHostedSettingsScope } from "@/hooks/useFileContextActions.js";
 import { useRemoteConnectionEntryVisibility } from "@/hooks/useRemoteConnectionEntryVisibility.js";
 import { cn } from "@/components/lib/utils.js";
 import { logger } from "@/logger.js";
@@ -86,6 +87,8 @@ export function ProjectComposerMenu({
   children?: ReactNode;
 }) {
   const { intl } = useZCodeIntl();
+  // 独立 Web / 手机远控下本地目标是当前服务器 Host；桌面端保持“此电脑”。
+  const serverHosted = useIsServerHostedSettingsScope();
   const [workspaceSearchQuery, setWorkspaceSearchQuery] = useState("");
   const showRemoteConnectionEntry = useRemoteConnectionEntryVisibility();
   // Bugfix: Web 普通模式没有完整远程 workspace 会话链路，不能只依赖全局 feature visibility。
@@ -556,7 +559,9 @@ export function ProjectComposerMenu({
                 ? (deviceNames?.get(
                     currentProject ? (projectSourceServerId(currentProject) ?? "") : "",
                   ) ?? hostId)
-                : intl.formatMessage({ id: "project.thisComputer" }),
+                : intl.formatMessage({
+                    id: serverHosted ? "settings.scope.server" : "project.thisComputer",
+                  }),
               project:
                 currentProject?.name ?? intl.formatMessage({ id: "chat.empty.workOutsideProject" }),
             },

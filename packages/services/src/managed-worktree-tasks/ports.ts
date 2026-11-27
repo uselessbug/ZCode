@@ -12,7 +12,7 @@ export interface ManagedWorktreeCommand extends ManagedWorktreeWorkspace {
 }
 
 export interface ManagedWorktreeServicePorts {
-  /** 本 Host 是否为本地桌面 Host；远端 Source Server 一律拒绝。 */
+  /** 本 Host 是否允许管理本机 Git worktree（本地桌面 Host 或显式开启独立 Web 兼容的独立服务）；普通远端 Source Server 一律拒绝。 */
   isLocalHost: boolean;
   repository(): Promise<ProjectRepositoryContract>;
   git: GitWorktreeRepo;

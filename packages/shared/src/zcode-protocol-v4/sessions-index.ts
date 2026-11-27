@@ -52,6 +52,9 @@ export const sessionSummarySchema = z.object({
   goalStatus: goalStateSchema.shape.status.optional(),
   // 未读推导：客户端本地记 lastSeenActivityAt 比较（不用 seq，epoch 会重置）。
   lastActivityAt: timestampSchema,
+  // 进入当前终态的稳定时间戳（非终态缺席；仅当离开终态再进入下一轮终态时更新，不被后续活动刷新）。
+  // optional 是为了兼容旧 sessions-index frame / 旧持久化摘要。
+  terminalAt: timestampSchema.optional(),
   // ≤120 字符。
   lastAssistantPreview: z.string().optional(),
   createdAt: timestampSchema,

@@ -1,23 +1,18 @@
-import { z } from "zod";
 import { createHash, randomUUID } from "node:crypto";
-import { basename, isAbsolute, relative } from "node:path";
+import { basename } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { pauseAutomationsForArchivedTask } from "#src/session/automationRepo.js";
+import { isRemoteWorkspaceIdentity, resolveWorkspaceKey } from "@zcode/shared";
 import {
-  generateTraceId,
-  isRemoteWorkspaceIdentity,
-  resolveWorkspaceKey,
-  ZCODE_AGENT_PROVIDER,
-} from "@zcode/shared";
-import type {
-  AutoArchiveInput,
-  ProjectDirectories,
-  ProjectRepositoryContract,
-  ProjectTask,
-  ProjectTaskRef,
-  ProjectTree,
-  SaveProjectInput,
-  VirtualProject,
+  TRUSTED_FROZEN_EXECUTION_SNAPSHOT,
+  type AutoArchiveInput,
+  type ProjectDirectories,
+  type ProjectRepositoryContract,
+  type ProjectRepositoryOptions,
+  type ProjectTaskRef,
+  type ProjectTree,
+  type SaveProjectInput,
+  type VirtualProject,
 } from "#src/project-storage/contract.js";
 import { hostMismatch } from "#src/project-storage/host-mismatch.js";
 import {
@@ -29,192 +24,38 @@ import type { ProjectDataRepositoryContract } from "#src/project-storage/purge/c
 import {
   assertRemoteProjectRoots,
   assertRemoteTaskDirectories,
+  assertRemoteTaskMoveTarget,
+  type StandaloneNonProjectPolicy,
 } from "#src/project-storage/remote-policy.js";
-
-const executionDirectoriesSchema = z.array(z.string().min(1)).max(256);
-
-function transaction<T>(db: DatabaseSync, body: () => T, write = true): T {
-  db.exec(write ? "BEGIN IMMEDIATE" : "BEGIN");
-  try {
-    const result = body();
-    db.exec("COMMIT");
-    return result;
-  } catch (error) {
-    if (db.isTransaction) db.exec("ROLLBACK");
-    throw error;
-  }
-}
-
-function readProjects(db: DatabaseSync, includeDeleted = true): VirtualProject[] {
-  const roots = db
-    .prepare(
-      "SELECT project_id,root_path,position,is_primary FROM project_roots ORDER BY position,root_path",
-    )
-    .all();
-  return db
-    .prepare(
-      `SELECT * FROM projects ${includeDeleted ? "" : "WHERE deleted=0"} ORDER BY position,project_id`,
-    )
-    .all()
-    .map((row) => ({
-      id: String(row.project_id),
-      hostId: String(row.host_id),
-      name: String(row.name),
-      nameOverridden: row.name_overridden === 1,
-      position: Number(row.position),
-      pinned: row.pinned === 1,
-      deleted: row.deleted === 1,
-      createdAt: Number(row.created_at),
-      updatedAt: Number(row.updated_at),
-      roots: roots
-        .filter((root) => root.project_id === row.project_id)
-        .map((root) => ({
-          rootPath: String(root.root_path),
-          position: Number(root.position),
-          isPrimary: root.is_primary === 1,
-        })),
-    }));
-}
-
-function requireProject(db: DatabaseSync, id: string): VirtualProject {
-  const project = readProjects(db).find((entry) => entry.id === id);
-  if (!project) throw new Error("project.not-found");
-  return project;
-}
-
-function tableExists(db: DatabaseSync, name: string): boolean {
-  return (
-    db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined
-  );
-}
-
-/**
- * worktree 任务的放置：workspace 是项目，cwd 位于受管 worktree 内（docs/git/worktree.md §6.6.1）。
- * 只允许本地、有项目归属、cwd 在 worktree 根内的组合；其他组合说明调用方装配错误，直接拒绝。
- */
-function resolveWorktreePlacement(input: {
-  task: { workspaceIdentity?: string };
-  projectId: string | null;
-  cwd?: string;
-  worktreeRoot?: string;
-}): { cwd: string; worktreeRoot: string } | null {
-  if (input.cwd === undefined && input.worktreeRoot === undefined) return null;
-  if (!input.cwd || !input.worktreeRoot) throw new Error("project.worktree-placement-incomplete");
-  if (input.task.workspaceIdentity?.trim()) throw new Error("project.worktree-local-only");
-  if (!input.projectId) throw new Error("project.worktree-requires-project");
-  const relativeCwd = relative(input.worktreeRoot, input.cwd);
-  if (relativeCwd.startsWith("..") || isAbsolute(relativeCwd))
-    throw new Error("project.worktree-cwd-outside-root");
-  return { cwd: input.cwd, worktreeRoot: input.worktreeRoot };
-}
-
-function readTask(db: DatabaseSync, task: ProjectTaskRef) {
-  return db
-    .prepare("SELECT * FROM tasks WHERE workspace_key=? AND task_id=?")
-    .get(resolveWorkspaceKey(task), task.taskId);
-}
-
-function resolveDirectories(
-  db: DatabaseSync,
-  task: ProjectTaskRef,
-  ownerHostId = "local",
-): ProjectDirectories {
-  const row = readTask(db, task);
-  // 旧远端影子行仍可能保留；行与项目一致不代表当前 Host 有权加载其目录。
-  if (row && row.host_id !== ownerHostId)
-    throw hostMismatch("owner", task, {
-      rowHostId: row.host_id,
-      ownerHostId,
-      projectId: row.project_id,
-    });
-  // root_path 是 cwd；worktree 任务的 workspace 是 workspace_path（项目主目录），两者分开返回，
-  // 导航等调用方打开的是 workspace，执行目录只给需要 cwd 的调用方（§6.6.1）。
-  const cwd = row ? String(row.root_path) : task.workspacePath;
-  const workspacePath =
-    row && typeof row.worktree_root === "string" ? String(row.workspace_path) : cwd;
-  const project = row?.project_id ? requireProject(db, String(row.project_id)) : null;
-  if (project && row?.host_id !== project.hostId)
-    throw hostMismatch("project", task, {
-      rowHostId: row?.host_id,
-      ownerHostId,
-      projectId: project.id,
-      projectHostId: project.hostId,
-    });
-  assertRemoteTaskDirectories(
-    ownerHostId,
-    project,
-    cwd,
-    typeof row?.execution_directories === "string"
-      ? executionDirectoriesSchema.parse(JSON.parse(row.execution_directories))
-      : [],
-  );
-  return {
-    workspacePath,
-    ...(workspacePath !== cwd ? { cwd } : {}),
-    ...(typeof row?.workspace_identity === "string"
-      ? { workspaceIdentity: row.workspace_identity }
-      : task.workspaceIdentity
-        ? { workspaceIdentity: task.workspaceIdentity }
-        : {}),
-    projectId: project?.id ?? null,
-    additionalDirectories:
-      typeof row?.execution_directories === "string"
-        ? executionDirectoriesSchema.parse(JSON.parse(row.execution_directories))
-        : (project?.roots.map((root) => root.rootPath).filter((path) => path !== cwd) ?? []),
-  };
-}
-
-function readTasks(db: DatabaseSync): ProjectTask[] {
-  // 迁移后的旧后端行也有 CLI 时间；沿用列表的 provider 边界，避免展示 Controller 无法操作的会话。
-  return db
-    .prepare(
-      "SELECT * FROM tasks WHERE provider=? AND deleted=0 AND coalesce(cli_deleted,0)=0 AND cli_created_at IS NOT NULL ORDER BY cli_updated_at DESC,task_id",
-    )
-    .all(ZCODE_AGENT_PROVIDER)
-    .map((row) => {
-      const meta = typeof row.meta_json === "string" ? JSON.parse(row.meta_json) : {};
-      return {
-        ...meta,
-        taskId: String(row.task_id),
-        traceId: meta.traceId ?? generateTraceId(String(row.task_id)),
-        // workspacePath 是任务所属 workspace；worktree 任务的 cwd 另由 cwd 给出
-        // （docs/git/worktree.md §6.6.1）。普通任务两列相同，行为不变。
-        workspacePath: String(row.workspace_path),
-        ...(typeof row.worktree_root === "string" ? { worktreeRoot: row.worktree_root } : {}),
-        ...(row.root_path && row.root_path !== row.workspace_path
-          ? { cwd: String(row.root_path) }
-          : {}),
-        workspaceIdentity:
-          row.workspace_identity === row.workspace_key
-            ? String(row.workspace_identity)
-            : isRemoteWorkspaceIdentity(String(row.workspace_key))
-              ? String(row.workspace_key)
-              : undefined,
-        title: String(row.title_overridden === 1 ? row.title : (row.cli_title ?? "")),
-        titleOverridden: row.title_overridden === 1 || row.cli_title_source === "custom",
-        createdAt: Number(row.cli_created_at),
-        updatedAt: Number(row.cli_updated_at),
-        status:
-          row.cli_last_outcome === "error"
-            ? "error"
-            : row.cli_last_outcome
-              ? "completed"
-              : undefined,
-        mode: meta.mode ?? "default",
-        pinned: row.pinned === 1,
-        archived: row.archived === 1,
-        unreadAt: row.unread_at == null ? undefined : Number(row.unread_at),
-        projectId: row.project_id == null ? null : String(row.project_id),
-        hostId: String(row.host_id),
-      };
-    });
-}
+import {
+  executionDirectoriesSchema,
+  readProjects,
+  readTask,
+  readTasks,
+  requireProject,
+  resolveDirectories,
+  resolveWorktreePlacement,
+  tableExists,
+  transaction,
+} from "#src/project-storage/repository-helpers.js";
 
 export class ProjectRepository implements ProjectRepositoryContract, ProjectDataRepositoryContract {
   constructor(
     private readonly db: DatabaseSync,
     private readonly ownerHostId?: string,
+    private readonly options?: ProjectRepositoryOptions,
   ) {}
+
+  /** 独立云端策略只转译给 remote-policy，不改写其它 owner 判定。 */
+  private get standalonePolicy(): StandaloneNonProjectPolicy | undefined {
+    return this.options
+      ? {
+          allowStandaloneNonProject: this.options.allowStandaloneCloudWorkspaces,
+          standaloneWorkspaceRoot: this.options.standaloneWorkspaceRoot,
+          allowStandaloneMultiRoot: this.options.allowStandaloneMultiRoot,
+        }
+      : undefined;
+  }
 
   archiveInactive(input: AutoArchiveInput): ProjectTaskRef[] {
     return transaction(this.db, () => {
@@ -263,16 +104,20 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
         ? {
             deletedTasks: this.db
               .prepare(`
-        SELECT task_id AS taskId,workspace_path AS workspacePath,workspace_identity AS workspaceIdentity,host_id AS hostId
+        SELECT task_id AS taskId,workspace_path AS workspacePath,workspace_identity AS workspaceIdentity,workspace_key AS workspaceKey,host_id AS hostId
         FROM tasks WHERE host_id=? AND (deleted=1 OR coalesce(cli_deleted,0)=1)`)
               .all(this.ownerHostId ?? "local")
               .map((row) => ({
                 taskId: String(row.taskId),
                 workspacePath: String(row.workspacePath),
                 hostId: String(row.hostId),
-                ...(typeof row.workspaceIdentity === "string"
-                  ? { workspaceIdentity: row.workspaceIdentity }
-                  : {}),
+                // 与 readTasks 同源：删除事实的存储身份也必须能反解 Host，否则墓碑键与
+                // 活动任务分叉，分组列表在删除后重新入组或丢失。
+                ...(typeof row.workspaceIdentity === "string" && row.workspaceIdentity.trim()
+                  ? { workspaceIdentity: String(row.workspaceIdentity) }
+                  : isRemoteWorkspaceIdentity(String(row.workspaceKey))
+                    ? { workspaceIdentity: String(row.workspaceKey) }
+                    : {}),
               })),
           }
         : {}),
@@ -295,7 +140,7 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
       if (old && old.hostId !== hostId) throw new Error("project.cross-host-move");
       if (input.hostId && input.hostId !== hostId) throw new Error("project.host-immutable");
       const roots = [...new Set(input.roots ?? old?.roots.map((root) => root.rootPath) ?? [])];
-      assertRemoteProjectRoots(this.ownerHostId, roots, old);
+      assertRemoteProjectRoots(this.ownerHostId, roots, old, this.standalonePolicy);
       if (input.reuseExistingRoot) {
         if (hostId !== "local" || old || roots.length !== 1)
           throw new Error("project.invalid-directory-open");
@@ -377,7 +222,7 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
       if (project.hostId !== (this.ownerHostId ?? "local"))
         throw new Error("project.cross-host-move");
       if (project.deleted) throw new Error("project.deleted");
-      assertRemoteProjectRoots(this.ownerHostId, [path], project);
+      assertRemoteProjectRoots(this.ownerHostId, [path], project, this.standalonePolicy);
       if (!project.roots.length) {
         this.db
           .prepare(
@@ -398,7 +243,7 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
       .run(Date.now(), Date.now(), id, this.ownerHostId ?? "local");
   }
 
-  readProjectTaskRefs(id: string): Array<ProjectTaskRef & { cwd: string }> {
+  readProjectTaskRefs(id: string): Array<ProjectTaskRef & { cwd: string; worktreeRoot?: string }> {
     return this.db
       .prepare("SELECT * FROM tasks WHERE project_id=? AND host_id=? ORDER BY task_id")
       .all(id, this.ownerHostId ?? "local")
@@ -408,14 +253,18 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
         ...(row.workspace_identity == null
           ? {}
           : { workspaceIdentity: String(row.workspace_identity) }),
-        cwd: String(row.root_path ?? row.workspace_path),
+        ...(typeof row.worktree_root === "string" ? { worktreeRoot: row.worktree_root } : {}),
+        // 受管 worktree 任务的记忆与检查点归属主 workspacePath，不把临时/已删 worktree 目录当独立记忆 root（§3.12）。
+        cwd: String(
+          row.worktree_root != null ? row.workspace_path : (row.root_path ?? row.workspace_path),
+        ),
       }));
   }
 
   readTaskDirectories(): Array<{ projectId: string | null; cwd: string }> {
     return this.db
       .prepare(
-        "SELECT DISTINCT project_id, coalesce(root_path, workspace_path) AS cwd FROM tasks WHERE host_id=? AND deleted=0",
+        "SELECT DISTINCT project_id, CASE WHEN worktree_root IS NOT NULL THEN workspace_path ELSE coalesce(root_path, workspace_path) END AS cwd FROM tasks WHERE host_id=? AND deleted=0",
       )
       .all(this.ownerHostId ?? "local")
       .map((row) => ({
@@ -500,9 +349,20 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
       // worktree 任务的 cwd 在受管根目录下，移动会把 worktree 路径变成别的项目的 root（§7.1）。
       if (typeof task.worktree_root === "string")
         throw new Error("project.worktree-task-immovable");
-      assertRemoteTaskDirectories(this.ownerHostId, project, String(task.root_path));
+      // 只校验 root 数量合法性；缺 root 时由下方 root-confirmation-required + addMissingRoot 处理，
+      // 独立云端 Web 放行该流程，普通远端仍要求 cwd 已是唯一 root。
+      assertRemoteTaskMoveTarget(
+        this.ownerHostId,
+        project,
+        String(task.root_path),
+        this.standalonePolicy,
+      );
       if (!project.roots.some((root) => root.rootPath === task.root_path)) {
         if (!input.addMissingRoot) throw new Error("project.root-confirmation-required");
+        // 增补的 root 取自任务行已持久化的 root_path（服务端事实），不是请求参数：
+        // 请求里的 workspacePath 只参与定位任务行，找不到就 task-not-found。
+        // 因此独立 Web 的多 root 不会因此变成「客户端可指定任意宿主路径」，无需再加工作区根限制
+        // （那会破坏 cwd 已在工作区外合法 root 的任务移动）。
         this.db
           .prepare(
             "INSERT INTO project_roots(project_id,root_path,position,is_primary) VALUES(?,?,?,?)",
@@ -534,7 +394,11 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
   }
 
   resolveSessionDirectories(task: ProjectTaskRef): ProjectDirectories {
-    return transaction(this.db, () => resolveDirectories(this.db, task, this.ownerHostId), false);
+    return transaction(
+      this.db,
+      () => resolveDirectories(this.db, task, this.ownerHostId, this.standalonePolicy),
+      false,
+    );
   }
 
   findCreationReceipts(
@@ -565,7 +429,12 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
             };
             return {
               sessionId: task.taskId,
-              directories: resolveDirectories(this.db, task, this.ownerHostId),
+              directories: resolveDirectories(
+                this.db,
+                task,
+                this.ownerHostId,
+                this.standalonePolicy,
+              ),
             };
           }),
       false,
@@ -586,7 +455,13 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
         input.task.taskId === input.parentTaskId
       )
         throw new Error("project.task-not-found");
-      const directories = resolveDirectories(this.db, parentRef, this.ownerHostId);
+      // 透传独立云端策略，使非项目与多 root 会话的 fork 在 ACK 前也能继承父任务目录归属。
+      const directories = resolveDirectories(
+        this.db,
+        parentRef,
+        this.ownerHostId,
+        this.standalonePolicy,
+      );
       if (directories.workspacePath !== input.task.workspacePath)
         throw new Error("project.cwd-not-in-roots");
       // ACK 先到时也必须沿用首次事实摄入的父行继承规则，否则子任务丢失 worktree 标记，
@@ -644,7 +519,7 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
             input.task.taskId,
           );
       }
-      return resolveDirectories(this.db, input.task, this.ownerHostId);
+      return resolveDirectories(this.db, input.task, this.ownerHostId, this.standalonePolicy);
     });
   }
 
@@ -694,23 +569,40 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
             })
           : null;
       if (!readTask(this.db, task)) {
+        const trustedFrozenSnapshot =
+          TRUSTED_FROZEN_EXECUTION_SNAPSHOT in input &&
+          input[TRUSTED_FROZEN_EXECUTION_SNAPSHOT] === true;
+        const project = input.projectId ? requireProject(this.db, input.projectId) : null;
         assertRemoteTaskDirectories(
           this.ownerHostId,
-          input.projectId ? requireProject(this.db, input.projectId) : null,
+          project,
           task.workspacePath,
           input.additionalDirectories,
+          this.standalonePolicy,
+          {
+            frozenExecutionSnapshot: trustedFrozenSnapshot,
+            worktreePlacement: placement,
+          },
         );
-        if (input.projectId) {
-          const project = requireProject(this.db, input.projectId);
-          if (project.deleted && input.additionalDirectories === undefined)
+        if (project) {
+          if (
+            project.deleted &&
+            !trustedFrozenSnapshot &&
+            (placement !== null || input.additionalDirectories === undefined)
+          )
             throw new Error("project.deleted");
           if (project.hostId !== host) throw new Error("project.cross-host-move");
           if (
+            !trustedFrozenSnapshot &&
             input.additionalDirectories === undefined &&
             !project.roots.some((root) => root.rootPath === task.workspacePath)
           )
             throw new Error("project.cwd-not-in-roots");
         }
+        const effectiveAdditionalDirectories =
+          trustedFrozenSnapshot && input.additionalDirectories === undefined
+            ? []
+            : input.additionalDirectories;
         // 创建归属必须先于 CLI 首发；空事实不是假会话，列表只读取已有 CLI 事实的行。
         this.db
           .prepare(`INSERT INTO tasks(workspace_key,workspace_path,workspace_identity,task_id,created_at,updated_at,host_id,root_path,project_id,handoff_pending,execution_directories,worktree_root)
@@ -724,13 +616,19 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
             placement?.cwd ?? inherited?.rootPath ?? task.workspacePath,
             input.projectId,
             OWNERSHIP_DECIDED,
-            input.additionalDirectories === undefined
+            effectiveAdditionalDirectories === undefined
               ? (inherited?.executionDirectories ?? null)
-              : JSON.stringify(executionDirectoriesSchema.parse(input.additionalDirectories)),
+              : JSON.stringify(executionDirectoriesSchema.parse(effectiveAdditionalDirectories)),
             placement?.worktreeRoot ?? inherited?.worktreeRoot ?? null,
           );
       }
-      const directories = resolveDirectories(this.db, task, this.ownerHostId);
+      // 读取已预留目录时同步透传独立云端策略，确保非项目与多 root 会话不会在远端门禁下被误拒。
+      const directories = resolveDirectories(
+        this.db,
+        task,
+        this.ownerHostId,
+        this.standalonePolicy,
+      );
       // 旧客户端重试发生在 CLI 去重之前；同事务记录首次分配，避免产生额外任务预留。
       if (command && !receipt) {
         this.db

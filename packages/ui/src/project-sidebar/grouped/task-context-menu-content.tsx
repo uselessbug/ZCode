@@ -27,6 +27,8 @@ export function GroupedTaskContextMenuContent({
   onArchiveTask,
   onMarkTaskAsUnread,
   onOpenTaskPathInFileManager,
+  onOpenTaskFiles,
+  canOpenLocalFiles = true,
   onCopyText,
   onOpenProviderConfig,
   onOpenTaskFeedback,
@@ -49,6 +51,10 @@ export function GroupedTaskContextMenuContent({
   onArchiveTask: (task: ZCodeTaskMeta) => void;
   onMarkTaskAsUnread: (task: ZCodeTaskMeta) => void;
   onOpenTaskPathInFileManager: () => void;
+  /** 无本机文件管理器（独立 Web）时的回退入口：打开任务文件树；不传则隐藏。 */
+  onOpenTaskFiles?: () => void;
+  /** 平台可调用本机文件管理器/编辑器；缺省 true 保持桌面原样。 */
+  canOpenLocalFiles?: boolean;
   onCopyText: (label: string, text: string | null) => void;
   onOpenProviderConfig: () => void;
   onOpenTaskFeedback: () => void;
@@ -157,19 +163,24 @@ export function GroupedTaskContextMenuContent({
         </ContextMenuItem>
       </SidebarNativeTooltip>
       <ContextMenuSeparator />
-      <SidebarNativeTooltip>
-        <ContextMenuItem
-          disabled={Boolean(disabledReason)}
-          title={disabledReason}
-          onSelect={() => {
-            if (!disabledReason) {
-              onOpenTaskPathInFileManager();
-            }
-          }}
-        >
-          {fileManagerLabel}
-        </ContextMenuItem>
-      </SidebarNativeTooltip>
+      {/* 修复原因：独立 Web 无法调用本机文件管理器，改为「显示文件树」；无 onOpenTaskFiles（手机远控）时隐藏。 */}
+      {canOpenLocalFiles || onOpenTaskFiles ? (
+        <SidebarNativeTooltip>
+          <ContextMenuItem
+            disabled={Boolean(disabledReason)}
+            title={disabledReason}
+            onSelect={() => {
+              if (disabledReason) return;
+              if (canOpenLocalFiles) onOpenTaskPathInFileManager();
+              else onOpenTaskFiles?.();
+            }}
+          >
+            {canOpenLocalFiles
+              ? fileManagerLabel
+              : intl.formatMessage({ id: "git.action.showTree" })}
+          </ContextMenuItem>
+        </SidebarNativeTooltip>
+      ) : null}
       <ContextMenuItem
         onSelect={() =>
           onCopyText(intl.formatMessage({ id: "appHeader.copyPath" }), task.workspacePath)
@@ -203,14 +214,16 @@ export function GroupedTaskContextMenuContent({
       >
         {intl.formatMessage({ id: "appHeader.copySessionId" })}
       </ContextMenuItem>
-      <ContextMenuItem
-        disabled={providerConfigFile.loading || !providerConfigFile.path}
-        onSelect={onOpenProviderConfig}
-      >
-        <span className="truncate">
-          {intl.formatMessage({ id: "appHeader.goToProviderConfig" })}
-        </span>
-      </ContextMenuItem>
+      {canOpenLocalFiles ? (
+        <ContextMenuItem
+          disabled={providerConfigFile.loading || !providerConfigFile.path}
+          onSelect={onOpenProviderConfig}
+        >
+          <span className="truncate">
+            {intl.formatMessage({ id: "appHeader.goToProviderConfig" })}
+          </span>
+        </ContextMenuItem>
+      ) : null}
       <ContextMenuSeparator />
       <ContextMenuItem onSelect={onOpenTaskFeedback}>
         {intl.formatMessage({ id: "taskList.feedback" })}

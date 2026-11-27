@@ -237,6 +237,26 @@ function readSerializedModelSelection(value: string | null): ModelSelection | un
   }
 }
 
+/**
+ * 只读查询 workspace_alias 表中已持久化的 canonical_key；不扫描或合并同路径其它记录。
+ * 供 standalone 启动对齐、创建校验与派发校验在不触发 SourceServerWorkspaceAliasRepo 批量迁移副作用的前提下读取别名。
+ */
+export function readWorkspaceAliasCanonicalKeyFromDatabase(
+  db: DatabaseSyncInstance,
+  workspacePath: string,
+): string | null {
+  const trimmed = workspacePath.trim();
+  if (!trimmed) return null;
+  const hasAliasTable = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_alias'")
+    .get();
+  if (!hasAliasTable) return null;
+  const row = db.prepare("SELECT canonical_key FROM workspace_alias WHERE path = ?").get(trimmed) as
+    | { canonical_key: string }
+    | undefined;
+  return row?.canonical_key?.trim() || null;
+}
+
 /** 退避重试时间：now + min(BASE * 2^(attempts-1), CAP)。 */
 export function computeRetryAt(now: number, attempts: number): number {
   const backoff = Math.min(
@@ -994,33 +1014,53 @@ export class AutomationRepo {
   }
 
   /**
-   * 派发成功结算：展示总数与定时派发数各 +1、写 last_run_at、清重试态、复位 running；
-   * 循环任务回 active（nextRunAt 由调用方按实际派发时间重算传入）；
-   * 有限次任务达 max_runs 转 completed（enabled=0、next_run_at=NULL）；
+   * 定时派发成功原子幂等结算：以 automation_runs.dispatch_status 首次进入 dispatched 为唯一边界，
+   * 防止同一 runId 重复回执时重复累加 run_count / scheduled_run_count 或再次推进 next_run_at。
    * 派发窗口内已被暂停（CronPauseSelf / UI 暂停）的任务保持 paused，只记录本次派发。
    */
-  async markDispatched(
-    automationId: string,
-    options: { dispatchedAt: number; nextRunAt: number | null },
-  ): Promise<void> {
+  async markScheduleRunDispatched(params: {
+    runId: string;
+    automationId: string;
+    sessionId?: string | null;
+    dispatchedAt: number;
+    nextRunAt: number | null;
+  }): Promise<boolean> {
     await this.ensureReady();
-    const row = this.getRow(automationId);
-    if (!row) return; // 已删除，丢弃回写，避免复活
-    const runCount = row.run_count + 1;
-    const scheduledRunCount = row.scheduled_run_count + 1;
-    // 有限次任务（recurring=0）达上限即 completed。未显式设 max_runs 时按一次性任务处理（默认上限 1），
-    // 否则一次性 cron 会一直停在 active 并被 cron 反复触发，永不结束。这里必须使用独立的
-    // scheduled_run_count；run_count 还包含 manual run，只能用于 Card 累计展示。
-    const reachedMax = row.recurring === 0 && scheduledRunCount >= (row.max_runs ?? 1);
-    const reachedEnd = row.end_at !== null && (options.nextRunAt ?? Infinity) > row.end_at;
-    const completed = reachedMax || reachedEnd ? 1 : 0;
-    // 修复原因：scheduler 回写与 Host 侧暂停（CronPauseSelf / UI setEnabled(false)）跑在两个
-    // 独立连接上，旧实现在这里无条件写 lifecycle_status='active'、enabled=1，会把派发窗口内
-    // 刚落下的 paused 复活成 active。改为在同一条 UPDATE 里按行的当前值判定（SQLite SET 表达式
-    // 读取的是更新前的旧值）：completed 优先收口；否则 enabled=0 的行保持原 lifecycle / enabled，
-    // 只记录本次派发；其余仍回 active。不引入二次读取或重试，避免再开新的竞态窗口。
-    this.getDatabase()
-      .prepare(
+    const db = this.getDatabase();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const existingRun = db
+        .prepare(`SELECT dispatch_status FROM automation_runs WHERE run_id = @run_id`)
+        .get({ run_id: params.runId }) as Pick<AutomationRunRow, "dispatch_status"> | undefined;
+      if (existingRun?.dispatch_status === "dispatched") {
+        db.exec("COMMIT");
+        return false;
+      }
+
+      db.prepare(
+        `UPDATE automation_runs
+        SET dispatch_status = 'dispatched',
+            session_id = COALESCE(@session_id, session_id),
+            error = NULL,
+            updated_at = @now
+        WHERE run_id = @run_id`,
+      ).run({
+        run_id: params.runId,
+        session_id: params.sessionId ?? null,
+        now: params.dispatchedAt,
+      });
+
+      const row = this.getRow(params.automationId);
+      if (!row) {
+        db.exec("COMMIT");
+        return false;
+      }
+      const runCount = row.run_count + 1;
+      const scheduledRunCount = row.scheduled_run_count + 1;
+      const reachedMax = row.recurring === 0 && scheduledRunCount >= (row.max_runs ?? 1);
+      const reachedEnd = row.end_at !== null && (params.nextRunAt ?? Infinity) > row.end_at;
+      const completed = reachedMax || reachedEnd ? 1 : 0;
+      db.prepare(
         `UPDATE automations
         SET run_count = @run_count,
             scheduled_run_count = @scheduled_run_count,
@@ -1040,16 +1080,131 @@ export class AutomationRepo {
             next_run_at = CASE WHEN @completed = 1 THEN NULL ELSE @next_run_at END,
             updated_at = @now
         WHERE automation_id = @id`,
-      )
-      .run({
-        id: automationId,
+      ).run({
+        id: params.automationId,
         run_count: runCount,
         scheduled_run_count: scheduledRunCount,
-        dispatched_at: options.dispatchedAt,
+        dispatched_at: params.dispatchedAt,
         completed,
-        next_run_at: options.nextRunAt,
-        now: options.dispatchedAt,
+        next_run_at: params.nextRunAt,
+        now: params.dispatchedAt,
       });
+      db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * 只读查询 workspace_alias 表中已持久化的 canonical_key；不扫描或合并同路径其它记录。
+   * 供 standalone 启动对齐与派发校验在不触发 SourceServerWorkspaceAliasRepo 批量迁移副作用的前提下读取别名。
+   */
+  async readWorkspaceAliasCanonicalKey(workspacePath: string): Promise<string | null> {
+    await this.ensureReady();
+    return readWorkspaceAliasCanonicalKeyFromDatabase(this.getDatabase(), workspacePath);
+  }
+
+  private hasCanonicalReferencedSessionSync(automationId: string): boolean {
+    const row = this.getRow(automationId);
+    if (!row) return false;
+    const hit = this.getDatabase()
+      .prepare(
+        `SELECT 1 FROM tasks
+        WHERE workspace_identity IS NOT NULL
+          AND trim(workspace_identity) != ''
+          AND workspace_identity != workspace_path
+          AND workspace_path = @workspace_path
+          AND (
+            (@target_task_id IS NOT NULL AND task_id = @target_task_id)
+            OR task_id IN (
+              SELECT session_id FROM automation_runs
+              WHERE automation_id = @id AND session_id IS NOT NULL
+            )
+          )
+        LIMIT 1`,
+      )
+      .get({
+        id: automationId,
+        workspace_path: row.workspace_path,
+        target_task_id: row.target_task_id ?? null,
+      });
+    return Boolean(hit);
+  }
+
+  /**
+   * 检查定时任务的 target_task_id 或历史 automation_runs.session_id 是否在 tasks 表中关联了
+   * 带非空 canonical workspace_identity 的既有会话行，用于 standalone 下保护已有会话坐标不分裂。
+   */
+  async hasCanonicalReferencedSession(automationId: string): Promise<boolean> {
+    await this.ensureReady();
+    return this.hasCanonicalReferencedSessionSync(automationId);
+  }
+
+  /**
+   * standalone 启动身份对齐：在同一写事务内把历史缺失 identity、本机路径键或同服务器旧身份的
+   * 定时任务及运行台账对齐为目标 workspaceKey / workspaceIdentity 与 hostId。
+   */
+  async alignStandaloneWorkspaceIdentity(params: {
+    automationId: string;
+    expectedOldWorkspaceKey: string;
+    canonicalWorkspaceKey: string;
+    targetWorkspaceIdentity?: string | null;
+    hostId: string;
+  }): Promise<boolean> {
+    await this.ensureReady();
+    const db = this.getDatabase();
+    const now = Date.now();
+    const targetIdentity =
+      params.targetWorkspaceIdentity === undefined
+        ? params.canonicalWorkspaceKey
+        : params.targetWorkspaceIdentity;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      // 原子保护：若已有 canonical tasks 会话引用此定时任务，禁止将其剥离为 path-only。
+      if (targetIdentity === null && this.hasCanonicalReferencedSessionSync(params.automationId)) {
+        db.exec("COMMIT");
+        return false;
+      }
+      const updated = db
+        .prepare(
+          `UPDATE automations
+          SET workspace_key = @canonical_key,
+              workspace_identity = @workspace_identity,
+              host_id = @host_id,
+              updated_at = @now
+          WHERE automation_id = @id AND workspace_key = @expected_old_key`,
+        )
+        .run({
+          id: params.automationId,
+          expected_old_key: params.expectedOldWorkspaceKey,
+          canonical_key: params.canonicalWorkspaceKey,
+          workspace_identity: targetIdentity,
+          host_id: params.hostId,
+          now,
+        });
+      if (updated.changes !== 1) {
+        db.exec("COMMIT");
+        return false;
+      }
+      db.prepare(
+        `UPDATE automation_runs
+        SET workspace_key = @canonical_key,
+            updated_at = @now
+        WHERE automation_id = @id AND workspace_key = @expected_old_key`,
+      ).run({
+        id: params.automationId,
+        expected_old_key: params.expectedOldWorkspaceKey,
+        canonical_key: params.canonicalWorkspaceKey,
+        now,
+      });
+      db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   /**
@@ -1065,10 +1220,10 @@ export class AutomationRepo {
       /** transient 达上限后，循环任务的下一个正常 next_run_at（调用方重算）。 */
       nextRunAt?: number | null;
     },
-  ): Promise<void> {
+  ): Promise<{ terminal: boolean }> {
     await this.ensureReady();
     const row = this.getRow(automationId);
-    if (!row) return;
+    if (!row) return { terminal: true };
     const db = this.getDatabase();
     const now = options.failedAt;
     if (options.kind === "permanent") {
@@ -1079,7 +1234,7 @@ export class AutomationRepo {
             last_error = @error, updated_at = @now
         WHERE automation_id = @id`,
       ).run({ id: automationId, error: options.error, now });
-      return;
+      return { terminal: true };
     }
     const attempts = row.dispatch_attempts + 1;
     if (attempts >= DISPATCH_MAX_ATTEMPTS) {
@@ -1106,7 +1261,7 @@ export class AutomationRepo {
           WHERE automation_id = @id`,
         ).run({ id: automationId, error: options.error, now });
       }
-      return;
+      return { terminal: true };
     }
     // 未达上限：写退避 retry_at，复位 running 等下轮重认领。
     db.prepare(
@@ -1122,6 +1277,7 @@ export class AutomationRepo {
       error: options.error,
       now,
     });
+    return { terminal: false };
   }
 
   /** 关机/退出时释放认领：清 running、保留 next_run_at，不记失败不推进。 */

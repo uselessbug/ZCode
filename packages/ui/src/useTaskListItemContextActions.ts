@@ -20,6 +20,8 @@ interface TaskListItemContextActionsResult {
   taskNativeSessionLogFile: TaskPathState;
   providerConfigFile: TaskPathState;
   fileManagerLabel: string;
+  /** 平台是否能调用本机文件管理器/编辑器；独立 Web 与手机远控为 false。 */
+  canOpenLocalFiles: boolean;
   handleCopyText: (label: string, value: string | null) => Promise<void>;
   handleOpenTaskPathInFileManager: () => Promise<void>;
   handleOpenProviderConfig: () => Promise<void>;
@@ -113,7 +115,8 @@ export function useTaskListItemContextActions({
       serviceScope: remoteSessionId ? "base" : "workspace",
       // Bugfix: 任务列表里每个 item 都会挂载右键菜单动作；如果挂载时就读取 provider 配置路径，
       // 远程 workspace 会按任务数量放大 base RPC 和日志。这里改成菜单真正打开时才加载。
-      enabled: loadProviderConfig,
+      // 修复原因：Web 无法打开本机 provider 配置，菜单已隐藏「前往配置」，不再下发无用 RPC。
+      enabled: loadProviderConfig && Boolean(platform.canOpenLocalFiles),
     },
   );
 
@@ -266,6 +269,7 @@ export function useTaskListItemContextActions({
     taskNativeSessionLogFile,
     providerConfigFile,
     fileManagerLabel: getFileManagerLabel(intl),
+    canOpenLocalFiles: Boolean(platform.canOpenLocalFiles),
     handleCopyText,
     handleOpenTaskPathInFileManager,
     handleOpenProviderConfig,

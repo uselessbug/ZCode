@@ -28,9 +28,12 @@ import { useComposerClientNamespace } from "@/hooks/useServices.js";
 import {
   resolveComposerScope,
   ensurePendingTaskDraft,
+  readPendingTaskDraft,
   bindPendingTaskDraft,
   rememberComposerWorkspaceScope,
   readComposerWorkspaceScope,
+  rotateMissingPendingTaskDraft,
+  transferStaleProjectDraftToProjectlessScope,
 } from "@/v4/composer/composerDraftStore.js";
 import { openFolderFromWorkspaceEntry } from "@/root/openWorkspaceFolderEntry.js";
 import { useConversationWorkspaceActions } from "@/root/useConversationWorkspaceActions.js";
@@ -309,7 +312,11 @@ export function useRootWorkspaceActions({
         const hasExplicitProject =
           typeof request === "object" &&
           request !== null &&
-          ("projectId" in request || Boolean(request.targetWorkspace?.projectId));
+          (request.projectId !== undefined || request.targetWorkspace?.projectId !== undefined);
+        let staleLocalProjectFallback: {
+          staleWorkspacePath: string;
+          staleProjectId: string;
+        } | null = null;
         const newTaskTarget = resolveNewTaskTargetFromRequest(request, () =>
           resolveWorkbenchNewTaskTarget({
             activeWorkspacePath,
@@ -359,6 +366,12 @@ export function useRootWorkspaceActions({
               )
             ) {
               logger.debug("[Root] 新任务不继承已删除的本地项目", { projectId });
+              if (!workspace.activeTaskId) {
+                staleLocalProjectFallback = {
+                  staleWorkspacePath: newTaskTarget.workspacePath,
+                  staleProjectId: projectId,
+                };
+              }
               projectId = undefined;
             }
           }
@@ -371,29 +384,69 @@ export function useRootWorkspaceActions({
           // 归属先在共享入口解析，目录仍只由 bridge owner 准备；旧 Root 不写交接后的草稿。
           await openMobileProjectDraft({
             ...requestOptions,
-            ...(projectId ? { projectId } : {}),
+            ...(projectId !== undefined ? { projectId } : {}),
             ...(hostId ? { hostId } : {}),
           });
           return;
         }
-        if (!services.projectService) throw new Error("project.service-unavailable");
-        const pendingDraft =
+        const projectService = services.projectService;
+        if (!projectService) throw new Error("project.service-unavailable");
+        const pendingScope = resolveComposerScope(null, undefined, composerClientNamespace);
+        let pendingDraft =
           !projectId && (!hostId || hostId === "local")
-            ? ensurePendingTaskDraft(resolveComposerScope(null, undefined, composerClientNamespace))
+            ? ensurePendingTaskDraft(pendingScope)
             : null;
-        const target = await services.projectService.prepareSession({
-          ...(projectId ? { projectId } : {}),
-          ...(hostId ? { hostId } : {}),
-          // worktree 模式由 Host 新建受管 worktree 并返回其中的 cwd；不复用未归类草稿目录。
-          ...(typeof request === "object" && request.worktree && projectId
-            ? { worktree: request.worktree }
-            : {}),
-          // 显式 local 与省略 Host 是同一入口，不能漏掉待发送身份而另建目录。
-          ...(pendingDraft
-            ? { draftId: pendingDraft.draftId, reuseDraft: Boolean(pendingDraft.workspacePath) }
-            : {}),
-        });
+        const prepareTarget = (draft: typeof pendingDraft, reuseDraft: boolean) =>
+          projectService.prepareSession({
+            ...(projectId ? { projectId } : {}),
+            ...(hostId ? { hostId } : {}),
+            // worktree 模式由 Host 新建受管 worktree 并返回其中的 cwd；不复用未归类草稿目录。
+            ...(typeof request === "object" && request.worktree && projectId
+              ? { worktree: request.worktree }
+              : {}),
+            // 显式 local 与省略 Host 是同一入口，不能漏掉待发送身份而另建目录。
+            ...(draft ? { draftId: draft.draftId, reuseDraft } : {}),
+          });
+        let target: Awaited<ReturnType<typeof prepareTarget>>;
+        try {
+          target = await prepareTarget(pendingDraft, Boolean(pendingDraft?.workspacePath));
+        } catch (error) {
+          // 导航已过时时直接退出，避免迟到 ENOENT 触发换绑或重建。
+          if (!isCurrent()) return;
+          // 已绑定的草稿目录被移走：换绑新 draftId 重建目录，正文草稿按 scope 保存不会丢失。
+          // 有在途首发命令时 rotate 返回 null，保持原错误，绝不覆盖在途命令。
+          // 手机 bridge 返回普通错误对象，不能只认 instanceof Error。
+          const prepareMessage =
+            error && typeof error === "object" && "message" in error
+              ? String(error.message)
+              : String(error);
+          if (
+            !pendingDraft?.workspacePath ||
+            !prepareMessage.includes("project.draft-workspace-missing")
+          )
+            throw error;
+          const rotatedDraft = rotateMissingPendingTaskDraft(pendingScope, pendingDraft.draftId);
+          if (!rotatedDraft) throw error;
+          pendingDraft = rotatedDraft;
+          // 若已被并发入口换绑且已绑定目录，沿用当前 workspacePath 的 reuseDraft 状态做幂等校验，
+          // 绝不强行传 false 重建已被删除的目录。
+          target = await prepareTarget(rotatedDraft, Boolean(rotatedDraft.workspacePath));
+        }
         if (!isCurrent()) return;
+        if (pendingDraft) {
+          // 异步返回后再次验证草稿所有权：期间已被换绑或发送完成时不得写回旧绑定或切 tab。
+          const currentDraft = readPendingTaskDraft(pendingScope);
+          if (!currentDraft || currentDraft.draftId !== pendingDraft.draftId) return;
+          bindPendingTaskDraft(pendingScope, pendingDraft.draftId, target.workspacePath);
+          if (staleLocalProjectFallback && target.projectId === null) {
+            transferStaleProjectDraftToProjectlessScope({
+              staleWorkspacePath: staleLocalProjectFallback.staleWorkspacePath,
+              staleProjectId: staleLocalProjectFallback.staleProjectId,
+              targetWorkspacePath: target.workspacePath,
+              clientNamespace: composerClientNamespace,
+            });
+          }
+        }
         if (hostId && hostId !== "local") {
           if (!target.workspaceIdentity || !openRemoteProjectWorkspace)
             throw new Error("project.remote-navigation-unavailable");
@@ -470,6 +523,11 @@ export function useRootWorkspaceActions({
     addTab,
     createTask: startNewTaskFromActiveWorkspace,
     setWorkspaceActionError,
+    composerClientNamespace,
+    navigationSequenceRef: navigationSequence,
+    tabStoreApi,
+    activeWorkspacePath,
+    activeWorkspaceIdentity,
   });
 
   const handleLogout = useCallback(async () => {
@@ -619,12 +677,37 @@ export function useRootWorkspaceActions({
         if (!isCurrent()) return;
         // 项目模型迁移后，单独 addTab 不再赋予项目归属。桌面目录入口必须先由
         // Host 原子复用/创建项目，再初始化草稿，不能沿用该目录的旧草稿归属。
-        let projectId: string | undefined;
+        let projectId: string | null | undefined;
         if (isDesktop) {
           if (!services.projectService) throw new Error("project.service-unavailable");
           projectId = (
             await services.projectService.saveProject({ roots: [path], reuseExistingRoot: true })
           ).id;
+        } else {
+          const cachedProjectId = readComposerWorkspaceScope(
+            path,
+            undefined,
+            composerClientNamespace,
+          )?.projectId;
+          if (cachedProjectId && services.projectService) {
+            // 非桌面入口复验缓存项目：仅在确认已不存在或软删除时降回 null 并保留草稿，读取失败不误判。
+            const projects = await services.projectService.readProjects();
+            if (!isCurrent()) return;
+            if (
+              !projects.some(
+                (project) =>
+                  project.id === cachedProjectId && project.hostId === "local" && !project.deleted,
+              )
+            ) {
+              transferStaleProjectDraftToProjectlessScope({
+                staleWorkspacePath: path,
+                staleProjectId: cachedProjectId,
+                targetWorkspacePath: path,
+                clientNamespace: composerClientNamespace,
+              });
+              projectId = null;
+            }
+          }
         }
         if (!isCurrent()) return;
         // 桌面端：检查是否已有其他窗口打开了该目录，如果是则激活该窗口对应 tab
@@ -641,7 +724,7 @@ export function useRootWorkspaceActions({
         addTab(path);
         // 打开 workspace 是 workspace-only 意图，不是“继续上次会话”。
         // 即使命中已存在 tab，也必须清掉该 workspace 的 activeTaskId 并回到单 pane 草稿。
-        startDraftInWorkspace(path, undefined, projectId ? { projectId } : undefined);
+        startDraftInWorkspace(path, undefined, projectId !== undefined ? { projectId } : undefined);
         setWorkspaceActionError(null);
         logger.info("[Root] 已打开目录", { path, projectId });
       } catch (err) {
@@ -652,6 +735,7 @@ export function useRootWorkspaceActions({
     },
     [
       addTab,
+      composerClientNamespace,
       intl,
       onOpenRemoteConnection,
       platform,

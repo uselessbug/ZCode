@@ -709,7 +709,8 @@ export const appSettingsPatchSchema = z.object({
     .nullish(),
   proactiveSuggestionsEnabled: z.boolean().optional(),
   memoryEnabled: z.boolean().optional(),
-  replyLanguage: replyLanguageSchema.optional(),
+  // 空串是「清除回复语言、回到跟随对话语言」的哨兵：RPC 会吞掉 undefined，normalizeSettingsPatch 把它归一成删除。
+  replyLanguage: z.union([replyLanguageSchema, z.literal("")]).optional(),
   lastWorkspaceSession: z.array(appWorkspaceSessionEntrySchema).optional(),
   lastActiveWorkspace: appWorkspaceSessionEntrySchema.nullable().optional(),
   remoteConversationWorkspaceBySourceServerId: z

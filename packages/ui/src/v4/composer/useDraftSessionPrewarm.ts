@@ -40,12 +40,14 @@ export function startDraftSessionPrewarm(params: {
   workspaceKey: string;
   dispatchCommand: DispatchCommand;
   onReady: (sessionId: string) => void;
+  onFailed?: (reason: string) => void;
   /** single-flight owner 用于等待不可取消的 createSession 收口；无论成功失败都只调用一次。 */
   onSettled?: () => void;
   /** 预热会话初始 config（全局「上次选择」，同步解析）；让投影首帧即全局、不闪。 */
   resolveInitialConfig?: () => Partial<SessionConfigState> | undefined;
 }): DraftPrewarmController {
-  const { workspaceKey, dispatchCommand, onReady, onSettled, resolveInitialConfig } = params;
+  const { workspaceKey, dispatchCommand, onReady, onFailed, onSettled, resolveInitialConfig } =
+    params;
   let disposed = false;
   let promotionState: "draft" | "pending" | "promoted" | "discarded" = "draft";
   let createdSessionId: string | null = null;
@@ -89,11 +91,13 @@ export function startDraftSessionPrewarm(params: {
         return;
       }
       if (ack.status !== "accepted" || ack.result?.type !== "createSession") {
+        const reason = ack.reasonCode ?? `createSession ${ack.status}`;
         logger.warn("[v4-draft-prewarm] createSession 被拒", {
           status: ack.status,
           reasonCode: ack.reasonCode ?? null,
           workspaceKey,
         });
+        if (!disposed) onFailed?.(reason);
         return;
       }
       createdSessionId = ack.result.sessionId;
@@ -109,10 +113,12 @@ export function startDraftSessionPrewarm(params: {
       onReady(createdSessionId);
     })
     .catch((error) => {
+      const reason = error instanceof Error ? error.message : String(error);
       logger.warn("[v4-draft-prewarm] createSession 失败", {
-        error: error instanceof Error ? error.message : String(error),
+        error: reason,
         workspaceKey,
       });
+      if (!disposed) onFailed?.(reason);
     })
     .finally(() => {
       onSettled?.();
@@ -148,6 +154,10 @@ export function startDraftSessionPrewarm(params: {
 export interface DraftSessionPrewarm {
   /** 当前 workspace/transport generation 已就绪的预热 binding。 */
   binding: DraftPrewarmBinding | null;
+  /** 预热退避重试耗尽或被作废后的失败出口；正在重试或恢复创建时为 null。 */
+  error: string | null;
+  /** 通过既有重试出口重新创建草稿预热会话。 */
+  retry(): void;
   /** 首发等待本 owner 当前创建任务；失败或换代即拒绝，不在发送路径另建会话。 */
   waitForSession(): Promise<DraftPrewarmBinding>;
 }
@@ -162,13 +172,13 @@ export interface DraftPrewarmBinding {
   /** 首发成功后标记（阻止清理路径 deleteSession 已提升的会话）。 */
   promote(): void;
   /** 订阅错误 / sendText 被拒后丢弃；只影响创建本 binding 的 controller。 */
-  discard(): void;
+  discard(reason?: string): void;
 }
 
 interface DraftPrewarmSubscriber {
   generation: object;
   invalidationVersion: number;
-  onBinding: (binding: DraftPrewarmBinding | null) => void;
+  onState: (state: { binding: DraftPrewarmBinding | null; error: string | null }) => void;
 }
 
 interface DraftPrewarmCurrent {
@@ -176,6 +186,7 @@ interface DraftPrewarmCurrent {
   invalidationVersion: number;
   controller: DraftPrewarmController;
   binding: DraftPrewarmBinding | null;
+  failureReason: string | null;
   settled: boolean;
   completion: Promise<void>;
   retiring: boolean;
@@ -272,10 +283,35 @@ class DraftSessionPrewarmCoordinator {
     return current.binding;
   }
 
+  retry(invalidationVersion: number, generation: object): void {
+    if (
+      this.requestedInvalidationVersion() !== invalidationVersion ||
+      !Array.from(this.subscribers.values()).some(
+        (subscriber) => subscriber.generation === generation,
+      )
+    ) {
+      return;
+    }
+    if (this.current?.retiring) {
+      return;
+    }
+    if (this.current && !this.current.settled) {
+      return;
+    }
+    if (this.current?.binding) {
+      return;
+    }
+    this.clearRetryTimer();
+    this.blockedInvalidationVersion = null;
+    this.current = null;
+    this.startCurrent(invalidationVersion);
+    this.emitBindings();
+  }
+
   acquire(params: {
     generation: object;
     invalidationVersion: number;
-    onBinding: (binding: DraftPrewarmBinding | null) => void;
+    onState: (state: { binding: DraftPrewarmBinding | null; error: string | null }) => void;
   }): () => void {
     if (this.cleanupTimer !== null) {
       clearTimeout(this.cleanupTimer);
@@ -355,14 +391,20 @@ class DraftSessionPrewarmCoordinator {
    */
   private scheduleRetryAfterFailure(failed: DraftPrewarmCurrent): void {
     const delay = PREWARM_RETRY_DELAYS_MS[failed.retryAttempt];
-    if (delay === undefined) return;
+    if (delay === undefined) {
+      this.emitBindings();
+      return;
+    }
     this.clearRetryTimer();
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       if (this.current !== failed || failed.retiring || failed.binding !== null) return;
       if (this.subscribers.size === 0) return;
       const requestedVersion = this.requestedInvalidationVersion();
-      if (requestedVersion === null || this.blockedInvalidationVersion === requestedVersion) return;
+      if (requestedVersion === null || this.blockedInvalidationVersion === requestedVersion) {
+        this.emitBindings();
+        return;
+      }
       // 释放失败的一代，让下一代能通过 reconcile 的单飞闸。
       this.current = null;
       this.startCurrent(requestedVersion, failed.retryAttempt + 1);
@@ -429,12 +471,15 @@ class DraftSessionPrewarmCoordinator {
             // （sessionId 非空 → 预热停用 → generation 换代，binding 随之失效）。
             // useSessionPaneLease 的「草稿晋升复用预热 lease」由此成立，交接期间有效会话不变。
           },
-          discard: () => {
+          discard: (reason) => {
             if (this.current !== current || current.binding !== binding) {
               return;
             }
+            this.clearRetryTimer();
             current.controller.markDiscarded();
             current.binding = null;
+            current.settled = true;
+            current.failureReason = reason ?? current.failureReason ?? "草稿会话已失效，请重试";
             this.blockedInvalidationVersion = current.invalidationVersion;
             const retainers = [...current.retainers];
             current.retainers.clear();
@@ -443,7 +488,13 @@ class DraftSessionPrewarmCoordinator {
           },
         };
         current.binding = binding;
+        current.failureReason = null;
         this.emitBindings();
+      },
+      onFailed: (reason) => {
+        if (this.current === current && !current.retiring) {
+          current.failureReason = reason;
+        }
       },
       onSettled: () => {
         current.settled = true;
@@ -468,6 +519,7 @@ class DraftSessionPrewarmCoordinator {
       invalidationVersion,
       controller,
       binding: null,
+      failureReason: null,
       settled: false,
       completion,
       retiring: false,
@@ -501,11 +553,23 @@ class DraftSessionPrewarmCoordinator {
 
   private emitBindingTo(subscriber: DraftPrewarmSubscriber): void {
     const current = this.current;
-    subscriber.onBinding(
-      current && !current.retiring && current.invalidationVersion === subscriber.invalidationVersion
-        ? current.binding
-        : null,
-    );
+    if (
+      !current ||
+      current.retiring ||
+      current.invalidationVersion !== subscriber.invalidationVersion
+    ) {
+      subscriber.onState({ binding: null, error: null });
+      return;
+    }
+    if (current.binding) {
+      subscriber.onState({ binding: current.binding, error: null });
+      return;
+    }
+    const terminalFailure =
+      current.settled && this.retryTimer === null
+        ? (current.failureReason ?? "草稿会话创建失败，请重试")
+        : null;
+    subscriber.onState({ binding: null, error: terminalFailure });
   }
 }
 
@@ -609,13 +673,17 @@ export function useDraftSessionPrewarm(params: {
       acquired.current.coordinator.update(dispatchCommand, resolveInitialConfig);
     }
   }, [dispatchCommand, generation, resolveInitialConfig]);
-  const [ready, setReady] = useState<{
+  const [prewarmState, setPrewarmState] = useState<{
     generation: typeof generation;
-    binding: DraftPrewarmBinding;
+    binding: DraftPrewarmBinding | null;
+    error: string | null;
   } | null>(null);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) {
+      setPrewarmState(null);
+      return;
+    }
     // 原先在 render 登记，未启用预热的历史页没有 acquire/release，Map 会永久保留闭包中的
     // 已关闭 store 和历史。登记与订阅必须同属已提交的 effect，中止 render 也不能留下 owner。
     const coordinator = getDraftSessionPrewarmCoordinator({
@@ -628,12 +696,12 @@ export function useDraftSessionPrewarm(params: {
     const release = coordinator.acquire({
       generation,
       invalidationVersion,
-      onBinding: (binding) => {
-        setReady((current) => {
-          if (!binding) {
+      onState: ({ binding, error }) => {
+        setPrewarmState((current) => {
+          if (!binding && !error) {
             return current?.generation === generation ? null : current;
           }
-          return { generation, binding };
+          return { generation, binding, error };
         });
       },
     });
@@ -647,6 +715,21 @@ export function useDraftSessionPrewarm(params: {
     () => createWaitForDraftSession(acquired, enabled, generation, invalidationVersion),
     [enabled, generation, invalidationVersion],
   );
+  const retry = useMemo(
+    () => () => {
+      if (!enabled) return;
+      const current = acquired.current;
+      if (current?.generation !== generation) return;
+      current.coordinator.retry(invalidationVersion, generation);
+    },
+    [enabled, generation, invalidationVersion],
+  );
 
-  return { binding: ready?.generation === generation ? ready.binding : null, waitForSession };
+  const currentState = prewarmState?.generation === generation ? prewarmState : null;
+  return {
+    binding: currentState?.binding ?? null,
+    error: currentState?.error ?? null,
+    retry,
+    waitForSession,
+  };
 }

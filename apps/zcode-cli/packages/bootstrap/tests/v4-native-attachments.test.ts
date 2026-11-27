@@ -101,9 +101,8 @@ const pathRef = {
 };
 
 describe("attachment-refs 映射（AttachmentRef → TurnAttachment）", () => {
-  it("话题历史 artifact 保留引用，禁止自动解码正文", async () => {
-    const app = makeApp();
-    const mapped = await mapAttachmentRefsToTurnAttachments(app as never, [
+  it("话题历史 artifact 保留引用，禁止自动解码正文", () => {
+    const mapped = mapAttachmentRefsToTurnAttachments([
       {
         ref: "zcode-artifact://history",
         fileName: "topic-history.txt",
@@ -119,12 +118,10 @@ describe("attachment-refs 映射（AttachmentRef → TurnAttachment）", () => {
         sourceKind: "topic-history",
       }),
     ]);
-    expect(app.readToolResultArtifact).not.toHaveBeenCalled();
   });
 
-  it("本地路径 ref：图片/视频/文件按 mime 分型为 path 引用，展示元信息保真", async () => {
-    const app = makeApp() as unknown as V4SessionRecordView["app"];
-    const mapped = await mapAttachmentRefsToTurnAttachments(app, [
+  it("本地路径 ref：图片/视频/文件按 mime 分型为 path 引用，展示元信息保真", () => {
+    const mapped = mapAttachmentRefsToTurnAttachments([
       pathRef,
       { ref: "/tmp/demo.mp4", fileName: "demo.mp4", mime: "video/mp4", bytes: 456 },
       { ref: "/tmp/report.pdf", fileName: "report.pdf", mime: "application/pdf", bytes: 789 },
@@ -162,16 +159,8 @@ describe("attachment-refs 映射（AttachmentRef → TurnAttachment）", () => {
     ]);
   });
 
-  it("PDF artifact URI ref 保留 durable URI，禁止按文本解码", async () => {
-    const app = makeApp({
-      readToolResultArtifact: vi.fn().mockResolvedValue({
-        uri: "zcode-artifact://pdf-1",
-        content: "data:application/pdf;base64,JVBERi0xLjQK",
-        contentType: "text/plain",
-        bytes: 9,
-      }),
-    }) as unknown as V4SessionRecordView["app"];
-    const mapped = await mapAttachmentRefsToTurnAttachments(app, [
+  it("PDF artifact URI ref 保留 durable URI，禁止按文本解码", () => {
+    const mapped = mapAttachmentRefsToTurnAttachments([
       { ref: "zcode-artifact://pdf-1", fileName: "report.pdf", mime: "application/pdf", bytes: 9 },
     ]);
 
@@ -185,12 +174,10 @@ describe("attachment-refs 映射（AttachmentRef → TurnAttachment）", () => {
         sizeBytes: 9,
       },
     ]);
-    expect(app.readToolResultArtifact).not.toHaveBeenCalled();
   });
 
-  it("图片/视频 artifact URI ref：content 携带 URI（core 解析链读回，不在命令层内联）", async () => {
-    const app = makeApp() as unknown as V4SessionRecordView["app"];
-    const mapped = await mapAttachmentRefsToTurnAttachments(app, [
+  it("图片/视频 artifact URI ref：content 携带 URI（core 解析链读回，不在命令层内联）", () => {
+    const mapped = mapAttachmentRefsToTurnAttachments([
       { ref: "zcode-artifact://img-1", fileName: "shot.png", mime: "image/png", bytes: 42 },
       { ref: "zcode-artifact://video-1", fileName: "demo.mp4", mime: "video/mp4", bytes: 84 },
     ]);
@@ -214,54 +201,70 @@ describe("attachment-refs 映射（AttachmentRef → TurnAttachment）", () => {
     ]);
   });
 
-  it("文本 artifact URI ref：读回并解码为 ≤64KiB 文本内容（旧 decodeTextProtocolAttachment 语义）", async () => {
-    const rawApp = makeApp();
-    const mapped = await mapAttachmentRefsToTurnAttachments(
-      rawApp as unknown as V4SessionRecordView["app"],
-      [{ ref: "zcode-artifact://a1", fileName: "paste.txt", mime: "text/plain", bytes: 11 }],
-    );
-    expect(rawApp.readToolResultArtifact).toHaveBeenCalledWith("zcode-artifact://a1");
-    expect(mapped?.[0]).toMatchObject({
-      content: "hello world",
-      path: "paste.txt",
-      type: "file",
-    });
-  });
-
-  it("超限/读取失败的非图片 artifact ref：降级为仅展示元信息（不让发送整体失败）", async () => {
-    const rawApp = makeApp({
-      readToolResultArtifact: vi.fn().mockRejectedValue(new Error("gone")),
-    });
-    const app = rawApp as unknown as V4SessionRecordView["app"];
-    const oversized = await mapAttachmentRefsToTurnAttachments(app, [
+  it("普通文件 artifact URI ref：统一透传 URI 与展示元信息（不提前解码，不丢弃超 64KiB，不冒充本地路径）", () => {
+    const mapped = mapAttachmentRefsToTurnAttachments([
+      { ref: "zcode-artifact://a1", fileName: "paste.txt", mime: "text/plain", bytes: 11 },
       {
         ref: "zcode-artifact://big",
-        fileName: "big.txt",
+        fileName: "big.log",
         mime: "text/plain",
-        bytes: 65 * 1024,
+        bytes: 100 * 1024,
+      },
+      {
+        ref: "zcode-artifact://zip-1",
+        fileName: "bundle.zip",
+        mime: "application/zip",
+        bytes: 1024,
+      },
+      {
+        ref: "zcode-artifact://clip-1",
+        fileName: "clipboard.txt",
+        mime: "text/plain",
+        bytes: 80_000,
+        sourceKind: "clipboard-text",
+        messageCount: 3,
       },
     ]);
-    expect(oversized?.[0]).toEqual({
-      type: "file",
-      filename: "big.txt",
-      mimeType: "text/plain",
-      sizeBytes: 65 * 1024,
-    });
-    const unreadable = await mapAttachmentRefsToTurnAttachments(app, [
-      { ref: "zcode-artifact://a1", fileName: "gone.txt", mime: "text/plain", bytes: 4 },
+    expect(mapped).toEqual([
+      {
+        content: "zcode-artifact://a1",
+        type: "file",
+        filename: "paste.txt",
+        mimeType: "text/plain",
+        sizeBytes: 11,
+      },
+      {
+        content: "zcode-artifact://big",
+        type: "file",
+        filename: "big.log",
+        mimeType: "text/plain",
+        sizeBytes: 100 * 1024,
+      },
+      {
+        content: "zcode-artifact://zip-1",
+        type: "file",
+        filename: "bundle.zip",
+        mimeType: "application/zip",
+        sizeBytes: 1024,
+      },
+      {
+        content: "zcode-artifact://clip-1",
+        type: "file",
+        filename: "clipboard.txt",
+        mimeType: "text/plain",
+        sizeBytes: 80_000,
+        sourceKind: "clipboard-text",
+        messageCount: 3,
+      },
     ]);
-    expect(unreadable?.[0]).toEqual({
-      type: "file",
-      filename: "gone.txt",
-      mimeType: "text/plain",
-      sizeBytes: 4,
-    });
+    for (const item of mapped ?? []) {
+      expect(item.path).toBeUndefined();
+    }
   });
 
-  it("空/缺省 → undefined；isUriAttachmentRef 区分 scheme:// 与本地路径（含 Windows 盘符）", async () => {
-    const app = makeApp() as unknown as V4SessionRecordView["app"];
-    expect(await mapAttachmentRefsToTurnAttachments(app, undefined)).toBeUndefined();
-    expect(await mapAttachmentRefsToTurnAttachments(app, [])).toBeUndefined();
+  it("空/缺省 → undefined；isUriAttachmentRef 区分 scheme:// 与本地路径（含 Windows 盘符）", () => {
+    expect(mapAttachmentRefsToTurnAttachments(undefined)).toBeUndefined();
+    expect(mapAttachmentRefsToTurnAttachments([])).toBeUndefined();
     expect(isUriAttachmentRef("zcode-artifact://x")).toBe(true);
     expect(isUriAttachmentRef("/tmp/a.png")).toBe(false);
     // Windows 盘符路径（C:\...）没有 //，不得误判为 URI。

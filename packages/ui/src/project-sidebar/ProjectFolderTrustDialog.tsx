@@ -8,6 +8,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
+import { useIsServerHostedSettingsScope } from "@/hooks/useFileContextActions.js";
 
 export interface ProjectFolderTrustRequest {
   roots: string[];
@@ -29,6 +30,8 @@ export function ProjectFolderTrustDialog({
   const { intl } = useZCodeIntl();
   const cancel = useRef<HTMLButtonElement>(null);
   const msg = (id: string) => intl.formatMessage({ id: `project.${id}` });
+  // 独立 Web / 手机远控下本地设备是当前服务器 Host；桌面端保持“此电脑”。
+  const serverHosted = useIsServerHostedSettingsScope();
   return (
     <Dialog
       open
@@ -55,7 +58,10 @@ export function ProjectFolderTrustDialog({
         <div className="grid min-w-0 gap-2">
           {request.projectName ? <p className="break-words">{request.projectName}</p> : null}
           <p className="break-words text-foreground-subtle">
-            {request.deviceLabel ?? msg("thisComputer")}
+            {request.deviceLabel ??
+              (serverHosted
+                ? intl.formatMessage({ id: "settings.scope.server" })
+                : msg("thisComputer"))}
           </p>
           <ul className="max-h-48 min-w-0 space-y-2 overflow-y-auto font-mono text-ui-sm select-text">
             {request.roots.map((root) => (

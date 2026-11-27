@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowLeft, LoaderCircle } from "lucide-react";
 import { type WebRemoteControlMobileNavigationIntent } from "@zcode/shared";
 import { Button } from "@/components/ui/button.js";
@@ -10,6 +10,31 @@ import type { WebRemoteControlWorkspaceSwitcherApi } from "@/root/types.js";
 import { useWebRemoteControlTerminalTransportState } from "@/webRemoteControlTerminalTransportState.js";
 
 type WebRemoteControlMobilePage = "home" | "chat";
+
+// 手机窄屏停在 Home 列表时，聊天内容区并未显示；activeTaskId 仍保留，但用户并没有在看该任务。
+// 页面状态属于壳层，这里只对外发布“Home 列表正在前台”这一事实，
+// 供 Root 的 syncActiveTaskSession 在此时上报 null，避免该任务的完成通知被误当作已查看而吞掉。
+let mobileHomeListVisible = false;
+const mobileHomeListVisibilityListeners = new Set<() => void>();
+
+export function isWebRemoteControlMobileHomeListVisible(): boolean {
+  return mobileHomeListVisible;
+}
+
+export function subscribeWebRemoteControlMobileHomeListVisibility(
+  listener: () => void,
+): () => void {
+  mobileHomeListVisibilityListeners.add(listener);
+  return () => {
+    mobileHomeListVisibilityListeners.delete(listener);
+  };
+}
+
+function publishMobileHomeListVisible(visible: boolean): void {
+  if (mobileHomeListVisible === visible) return;
+  mobileHomeListVisible = visible;
+  for (const listener of Array.from(mobileHomeListVisibilityListeners)) listener();
+}
 
 function hasMobileHistoryPage(
   state: unknown,
@@ -66,6 +91,8 @@ export function WebRemoteControlMobileShell({
   chatContent,
   chatOverlay,
   initialNavigationIntent,
+  composerPrefillRequestId,
+  revealChatRequestId,
   isSidePaneOpen = false,
   onCloseSidePane,
   renderTaskHome,
@@ -76,12 +103,15 @@ export function WebRemoteControlMobileShell({
 }: {
   children?: ReactNode;
   isMobileViewport?: boolean;
-  switcher: WebRemoteControlWorkspaceSwitcherApi;
+  switcher?: WebRemoteControlWorkspaceSwitcherApi;
   activeWorkspacePath: string;
   activeWorkspaceIdentity?: string;
   activeTaskId: string | null;
   taskViewEnabled?: boolean;
   initialNavigationIntent?: WebRemoteControlMobileNavigationIntent;
+  composerPrefillRequestId?: number;
+  /** 单调递增的“切到 Chat”请求序号（如通知点击选中会话）；变化且大于 0 时进入 Chat。 */
+  revealChatRequestId?: number;
   isSidePaneOpen?: boolean;
   onCloseSidePane?: () => void;
   renderTaskHome: (options: {
@@ -96,7 +126,9 @@ export function WebRemoteControlMobileShell({
 }) {
   const { intl } = useZCodeIntl();
   const [currentPage, setCurrentPage] = useState<WebRemoteControlMobilePage>(() =>
-    resolveInitialWebRemoteControlMobilePage(initialNavigationIntent),
+    composerPrefillRequestId
+      ? "chat"
+      : resolveInitialWebRemoteControlMobilePage(initialNavigationIntent),
   );
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const terminalTransportState = useWebRemoteControlTerminalTransportState(
@@ -107,6 +139,27 @@ export function WebRemoteControlMobileShell({
   const navigateToChat = useCallback(() => {
     setCurrentPage("chat");
   }, []);
+
+  useEffect(() => {
+    // 普通 Web 设置层只准备了草稿；手机 Home 没有 Composer，必须显式进入 Chat 才能消费预填。
+    // 不观察 currentPage，避免返回 Home 后把已经处理的意图重新执行。
+    if (isMobileViewport && composerPrefillRequestId) navigateToChat();
+  }, [
+    isMobileViewport,
+    composerPrefillRequestId,
+    activeWorkspacePath,
+    activeWorkspaceIdentity,
+    navigateToChat,
+  ]);
+
+  // 挂载时已有的序号视为已处理，重挂载或断点切换不会把停在 Home 的用户重新拉进 Chat。
+  const lastRevealChatRequestIdRef = useRef(revealChatRequestId ?? 0);
+  useEffect(() => {
+    // 与预填请求同理只观察序号、不观察 currentPage：用户之后点返回箭头或系统返回键仍能回到 Home。
+    if (!revealChatRequestId || revealChatRequestId === lastRevealChatRequestIdRef.current) return;
+    lastRevealChatRequestIdRef.current = revealChatRequestId;
+    if (isMobileViewport) navigateToChat();
+  }, [isMobileViewport, revealChatRequestId, navigateToChat]);
 
   const navigateHome = useCallback(() => {
     // 聊天可能是历史首项，浏览器无法后退。箭头直接回列表，并同步历史供刷新恢复。
@@ -125,6 +178,12 @@ export function WebRemoteControlMobileShell({
   useLayoutEffect(() => {
     if (isMobileViewport && currentPage === "chat") recordMobileChatHistory();
   }, [isMobileViewport, currentPage]);
+
+  useEffect(() => {
+    publishMobileHomeListVisible(isMobileViewport && currentPage === "home");
+  }, [isMobileViewport, currentPage]);
+  // 壳层卸载后不再有 Home 列表，必须复位，否则宽屏或桌面壳层会一直上报“未在查看”。
+  useEffect(() => () => publishMobileHomeListVisible(false), []);
 
   useEffect(() => {
     if (!isMobileViewport || typeof window === "undefined") {
@@ -159,7 +218,7 @@ export function WebRemoteControlMobileShell({
         switcher={switcher}
       />
       {isMobileViewport ? (
-        <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-background">
+        <div className="mobile-workspace relative flex h-full min-h-0 min-w-0 flex-col bg-background">
           {currentPage === "home" ? (
             <section className="flex h-full min-h-0 min-w-0 flex-col" data-mobile-page="home">
               {renderTaskHome({ navigateToChat, setSwitching: setSwitchingWorkspace })}

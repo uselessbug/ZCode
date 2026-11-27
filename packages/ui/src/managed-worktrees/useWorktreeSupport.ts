@@ -1,5 +1,5 @@
 // worktree 入口（composer 复选框、"在新 worktree 中分叉"）的可见性与可用性（docs/git/worktree.md §3.1）。
-// 可见：本地 Git 仓库；可用：项目 CLI 在 runtime/capabilities 中声明 worktreeCwd。
+// 可见：本地 Git 仓库（桌面与独立 Web 本地连接，由 Host 是否提供 managedWorktreeService 决定）；可用：项目 CLI 在 runtime/capabilities 中声明 worktreeCwd。
 import { useEffect, useState } from "react";
 import { useServices } from "@/hooks/useServices.js";
 import { logger } from "@/logger.js";

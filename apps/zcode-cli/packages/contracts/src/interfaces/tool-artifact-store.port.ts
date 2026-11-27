@@ -26,6 +26,8 @@ export interface ToolBinaryArtifactWriteRequest {
   content: Uint8Array;
   contentType: string;
   extension?: string;
+  /** 传入时按 `<sessionId>/<artifactId>/<safeFileName>` 具名落盘，保留安全原文件名。 */
+  fileName?: string;
   retention?: ToolArtifactRetention;
   trace?: TraceContext;
 }

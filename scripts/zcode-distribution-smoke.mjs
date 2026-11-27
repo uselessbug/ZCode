@@ -2,17 +2,23 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { promisify, stripVTControlCharacters } from "node:util";
 import { pathToFileURL } from "node:url";
+import {
+  bundledSkillPackRequiredPaths,
+  bundledSkillPackRootPath,
+} from "../apps/zcode-cli/packages/cli/scripts/sea-bundled-skill-assets.mjs";
+import { officialPluginStagingTargets } from "./zcode-distribution/assets.mjs";
 
 const exec = promisify(execFile);
 const archive = process.argv[2];
 assert.ok(archive, "Usage: node scripts/zcode-distribution-smoke.mjs <archive.tar.gz>");
+const repoRoot = resolve(import.meta.dirname, "..");
 const directory = await realpath(await mkdtemp(join(tmpdir(), "zcode-release-smoke-")));
 const root = join(directory, "zcode");
 const runner = join(root, "bin/zcode.mjs");
@@ -28,6 +34,7 @@ let web;
 let terminal;
 try {
   await exec("tar", ["-xzf", resolve(archive), "-C", directory]);
+  await assertBuiltinAgentAssets(root);
   await mkdir(workspace);
   await exec(process.execPath, [runner, "--help"], { cwd: workspace, env });
   const version = (
@@ -145,6 +152,53 @@ try {
   terminal?.kill();
   web?.kill();
   await rm(directory, { recursive: true, force: true });
+}
+
+// 静态验收内置资产：期望清单直接来自 CLI SEA 采集器，避免与构建侧各维护一份。
+// 只读文件、不启动 Agent、不调用模型；所有路径必须落在解压目录内，证明脱离源码树也能定位。
+async function assertBuiltinAgentAssets(releaseRoot) {
+  const agentRoot = join(releaseRoot, "agent");
+  const insideRelease = (path) => path === releaseRoot || path.startsWith(`${releaseRoot}${sep}`);
+  const assertReleaseFile = async (file, label) => {
+    assert.ok(insideRelease(file), `${label} escapes the extracted release: ${file}`);
+    assert.ok(
+      !file.startsWith(`${repoRoot}${sep}`),
+      `${label} resolved into the repo checkout: ${file}`,
+    );
+    const info = await stat(file).catch(() => null);
+    assert.ok(info?.isFile(), `Missing ${label}: ${file}`);
+  };
+
+  for (const target of officialPluginStagingTargets()) {
+    const pluginRoot = join(agentRoot, target.directory);
+    assert.ok(
+      insideRelease(pluginRoot) && !pluginRoot.startsWith(`${repoRoot}${sep}`),
+      `official plugin ${target.name} staged outside the release: ${pluginRoot}`,
+    );
+    await assertReleaseFile(
+      join(pluginRoot, ".zcode-plugin", "plugin.json"),
+      `${target.name} plugin manifest`,
+    );
+    for (const relativePath of target.requiredSeedPaths) {
+      await assertReleaseFile(
+        join(pluginRoot, ...relativePath.split("/")),
+        `${target.name} required seed asset ${relativePath}`,
+      );
+    }
+    for (const relativePath of target.requiredRuntimePaths) {
+      await assertReleaseFile(
+        join(pluginRoot, ...relativePath.split("/")),
+        `${target.name} runtime ${relativePath}`,
+      );
+    }
+  }
+
+  for (const relativePath of bundledSkillPackRequiredPaths) {
+    await assertReleaseFile(
+      join(agentRoot, bundledSkillPackRootPath, ...relativePath.split("/")),
+      `bundled skill pack asset ${relativePath}`,
+    );
+  }
 }
 
 async function until(check, label, diagnostic) {

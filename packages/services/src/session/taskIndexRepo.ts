@@ -28,6 +28,7 @@ import {
   createProjectDataRepository,
   projectStorage,
   type ProjectMigrationContext,
+  type ProjectRepositoryOptions,
 } from "#src/project-storage/index.js";
 import { runTasksDatabaseMigrations } from "#src/session/tasksDatabase/migrations.js";
 
@@ -368,9 +369,13 @@ export class TaskIndexRepo {
     return this.getDatabase();
   }
 
-  async getProjectRepository() {
+  /**
+   * 项目仓储读取/写入端口。独立云端 Web 的装配层按调用传入策略，
+   * 只在显式开启时放宽远端 owner 的无项目会话与自动 root 分配。
+   */
+  async getProjectRepository(options?: ProjectRepositoryOptions) {
     await this.ensureReady();
-    return projectStorage.repository(this.getDatabase(), this.storageHostId);
+    return projectStorage.repository(this.getDatabase(), this.storageHostId, options);
   }
 
   async getProjectDataRepository() {

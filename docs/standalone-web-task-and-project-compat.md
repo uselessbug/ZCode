@@ -1,0 +1,155 @@
+> 本规格描述已直接集成到当前源码的独立 Web 行为。下文的基础版本和补丁顺序仅是历史背景；构建使用本仓库当前源码，不再应用外部覆盖补丁。
+
+# 独立 Web 任务管理与非项目工作模式
+
+固定上游 3c5b227649371507ddc4eb46ac5133afe6db1cab（3.16.2）。本 spec 覆盖两件事：**第一项**独立 Web 的任务归档/取消归档/删除/重命名/置顶/已读状态与列表订阅回退；**补充项**项目创建（0 目录/1 目录/多目录）与非项目工作模式。连接生命周期另见 `docs/standalone-web-recovery.md`。
+
+兼容入口只限定在显式的独立云端配置（`allowStandaloneCloudWorkspaces` 由 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"` 打开）。桌面 MessagePort、桌面远控 `/remote` relay、真实远端 Source 的契约不变。
+
+## 状态所有者与接口
+
+| 事实                                             | 唯一所有者                                         | 写入接口                                                          |
+| ------------------------------------------------ | -------------------------------------------------- | ----------------------------------------------------------------- |
+| 任务组织态（archived / pinned / unread / title） | 所属 Host 的 tasks-index（`taskIndexRepo`）        | `zcodeTaskService`（独立 Web）/ `windowControllerService`（桌面） |
+| CLI 会话删除事实                                 | CLI（经 `zcodeTaskIndexSyncer` → `deleteSession`） | `taskIndexSyncer.mutateSessionFacts({type:"delete"})`             |
+| 归档条件删除裁决                                 | `zcodeTaskServiceAdapter.deleteArchivedTask(s)`    | 先读归档事实，再 CLI，最后 tombstone                              |
+| 项目 root 与归属                                 | 所属 Host 的 project 库                            | `projectService.saveProject` / `prepareSession`                   |
+| 非项目草稿目录                                   | 服务端按 `draftId` 分配                            | `projectService.prepareSession({draftId})`                        |
+
+### 第一项：服务暴露与回退
+
+```mermaid
+sequenceDiagram
+    participant UI as 侧栏/顶栏任务入口
+    participant Access as RemoteServiceAccess
+    participant Svc as zcodeTaskService
+    participant Host as 所属 Host tasks-index
+    UI->>Access: 读取 windowControllerService
+    alt 独立 Web（exposeWindowController=false）
+        Access-->>UI: undefined
+        UI->>Svc: listTaskList / getTaskMeta / archiveTask / deleteArchivedTask
+        Svc->>Host: 同一 tasks-index 事实
+    else 桌面 / 桌面远控
+        Access-->>UI: WindowController 代理
+        UI->>Access: Controller 查询与变更
+    end
+```
+
+- `RemoteServiceAccess` 只在 `exposeWindowController !== false` 时构造 `windowControllerService`。`connectViaWebSocket`（普通 Web）默认传 `false`；`connectViaMessagePort`（桌面）与 `connectViaProtocol`（`/remote` relay）保持构造，不改成可选。
+- 独立 Web 下 `useGlobalTaskList` 不再因缺失 Controller 直接报错返回：`refresh` 改用 `zcodeTaskService.listTaskList(query)`，并保留请求序号防竞态、排序与 `onSnapshotLoaded`；`useEffect` 在缺 Controller 时同时订阅 `refreshEventName` 与每个 `workspaceScopes` 的 `zcodeTaskService.onDynamicWorkspaceEvent(scope)`，保证顶栏置顶状态与全局搜索刷新。
+- 任务 mutation 复用既有 `task-mutation` 回退：`readProjectTaskMeta` / `mutateProjectTask` 在无 Controller 时走 `zcodeTaskService`（归档、取消归档、重命名、置顶、已读/未读）。
+- 归档管理删除复用带归档条件检查的 `deleteArchivedTask`，不把普通 `deleteTask` 当作归档删除。
+- 3.17.2 的列表查询可使用 `workspaceScopes: "host"`；它不代替工作区事件目标。独立 Web 的事件订阅仍使用按 path/identity 去重的已知工作区列表，避免把 Host 查询标记当作目录数组遍历；查询与订阅继续共用现有任务服务。
+
+### 第一项：删除的顺序保障（失败项不提前隐藏）
+
+```mermaid
+sequenceDiagram
+    participant UI as 归档管理
+    participant Svc as deleteArchivedTask(s)
+    participant Repo as taskIndexRepo
+    participant CLI as CLI (deleteSession)
+    UI->>Svc: 删除已确认的归档任务
+    Svc->>Repo: 读取当前归档事实
+    alt 未归档 / 已删除 / 不存在
+        Repo-->>Svc: 跳过
+        Svc-->>UI: false / skipped
+    else 仍归档
+        Svc->>CLI: mutateSessionFacts({type:"delete"})
+        alt CLI 失败
+            CLI-->>Svc: 抛错
+            Note over Repo: 未写 tombstone，刷新后仍留在归档列表
+            Svc-->>UI: failed（不移除行）
+        else CLI 成功
+            Svc->>Repo: deleteArchivedTask（tombstone + handoff_pending）
+            Note over Repo: CLI 对账可能已置 deleted=1，此时返回 null 仍按成功处理
+            Svc-->>UI: true / deleted（移除行并广播 task_deleted）
+        end
+    end
+```
+
+- `taskIndexRepo.deleteArchivedTask` 是唯一写 tombstone（`deleted=1` + `handoff_pending |= 1`）的入口，且与归档检查同事务；`getTaskMeta` 不返回 `archived`，故新增只读 `getTaskIndexFlags` 暴露 `archived/deleted` 事实供前置裁决，不返回完整 meta。
+- 顺序固定为「读归档事实 → CLI 删除 → tombstone」。CLI 成功但 tombstone 返回 `null`（CLI 对账已把该行置 `deleted=1`）时视为删除成功并广播，避免刷新/重连复活。
+- 批次 `deleteArchivedTasks` 采用同一顺序：未归档计入 `skippedTaskIds`；CLI 抛错计入 `failedTaskIds` 且不写 tombstone；全部成功后只广播一次。
+- 归档管理把单条结果映射为 `deleted → succeeded + 移除行`、`skipped → skipped + 移除行`、`异常 → failed + 不移除行`。
+
+### 补充边界：独立 Web 归档永久删除的 CLI Carrier 路由
+
+- 独立 Web（`serviceAuthorityMode === "standalone-server"`）下的归档任务携带本 Server 的 canonical `workspaceIdentity`（`remote:server:<serverId>:<workspacePath>`）。当该工作区当前没有活跃的 CLI 子进程（例如服务端重启后首次清理历史归档任务）时，`previewSessionDeletion` 与 `executeSessionDeletion` 仍保留对工作区目录的精确归属校验，不能全局放宽 `isLocalActiveWorkspaceClient`。
+- 路由规则：
+  1. 先按 `getReadOnlyClient(params.workspace, "existing-only")` 复用已活跃的工作区 CLI（热 runtime 原样复用，不另外拉起目标项目 CLI）。
+  2. 仅当抛出 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 时，由装配层显式注入的 `isDeletionWorkspaceOwnedByCurrentHost(workspace)` 裁决是否允许回落当前 Host 的 `getPluginManagementClient()`：
+     - 若存在 `workspace.remoteSessionId`、`workspaceIdentity` 为空或 `workspacePath` 为空，一律禁止回落；
+     - 仅在 `serviceAuthorityMode === "standalone-server"` 下调用 `sourceServerWorkspaceService.resolveWorkspace({ workspacePath })`，要求 `resolved.canonicalWorkspaceKey === workspace.workspaceIdentity.trim()` 精确相等（沿用 `SourceServerWorkspaceIdentityChannelServer` 映射后的 canonical 身份）才允许回落到当前 Host 的控制面 CLI；
+     - 异域身份（如 `remote:ssh:*`、`remote:wsl:*`、其他 `remote:server:*` 或同 server 错 `workspacePath`）以及非 runtime-unavailable 异常均严禁回落，原样透传错误。
+  3. 无论走热 runtime 还是控制面 carrier，`session/delete/preview` 与 `session/delete/execute` 请求体都完整保留原始 `workspace`（`workspacePath` + `workspaceIdentity`）、`revision` 与 `operationId`，由 CLI `permanent-deletion` 继续执行身份一致性、`revision` 冲突与幂等保护。
+
+### 补充边界：项目恢复与当前服务器项目数据清理的 Host 别名
+
+- 仅在 `web-remote-replayable` 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS=1` 时，由 HTTP 包装把 `restoreProject(id, "local")`、`measureProjectData(ids, "local")` 与 `deleteProjectData(id, "local")` 的第二个位置参数重写为当前服务器 canonical owner；对象内的 `hostId` 与返回结果沿用既有转换。
+- Toast 撤销移除与已移除项目列表恢复共用 `restoreProject` 路径；项目管理弹窗的数据估算与「同时删除它们的 ZCode 数据」共用 `measureProjectData` / `deleteProjectData` 路径。其他 Host 参数（如异域 `hostId`）原样传递，普通桌面、普通远端 owner 与未开启 `allowStandaloneProjectData` 的服务端仍抛 `project.data-local-only`。
+- 服务端 `project-data` 对每个可删目录（含 0 会话项目 root）同时覆盖独立 Web 本地路径哈希记忆目录（`<slug>-<hash>/memory`）与当前服务器 canonical `workspaceIdentity` 哈希记忆目录（`project-<sha256(identity).slice(0,16)>/memory`），避免本地路径会话记忆漏估漏删；`purgeSessionData` 优先命中热运行 CLI 以保护 `busy` 运行中会话，仅在 `ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE` 且归属当前 Host canonical 身份时回落管理面进程，异域身份与非 runtime-unavailable 异常原样抛出、不回落。
+- 回归直接执行源码别名包装与真实项目服务/SQLite，验证恢复参数转换、`measureProjectData`/`deleteProjectData` 成功路径、0 会话与 canonical 记忆路径解析、热运行 `busy` 会话保护、冷工作区安全回落及异域/未开启拒绝边界。
+
+### 补充项：非项目工作模式与项目 root
+
+```mermaid
+sequenceDiagram
+    participant UI as 页面（脱离项目 / X / 新建项目）
+    participant Svc as projectService
+    participant Policy as remote-policy
+    participant FS as standaloneWorkspaceRoot
+    UI->>Svc: prepareSession({draftId})（无 projectId）
+    Svc->>FS: <root>/.zcode/conversations/draft-<draftId>
+    Svc->>Policy: assertRemoteTaskDirectories(owner, null, path, [])
+    Policy-->>Svc: 显式 allow 时放行；否则 remote-project-required
+    Svc-->>UI: { projectId: null, workspacePath, additionalDirectories: [] }
+    UI->>Svc: saveProject({ name })（0 目录新建）
+    Svc->>Policy: assertRemoteProjectRoots(owner, [])
+    Svc-->>UI: 0 目录项目（磁盘不提前建目录）
+    UI->>Svc: prepareSession({ projectId })
+    Svc->>FS: <root>/.zcode/workspace/<projectId>
+    Svc-->>UI: 懒创建并登记工作目录
+```
+
+- `assertRemoteTaskDirectories` 增加可选策略：仅当 `allowStandaloneNonProject` 为真、`additionalDirectories` 为空、`workspacePath` 非空且位于 `standaloneWorkspaceRoot` 之内时放行无项目会话；否则维持 `project.remote-project-required`。跨 Host 与 canonical owner 不变。
+- `ProjectRepository` / `createProjectService` 透传 `allowStandaloneCloudWorkspaces` 与 `standaloneWorkspaceRoot`；`node.ts` 仅在 standalone server 且 `ZCODE_STANDALONE_WEB_LOCAL_HOST_ALIAS === "1"` 时开启，root 取 `ZCODE_DEFAULT_WORKSPACE_DIR || /workspace`。
+- `prepareSession` 无 `projectId`：普通本地模式仍用原 `workspaceDirectory`；独立云端开启时用 `<root>/.zcode/conversations`，按 `draftId` 分配稳定目录（相同 `draftId` 幂等复用）。remote owner 未开启策略时仍抛 `project.remote-project-required`。
+- `saveProject` 0 目录项目（对齐官方桌面生命周期）：开启 `allowStandaloneMultiRoot` 的独立 Web 允许 `0..n` 个目录，0 目录新建时保留 `roots: []`（不提前在磁盘建目录，未填名称时使用干净默认名 `New project` / `defaultName`），编辑传入 `roots: []` 允许清空为 0 目录；首次 `prepareSession({ projectId })` 时通过 `initializeProjectRoot` 在 `<root>/.zcode/workspace/<projectId>` 懒创建并登记唯一 root。未开启 `allowStandaloneMultiRoot` 的普通远端仍要求恰好 1 个不可变 root（`project.remote-single-root-required` / `project.remote-root-immutable`）。独立 Web 的多 root 能力与任务移动增补 root 见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
+- 前端：非项目草稿绑定稳定 `draftId`，切换时显式 `projectId: null` 并保留转移中的草稿（无项目草稿目录保持 `<root>/.zcode/conversations/draft-<draftId>`）；已绑定的草稿目录在磁盘上被移走或清理（`ENOENT`）时，`packages/services/src/project/index.ts` 对 `reuseDraft: true` 分支返回稳定业务错误码 `project.draft-workspace-missing`（不静默重建），`useRootWorkspaceActions.ts` 与 `useConversationWorkspaceActions.ts` 捕获该错误时须先确认当前导航未过时且无在途首发 `commandId`，再调用 `composerDraftStore.ts` 的 `rotateMissingPendingTaskDraft`（先校验 `current` 与 `commandId`，即使被其他入口换绑也先拦截在途命令），并以当前绑定状态 `reuseDraft: Boolean(rotatedDraft.workspacePath)` 幂等重试 `prepareSession`（不强制 `reuseDraft: false` 重建已被删除的目录），异步回包后核验导航与草稿所有权（`readPendingTaskDraft(scope)?.draftId === pendingDraft.draftId`）才写回绑定或导航；当无项目草稿菜单（`resolveConversationWorkspaceTarget`）位于当前受管 `pendingDraft` 路径时同样不绕过 `prepareSession`，真实历史非项目会话快捷路径继续保留；输入框正文草稿按 `ComposerScope` 保存并在换绑后完整保留；`ProjectEditor` 对真实远端仍限制为单 root（选择目录最多保留 1 个、既有项目 root 固定不可移除），独立 Web 对齐官方桌面删除 `standaloneAutoRootHint` 提示，允许增删多个 root、0 目录新建项目以及编辑已有项目移除最后一个目录回到 0 目录状态（首次 `prepareSession` 懒创建 `<root>/.zcode/workspace/<projectId>`）；`formatProjectError` 为三个错误码提供可读国际化文案，不向用户暴露原始错误码。
+
+### 补充项：页面导航隔离、草稿恢复与无项目附件发送
+
+- **独立 Web 页面导航隔离与恢复优先级**：
+  - 独立 Web 的页面导航状态按同源的本浏览器页面保留（不同浏览器或客户端之间不共享服务端全局 `lastActiveWorkspace`，并与桌面端及真实手机远控隔离）。
+  - 启动与恢复时，通知深链优先；无深链时优先恢复本浏览器页面仍有效的草稿或目标会话。
+  - 仅在确认原归属项目不存在或已删除时，才回退调用 `prepareSession` 复用未归类草稿目录，并保留草稿正文与用户已有选择（如模型、模式等）；网络抖动或临时连线失败不得误判为项目已删除或被静默吞掉。
+- **首发状态不明时只查不重发**：
+  - 首条消息发送过程中若遭遇断线或结果不明，恢复后仅按原命令标识查询投递/接纳状态，不自动重发首发消息，避免重复创建或重复投递。
+- **无项目草稿附件预热与发送门禁**：
+  - 无项目草稿在添加或粘贴附件时，需等待草稿工作区目录就绪（预热完成）后再落盘写入。
+  - 附件处于上传/准备中时发送入口等待；若附件进入终态失败，允许用户单独重试或移除该附件，且在存在缺失或失败附件时仍禁止发送。
+
+### 补充项：任务菜单文件入口与项目设备名称
+
+- 独立 Web 侧栏任务菜单（列表视图与分组视图）将桌面本地文件管理器入口替换为复用官方 `openTaskFiles` 的「显示文件树」（定位任务 `cwd` 并打开右侧文件栏），顶栏任务菜单与手机远控隐藏该项。
+- 「前往 Provider 配置」在无本机文件打开能力（`!canOpenLocalFiles`）时统一隐藏，避免独立 Web 下点击无反馈。
+- **项目本地设备文案对齐“当前服务器”**：在服务端承载环境（`useIsServerHostedSettingsScope()` 为 `true`，覆盖独立 Web 与手机远控）下，`ProjectEditor.tsx`（新建/编辑项目设备选择）、`ProjectManagementRow.tsx`（项目管理列表 `DeviceTag`）、`ProjectFolderTrustDialog.tsx`（工作区文件夹信任弹窗）与 `ProjectComposerMenu.tsx`（输入框项目选择菜单）四处将本地设备文案从“此电脑”（`project.thisComputer`）统一显示为“当前服务器”（`settings.scope.server`）；桌面端保持“此电脑”不变，远端设备名称原样展示。
+
+## 验收场景
+
+**Area A**
+
+1. `exposeWindowController:false` 时 `windowControllerService` 为 `undefined`；默认 / MessagePort / Protocol 下保留。
+2. 无 Controller 时 `readProjectTaskMeta` / `mutateProjectTask` 走 `zcodeTaskService`：归档、取消归档、重命名、置顶、已读、未读各自命中对应方法。
+3. 归档条件删除：已取消归档 → `false` / `skippedTaskIds`；CLI 抛错 → `failedTaskIds` 且 repo 未被写成 `deleted=1`；CLI 成功 → 删除完成且刷新/重连不复活。
+4. 归档管理计数：成功 `succeeded`、跳过 `skipped`（移除行）、失败 `failed`（不移除行）。
+5. 列表归档、菜单归档、设置取消归档在刷新与新连接后状态一致；重命名、置顶、已读状态及列表刷新正常。
+
+**Area B**
+
+6. 开启策略时无 `projectId` 的 `prepareSession({draftId})` 在 `<root>/.zcode/conversations` 下分配稳定目录，相同 `draftId` 幂等复用；当已绑定的 `draft-<draftId>` 目录在磁盘上缺失时，`prepareSession({ draftId, reuseDraft: true })` 返回 `project.draft-workspace-missing`，前端先校验当前导航与在途 `commandId` 再通过 `rotateMissingPendingTaskDraft` 换绑，并以 `reuseDraft: Boolean(rotatedDraft.workspacePath)` 幂等重试及核验异步结果所有权，命中当前受管 `pendingDraft` 路径的无项目草稿菜单不绕过 `prepareSession`（真实历史非项目会话快捷路径保留），同时完整保留输入框草稿文字；`reserveCreatedTask` / `resolveDirectories` 允许 `projectId:null` 且 `additionalDirectories:[]`。
+7. 0 目录新建项目保存为 `roots: []`（磁盘未提前建目录、默认名干净），编辑传入 `roots: []` 可清空为 0 目录；首次 `prepareSession({ projectId })` 在 `<root>/.zcode/workspace/<projectId>` 懒创建并登记工作目录；未开启 `allowStandaloneMultiRoot` 时多于 1 目录抛 `project.remote-single-root-required`、改既有 root 抛 `project.remote-root-immutable`。独立 Web 多 root 与移动增补 root 的验收见 [独立 Web 多 root 项目与任务移动](./standalone-web-multi-root-projects.md)。
+8. 未开启策略的普通远端 owner 仍抛 `project.remote-project-required` 与 `project.remote-single-root-required`；跨 Host 仍被拒绝。
+9. 既有独立 Web host alias 与连接恢复补丁仍生效；仅替换 ZCode 镜像，AGM、Access checker、Caddy 与其他服务不变。
+10. 独立 Web 不同浏览器互不覆盖当前活动工作区/草稿，通知深链优先于本地恢复；仅在确认项目不存在或已删除时回退 `prepareSession` 复用未归类草稿目录并保留正文与用户选择，连线失败不误吞；首发结果不明时只查原命令不重发；无项目草稿附件等待预热完成，终态失败可重试或移除，存在缺失/失败附件时禁止发送。

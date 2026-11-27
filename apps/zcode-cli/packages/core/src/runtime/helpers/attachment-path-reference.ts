@@ -42,11 +42,14 @@ export function resolvedPathReferenceAttachment(
   attachment: TurnAttachment,
   placeholder: string,
   options: {
+    artifactUri?: string;
     filename?: string;
     mime?: string;
+    originalUrl?: string;
     reason: PathReferenceReason;
     sizeBytes?: number;
     source?: FilePartSource;
+    url?: string;
   },
 ): ResolvedTurnAttachment {
   const mime =
@@ -60,7 +63,8 @@ export function resolvedPathReferenceAttachment(
     contentBlock: { type: "text", text: content },
     filename: options.filename,
     metadata: {
-      originalUrl: safeAttachmentOriginalRef(attachment),
+      ...(options.artifactUri ? { artifactUri: options.artifactUri } : {}),
+      originalUrl: options.originalUrl ?? safeAttachmentOriginalRef(attachment),
       recoverability: "metadata_only",
       sizeBytes: options.sizeBytes,
       storageKind: "local_ref",
@@ -69,7 +73,7 @@ export function resolvedPathReferenceAttachment(
     },
     mime,
     source: options.source,
-    url: attachment.path ?? attachment.content ?? "",
+    url: options.url ?? attachment.path ?? attachment.content ?? "",
   };
 }
 
@@ -77,9 +81,67 @@ export function isDataOrArtifactUrl(content: string): boolean {
   return content.startsWith("data:") || content.startsWith("zcode-artifact://");
 }
 
+const EXPLICIT_BINARY_EXTENSION_PATTERN =
+  /\.(7z|a|aac|apk|avi|bin|bz2|class|db|dll|docx|dylib|exe|flac|gif|gz|ico|jar|jpeg|jpg|lib|m4v|mkv|mov|mp3|mp4|o|ogg|otf|pdf|png|pptx|pyc|rar|so|sqlite|tar|tgz|ttf|wasm|wav|webm|webp|woff|woff2|xlsx|xz|zip)$/iu;
+
+const TEXT_LIKE_EXTENSION_PATTERN =
+  /\.(astro|bash|bat|c|cc|cjs|cmd|conf|cpp|cs|css|csv|cxx|env|fish|go|gql|graphql|h|hpp|htm|html|ini|java|js|json|json5|jsonc|jsx|kt|kts|less|log|md|mdx|mjs|php|proto|ps1|py|rb|rs|scss|sh|sql|svelte|svg|swift|toml|ts|tsx|tsv|txt|vue|xml|yaml|yml|zsh)$/iu;
+
+const SAFE_TEXT_MIMES = new Set([
+  "application/ecmascript",
+  "application/graphql",
+  "application/javascript",
+  "application/json",
+  "application/ld+json",
+  "application/sql",
+  "application/toml",
+  "application/typescript",
+  "application/x-javascript",
+  "application/x-sh",
+  "application/x-typescript",
+  "application/x-yaml",
+  "application/xml",
+  "application/yaml",
+  "image/svg+xml",
+]);
+
+export function isExplicitBinaryPath(path: string): boolean {
+  return EXPLICIT_BINARY_EXTENSION_PATTERN.test(path);
+}
+
 export function isTextLikePath(path: string): boolean {
-  return /\.(cjs|conf|cpp|cs|css|csv|go|h|hpp|html|ini|java|js|json|jsx|log|md|mjs|py|rs|sh|sql|toml|ts|tsx|txt|xml|yaml|yml)$/iu.test(
-    path,
+  if (isExplicitBinaryPath(path)) return false;
+  return TEXT_LIKE_EXTENSION_PATTERN.test(path) || /(?:^|[/\\])\.env(?:\.[^./\\]+)?$/iu.test(path);
+}
+
+function hasFileExtension(filename: string): boolean {
+  const base = basename(filename);
+  const dotIndex = base.lastIndexOf(".");
+  return dotIndex > 0 && dotIndex < base.length - 1;
+}
+
+/**
+ * 判断上传普通文件是否具备正面文本类型依据：
+ * 1. 显式二进制扩展名（.zip/.docx/.exe 等）一律排除；
+ * 2. 命中 isTextLikePath 的常见源码/配置扩展名直接认可；
+ * 3. 仅有未知扩展名时不轻信宽泛 MIME；仅当无扩展名时才认可显式安全文本 MIME。
+ */
+export function hasPositiveTextAttachmentType(
+  filename: string | undefined,
+  mimeType: string | undefined,
+): boolean {
+  if (filename) {
+    if (isExplicitBinaryPath(filename)) return false;
+    if (isTextLikePath(filename)) return true;
+    if (hasFileExtension(filename)) return false;
+  }
+  const normalizedMime = mimeType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  if (!normalizedMime || normalizedMime === "application/octet-stream") return false;
+  return (
+    normalizedMime.startsWith("text/") ||
+    SAFE_TEXT_MIMES.has(normalizedMime) ||
+    normalizedMime.endsWith("+json") ||
+    normalizedMime.endsWith("+xml")
   );
 }
 

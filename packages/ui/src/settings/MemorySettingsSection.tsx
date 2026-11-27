@@ -32,6 +32,8 @@ interface MemorySettingsPageProps {
   workspacePath?: string | null;
   workspaceIdentity?: string | null;
   isDesktop: boolean;
+  /** 独立 Web 直连自身服务器；官方 relay 手机远控保持上游「仅桌面可看项目记忆」边界。 */
+  isStandaloneWeb?: boolean;
   workspaceDisplayNames: readonly string[];
 }
 
@@ -47,6 +49,7 @@ export function MemorySettingsPage(props: MemorySettingsPageProps) {
         services={services}
         device={LOCAL_MEMORY_DEVICE}
         isDesktop={false}
+        isStandaloneWeb={props.isStandaloneWeb}
         workspaceDisplayNames={props.workspaceDisplayNames}
       />
     </ServiceProvider>
@@ -108,11 +111,13 @@ function MemoryDeviceSettings({
   services,
   device,
   isDesktop,
+  isStandaloneWeb = false,
   workspaceDisplayNames,
 }: {
   services: IServiceAccessor;
   device: SettingsScopeDevice;
   isDesktop: boolean;
+  isStandaloneWeb?: boolean;
   workspaceDisplayNames: readonly string[];
 }) {
   const { intl } = useZCodeIntl();
@@ -179,7 +184,9 @@ function MemoryDeviceSettings({
           memoryService={services.memoryService}
           onMemoryEnabledChange={onMemoryEnabledChange}
           disabled={loading || saving || Boolean(readError)}
-          projectMemoryViewerAvailable={isDesktop && isLocal}
+          // 独立 Web 的 base Host 就是服务器本机，页内读写服务端项目记忆；
+          // 桌面仍要求本机设备，relay 手机远控保持不可用。
+          projectMemoryViewerAvailable={(isDesktop || isStandaloneWeb) && isLocal}
           remoteDevice={!isLocal}
           workspaceDisplayNames={workspaceDisplayNames}
         />
@@ -188,7 +195,10 @@ function MemoryDeviceSettings({
   );
 }
 
-type MemoryCatalogService = Pick<IMemoryService, "listProjectMemories">;
+type MemoryCatalogService = Pick<
+  IMemoryService,
+  "listProjectMemories" | "readProjectMemoryFile" | "saveProjectMemoryFile"
+>;
 
 function normalizeWorkspaceDisplayName(value: string): string {
   const slug = value
@@ -377,6 +387,7 @@ export function MemorySettingsSection({
           catalogState={catalogState}
           selectedWorkspace={selectedWorkspace}
           workspaces={displayWorkspaces}
+          memoryService={memoryService}
           onRefresh={handleRefresh}
           onScopeKeyChange={(workspaceId) =>
             runUserAction({

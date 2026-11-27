@@ -2,13 +2,18 @@
 // 文件检查点由 Host 自己删除（它是 git checkpoint store 的写者）。
 import { lstat, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { resolveWorkspaceKey } from "@zcode/shared";
 import type {
   V4SessionDataMeasureResult,
   V4SessionDataParams,
   V4SessionDataPurgeResult,
 } from "@zcode/shared/zcode-protocol-v4";
 import { createServiceLogger } from "#src/logger/serviceLogger.js";
-import type { ProjectDataPort, ProjectDataSession } from "#src/project/data/contract.js";
+import type {
+  ProjectDataDirectory,
+  ProjectDataPort,
+  ProjectDataSession,
+} from "#src/project/data/contract.js";
 
 const log = createServiceLogger("project-data");
 
@@ -16,7 +21,9 @@ export interface ProjectSessionDataAgent {
   measure(params: V4SessionDataParams): Promise<V4SessionDataMeasureResult>;
   /** workspace 决定由哪个 Agent 进程执行：该 workspace 已有进程时交给它，否则交给管理面进程。 */
   purge(
-    params: V4SessionDataParams & { workspace: { workspacePath: string } },
+    params: V4SessionDataParams & {
+      workspace: { workspacePath: string; workspaceIdentity?: string };
+    },
   ): Promise<V4SessionDataPurgeResult>;
 }
 
@@ -40,23 +47,39 @@ export function createProjectDataPort(options: {
   agent: ProjectSessionDataAgent;
   checkpointDirectory(workspacePath: string): string;
 }): ProjectDataPort {
-  const local = (paths: readonly string[]) => paths.map((workspacePath) => ({ workspacePath }));
+  const toWireDirectories = (directories: readonly ProjectDataDirectory[]) =>
+    directories.map((dir) => ({
+      workspacePath: dir.workspacePath,
+      ...(dir.workspaceIdentity ? { workspaceIdentity: dir.workspaceIdentity } : {}),
+    }));
   return {
     async measure({ sessions, directories }) {
+      const uniquePaths = [...new Set(directories.map((dir) => dir.workspacePath))];
       const [agent, checkpoints] = await Promise.all([
         options.agent.measure({
           sessionIds: sessions.map((session) => session.sessionId),
-          directories: local(directories),
+          directories: toWireDirectories(directories),
         }),
-        Promise.all(directories.map((path) => directoryBytes(options.checkpointDirectory(path)))),
+        Promise.all(uniquePaths.map((path) => directoryBytes(options.checkpointDirectory(path)))),
       ]);
-      const memory = new Map(agent.memory.map((entry) => [entry.workspacePath, entry.bytes]));
+      // 同一 path 可能同时存在无 identity 本地路径记忆与 canonical 记忆两个独立哈希目录，
+      // 必须按 workspacePath 累加两者的记忆字节数，而检查点只按唯一 path 统计一次。
+      const memoryByPath = new Map<string, number>();
+      for (const entry of agent.memory) {
+        memoryByPath.set(
+          entry.workspacePath,
+          (memoryByPath.get(entry.workspacePath) ?? 0) + entry.bytes,
+        );
+      }
+      const checkpointByPath = new Map(
+        uniquePaths.map((path, index) => [path, checkpoints[index]!] as const),
+      );
       return {
         sessions: agent.sessions,
-        directories: directories.map((path, index) => ({
+        directories: uniquePaths.map((path) => ({
           path,
-          memoryBytes: memory.get(path) ?? 0,
-          checkpointBytes: checkpoints[index]!,
+          memoryBytes: memoryByPath.get(path) ?? 0,
+          checkpointBytes: checkpointByPath.get(path) ?? 0,
         })),
       };
     },
@@ -65,22 +88,27 @@ export function createProjectDataPort(options: {
       // 修复原因：曾按会话 cwd 分组并选进程；worktree 任务的 cwd 是 worktree，没有对应进程，
       // 删除被交给管理面进程，它看不到项目进程中正在运行的会话，可能删掉运行中的会话、
       // 且项目进程的 sessions-index 仍保留它。会话属于归属 workspace 的进程（docs/git/worktree.md §2.1）。
+      // 独立云端 Web 必须按 canonical workspaceIdentity 优先分组，避免回退只按路径匹配不到热进程。
       const byWorkspace = new Map<string, ProjectDataSession[]>();
-      for (const session of sessions)
-        byWorkspace.set(session.workspacePath, [
-          ...(byWorkspace.get(session.workspacePath) ?? []),
-          session,
-        ]);
+      for (const session of sessions) {
+        const key = resolveWorkspaceKey(session);
+        byWorkspace.set(key, [...(byWorkspace.get(key) ?? []), session]);
+      }
       const result: Awaited<ReturnType<ProjectDataPort["purgeSessions"]>> = {
         deleted: [],
         kept: [],
         failed: [],
       };
       // 逐个 workspace 串行：每组只交给持有这些会话运行态的那个进程，避免并发写同一个 CLI 库。
-      for (const [workspacePath, group] of byWorkspace) {
+      for (const group of byWorkspace.values()) {
+        const first = group[0]!;
+        const identity = first.workspaceIdentity?.trim();
         try {
           const purged = await options.agent.purge({
-            workspace: { workspacePath },
+            workspace: {
+              workspacePath: first.workspacePath,
+              ...(identity ? { workspaceIdentity: identity } : {}),
+            },
             sessionIds: group.map((session) => session.sessionId),
             directories: [],
           });
@@ -100,24 +128,37 @@ export function createProjectDataPort(options: {
     },
 
     async purgeDirectories(directories) {
+      if (directories.length === 0) return { bytes: 0, failed: [] };
       let bytes = 0;
       const failed: string[] = [];
+      const first = directories[0]!;
+      const firstIdentity = first.workspaceIdentity?.trim();
       try {
         const purged = await options.agent.purge({
-          workspace: { workspacePath: directories[0]! },
+          workspace: {
+            workspacePath: first.workspacePath,
+            ...(firstIdentity ? { workspaceIdentity: firstIdentity } : {}),
+          },
           sessionIds: [],
-          directories: local(directories),
+          directories: toWireDirectories(directories),
         });
         bytes += purged.memory.reduce((sum, entry) => sum + entry.bytes, 0);
-        failed.push(...purged.failed.flatMap((entry) => entry.workspacePath ?? []));
+        for (const entry of purged.failed) {
+          if (entry.workspacePath && !failed.includes(entry.workspacePath)) {
+            failed.push(entry.workspacePath);
+          }
+        }
       } catch (error) {
         log.warn(undefined, "Memory purge failed", {
           directories: directories.length,
           error: String(error),
         });
-        failed.push(...directories);
+        for (const dir of directories) {
+          if (!failed.includes(dir.workspacePath)) failed.push(dir.workspacePath);
+        }
       }
-      for (const path of directories) {
+      const uniquePaths = [...new Set(directories.map((dir) => dir.workspacePath))];
+      for (const path of uniquePaths) {
         const directory = options.checkpointDirectory(path);
         try {
           const size = await directoryBytes(directory);

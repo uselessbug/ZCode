@@ -122,6 +122,54 @@ describe("SessionsIndexProjection 黄金测试（L1）", () => {
     expect(summary.lastAssistantPreview).toContain("你好世界");
     expect(summary.createdAt).toBe(1000);
     expect(summary.lastActivityAt).toBe(2000);
+    expect(summary.terminalAt).toBe(1_700_000_007_000);
+  });
+
+  it("terminalAt：进入终态后不随后续活动 lastActivityAt 漂移，新一轮运行清空并重新记录", () => {
+    const index = new SessionsIndexProjection("ws-1", "epoch-1");
+    const running1 = buildEvents("s-term", (push) => {
+      push(SessionEventType.SessionCreated, { mode: "default", contextWindow: 200_000 });
+      push(SessionEventType.TurnStarted, { turnNumber: 1, input: "go", inputId: "q1" }, "t1");
+    });
+    const proj = projectionFor("s-term", running1);
+    const [d1] = index.upsertFromConversation(proj.getSnapshot(), {
+      createdAt: 1000,
+      lastActivityAt: 1000,
+    });
+    expect(d1?.op === "session.upserted" ? d1.session.terminalAt : null).toBeUndefined();
+
+    const completed1 = buildEvents("s-term", (push) => {
+      push(
+        SessionEventType.TurnComplete,
+        { response: "", tokenCount: 0, toolCallCount: 0, duration: 0, resultType: "success" },
+        "t1",
+      );
+    });
+    for (const ev of completed1) proj.applyEvent(ev);
+    const [d2] = index.upsertFromConversation(proj.getSnapshot(), {
+      createdAt: 1000,
+      lastActivityAt: 2000,
+    });
+    const firstTerminalAt = d2?.op === "session.upserted" ? d2.session.terminalAt : undefined;
+    expect(firstTerminalAt).toBeDefined();
+
+    // 后续活动（如后台任务/标题更新）推进 lastActivityAt，terminalAt 保持不变。
+    const [d3] = index.upsertFromConversation(proj.getSnapshot(), {
+      createdAt: 1000,
+      lastActivityAt: 2500,
+    });
+    expect(d3?.op === "session.upserted" ? d3.session.terminalAt : undefined).toBe(firstTerminalAt);
+
+    // 新回合开始，terminalAt 清空。
+    const running2 = buildEvents("s-term", (push) => {
+      push(SessionEventType.TurnStarted, { turnNumber: 2, input: "again", inputId: "q2" }, "t2");
+    });
+    for (const ev of running2) proj.applyEvent(ev);
+    const [d4] = index.upsertFromConversation(proj.getSnapshot(), {
+      createdAt: 1000,
+      lastActivityAt: 3000,
+    });
+    expect(d4?.op === "session.upserted" ? d4.session.terminalAt : null).toBeUndefined();
   });
 
   it("hasCompactWork：只跟踪 compact 活跃态，并在开始与结束时产出 upsert", () => {

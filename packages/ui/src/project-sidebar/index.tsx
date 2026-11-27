@@ -109,10 +109,9 @@ export const ProjectSidebar = memo(function ProjectSidebar(props: ProjectSidebar
   const [creating, setCreating] = useState(false);
   const [worktreeProject, setWorktreeProject] = useState<VirtualProject | null>(null);
   const managedWorktreeService = useManagedWorktreeService();
-  // 入口条件：桌面、非手机远控壳、Host 提供服务；是否 Git 仓库交给弹窗空状态表达。
-  const canManageWorktrees = Boolean(
-    managedWorktreeService && props.isDesktop && !props.isWebRemoteControl,
-  );
+  // 入口条件：非手机远控壳、Host 提供服务（桌面与独立 Web 本地连接由入口注入）；
+  // 是否 Git 仓库交给弹窗空状态表达。
+  const canManageWorktrees = Boolean(managedWorktreeService) && !props.isWebRemoteControl;
   // 当前任务只影响远端“创建项目”的默认设备；分组继承在点击时读，
   // 避免本地会话/草稿切换让全部项目的菜单与 Tooltip 重渲染。
   const hasActiveRemoteTask = useZCodeSessionStore((state) =>
@@ -169,7 +168,7 @@ export const ProjectSidebar = memo(function ProjectSidebar(props: ProjectSidebar
               .getWorkspaceState(props.workspacePath, props.workspaceIdentity).draftTaskGroupId ??
             null)
           : null;
-    props.onCreateTask({
+    await props.onCreateTask({
       projectId: projectId ?? null,
       taskGroupId: taskGroupId === undefined ? inheritedGroup : taskGroupId,
       ...(hostId ? { hostId } : {}),
@@ -242,7 +241,7 @@ export const ProjectSidebar = memo(function ProjectSidebar(props: ProjectSidebar
       <SidebarTooltipProvider>
         <aside data-testid={TID_SIDEBAR} className="flex h-full min-h-0 flex-col overflow-hidden">
           <div
-            className={`h-12 shrink-0 [app-region:drag] ${props.isWebRemoteControl ? "max-md:hidden" : ""}`}
+            className={`h-12 shrink-0 [app-region:drag] ${props.isWebRemoteControl || !props.isDesktop ? "max-md:hidden" : ""}`}
           />
           {/* 内联改名聚焦曾把 hidden 容器横向滚动，导致手机整栏左移；滑动面板只裁切，不允许焦点滚动。 */}
           <div className="relative min-h-0 flex-1 overflow-clip">

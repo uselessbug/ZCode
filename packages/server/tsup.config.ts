@@ -53,6 +53,8 @@ export const SERVER_HTTP_EXTERNAL_DEPENDENCIES = [
   // Bugfix: node-forge（appCaCert 自签 CA 链路）内部动态 require("crypto")，
   // 与 desktop tsup.config 的处理一致，必须外置交给 Node 原生加载。
   "node-forge",
+  // Playwright 从发行包 Agent 资源加载，保留其运行时文件布局。
+  "playwright-core",
   // 修复：云内容 ZIP 解包链路（services/cloud-content）引入 CJS 包 yauzl，内联进 ESM bundle 后
   // entry-http.js 加载即报 Dynamic require of "fs" is not supported；与 desktop 相同，外置交给 Node 原生加载。
   "yauzl",
@@ -77,6 +79,7 @@ export default defineConfig({
     "@zcode/services",
     "@zcode/services/node",
     "@zcode/client",
+    "@zcode/adapters/browser",
   ],
   // ssh2 / node-pty 含 .node native addon，不能被 esbuild 处理。
   // undici / axios 这类 CJS 依赖被内联进 ESM bundle 后，运行时会走到

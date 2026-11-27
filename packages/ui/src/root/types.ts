@@ -8,6 +8,7 @@ import type {
   WebRemoteControlWorkspaceSwitchOptions,
 } from "@zcode/shared";
 import type { IServiceAccessor } from "@zcode/services";
+import type { McpDirectoryService } from "@/store/mcpStoreDesktop.js";
 import type { ReactNode } from "react";
 import type { CreateTaskOptions, CreateTaskRequest } from "@/app-shell/types.js";
 import type { SettingsShareTaskTarget } from "@/conversation-share-interaction/SettingsShareManagement.js";
@@ -101,6 +102,20 @@ export interface RootProps {
   webRemoteControlFeatureEnabled?: boolean;
   /** Assistant code-comment 卡片灰度；默认关闭，关闭时保留原始 directive。 */
   assistantCodeCommentCardsEnabled?: boolean;
+  /**
+   * 独立 Web 页面导航隔离：仅保留当前浏览器/页面导航与活跃草稿，不读写服务端全局 lastActiveWorkspace，
+   * 通知深链优先，且在冷恢复确认原项目已删除时安全回退到正常无项目草稿。
+   */
+  standaloneWebNavigation?: boolean;
+  /** 只用于首次升级读取旧的本地草稿归属，不作为活动工作区。 */
+  standaloneWebDefaultWorkspacePath?: string;
+  /**
+   * 独立 Web 入口显式注入的 base Host MCP 目录服务归属（仅独立 Web 传 services.mcpSyncService）。
+   * 传值/传 null 表示「本入口的 user/project MCP 属于该 base Host」；不传（undefined）表示
+   * 桌面本机 / 官方手机 relay，MCP 走 platform 通道。归属由入口决定，不复用 isDesktop /
+   * preferDirectoryBrowser 等展示开关，也不为独立 Web 伪造 workspaceIdentity。
+   */
+  mcpBaseHostDirectoryService?: McpDirectoryService | null;
 }
 
 export interface WorkspaceSettingsLayerProps {

@@ -137,6 +137,7 @@ import {
   resolveChatEnterShortcut,
   resolveChatEnterSubmits,
   shouldAvoidIosInputFocusZoom,
+  useIsMobileCompactViewport,
   useIsMobileTextInputViewport,
 } from "@/lib/mobileTextInput.js";
 import { appendPromptHistoryEntry } from "@/lib/promptHistory.js";
@@ -476,6 +477,8 @@ export interface ConversationComposerProps {
   modelSelectionRefresh?: () => Promise<ModelSelectionRefreshResult>;
   /** 草稿态使用预热 session 作附件 transaction 载体。 */
   attachmentSessionId?: string | null;
+  sessionPreparationError?: string | null;
+  onRetrySessionPreparation?: () => void;
   attachmentPut: AttachmentPutFn;
   onRuntimeRestart?: (listener: () => void) => () => void;
   /** 承载 transport 暴露 runtime 存活态时优先用它，替代 onRuntimeRestart。 */
@@ -614,6 +617,8 @@ function ConversationComposerImpl({
   modelSelectionReload,
   modelSelectionRefresh,
   attachmentSessionId = null,
+  sessionPreparationError = null,
+  onRetrySessionPreparation,
   attachmentPut,
   onRuntimeRestart,
   onRuntimeLifecycle,
@@ -796,6 +801,8 @@ function ConversationComposerImpl({
   const commandResolutionCleanupsRef = useRef(new Set<() => void>());
   const reportedErrorKeysRef = useRef(new Set<string>());
   const isMobileTextInputViewport = useIsMobileTextInputViewport();
+  // 窄屏（<=767px）无论是否带 coarse 触摸指针都按手机输入控件收口，避免三行占位符遮挡工具栏。
+  const isMobileCompactViewport = useIsMobileCompactViewport();
   const primaryModifierPressed = usePrimaryFollowupModifier();
   const appleKeyboardPlatform = isAppleKeyboardPlatform();
   // Bugfix：M3 删除旧 ChatView 后，M5 只恢复了桌面端的 false 硬编码，已登记的手机远控
@@ -813,7 +820,8 @@ function ConversationComposerImpl({
   });
   // Bugfix：手机远控把完整能力说明放进绝对定位 placeholder 后，三行英文会越过
   // 40px 编辑区并覆盖工具栏。手机端改用短文案并限制两行；桌面端继续保留完整提示。
-  const compactMobilePlaceholder = isWebRemoteControl && isMobileTextInputViewport;
+  const compactMobilePlaceholder =
+    isWebRemoteControl && (isMobileTextInputViewport || isMobileCompactViewport);
   const sendShortcut = resolveChatEnterShortcut({ enterSubmits });
   const updateText = useCallback(
     (next: string) => {
@@ -851,6 +859,8 @@ function ConversationComposerImpl({
     remoteSessionId,
     scopeId: draftScopeId,
     attachmentSessionId,
+    sessionPreparationError,
+    onRetrySessionPreparation,
     attachmentPut,
     onRuntimeRestart,
     onRuntimeLifecycle,
@@ -2706,7 +2716,7 @@ function ConversationComposerImpl({
               phase={composerPhase}
               provider={provider}
               isWebRemoteControl={isWebRemoteControl}
-              isMobileViewport={isMobileTextInputViewport}
+              isMobileViewport={isMobileTextInputViewport || isMobileCompactViewport}
               draftMode={draftMode}
               draftConfig={draftConfig}
               usage={composerUsage}
@@ -2803,6 +2813,8 @@ function ConversationComposerImpl({
       highspeedEntranceAnimated,
       highspeedPresented,
       highspeedSweepActive,
+      isMobileTextInputViewport,
+      isMobileCompactViewport,
       isWebRemoteControl,
       mode,
       handleSelectModelTrace,

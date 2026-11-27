@@ -7,14 +7,11 @@ import type { AttachmentRef } from "@zcode/shared/zcode-protocol-v4";
 import { WORKSPACE_FILE_DRAG_MIME } from "@/lib/workspaceFileDrag.js";
 import {
   MAX_CHAT_ATTACHMENTS,
-  MissingInlinePdfContentError,
-  OversizedInlinePdfAttachmentError,
-  OversizedInlineVideoAttachmentError,
   createChatComposerAttachment,
   createChatComposerPathAttachment,
   createClipboardTextAttachmentFilenameForDate,
+  createClipboardTextComposerAttachment,
   createClipboardTextPathComposerAttachment,
-  formatAttachmentSize,
   revokeChatComposerAttachment,
   serializeChatComposerAttachment,
   shouldCreateClipboardTextAttachment,
@@ -42,7 +39,13 @@ import {
   type ComposerAttachmentUploadItem,
   type ComposerAttachmentUploadStatus,
 } from "@/store/composerAttachmentUploadStore.js";
-import { uploadComposerAttachment, type AttachmentPutFn } from "@/v4/composer/attachmentUpload.js";
+import {
+  REMOTE_ATTACHMENT_NOT_STAGED_ERROR_CODE,
+  formatAttachmentUploadError,
+  isTransientAttachmentUploadError,
+  uploadComposerAttachment,
+  type AttachmentPutFn,
+} from "@/v4/composer/attachmentUpload.js";
 
 export const COMPOSER_ATTACHMENT_UPLOAD_CONCURRENCY = 2;
 export const COMPOSER_ATTACHMENT_AUTO_RETRY_DELAY_MS = 500;
@@ -53,7 +56,6 @@ export const COMPOSER_ATTACHMENT_COMPLETE_VISIBLE_MS = 300;
  */
 export const COMPOSER_ATTACHMENT_REBUILD_RETRY_LIMIT = 5;
 const EMPTY_COMPOSER_ATTACHMENTS: ComposerAttachmentUploadItem[] = [];
-const REMOTE_ATTACHMENT_NOT_STAGED_ERROR_CODE = "remoteAttachmentNotStaged";
 export type {
   ComposerAttachmentUploadItem,
   ComposerAttachmentUploadStatus,
@@ -119,6 +121,8 @@ export interface UseComposerAttachmentsOptions {
   remoteSessionId?: string;
   scopeId: string;
   attachmentSessionId?: string | null;
+  sessionPreparationError?: string | null;
+  onRetrySessionPreparation?: () => void;
   attachmentPut: AttachmentPutFn;
   onRuntimeRestart?: (listener: () => void) => () => void;
   /**
@@ -211,33 +215,8 @@ export function setComposerAttachmentPreviewUrlForScope(
   return true;
 }
 
-function isAbortError(error: unknown): boolean {
-  if (error instanceof Error && error.name === "AbortError") return true;
-  return error instanceof Error && error.cause !== undefined ? isAbortError(error.cause) : false;
-}
-
 class RemoteAttachmentNotStagedError extends Error {
   readonly code = REMOTE_ATTACHMENT_NOT_STAGED_ERROR_CODE;
-}
-
-export function isTransientAttachmentUploadError(error: unknown): boolean {
-  if (isAbortError(error)) return false;
-  if (error instanceof OversizedInlineVideoAttachmentError) return false;
-  if (error instanceof OversizedInlinePdfAttachmentError) return false;
-  if (error instanceof MissingInlinePdfContentError) return false;
-  if (
-    error instanceof Error &&
-    "code" in error &&
-    error.code === REMOTE_ATTACHMENT_NOT_STAGED_ERROR_CODE
-  ) {
-    return false;
-  }
-  const message = error instanceof Error ? error.message : String(error);
-  // video 超限错误必须在黑名单里，否则会触发一次无意义重试；按错误类型精确拦截，
-  // 避免扩大 message 正则后改变 image 超限的既有判定。
-  return !/(?:payloadTooLarge|invalidBase64|invalidServerProgress|frameTooLarge|permission|EACCES|ENOENT|not found|unsupported|附件缺少|缺少可读取内容|远端附件未完成物化)/iu.test(
-    message,
-  );
 }
 
 function progressPercent(uploadedBytes: number, totalBytes: number): number {
@@ -263,6 +242,8 @@ export function useComposerAttachments(
     remoteSessionId,
     scopeId,
     attachmentSessionId = null,
+    sessionPreparationError = null,
+    onRetrySessionPreparation,
     attachmentPut,
     onRuntimeRestart,
     onRuntimeLifecycle,
@@ -472,33 +453,7 @@ export function useComposerAttachments(
         );
         if (!current) return;
         // 结构化超限错误在 UI 层按 locale 格式化（与 chatAttachments 序列化边界约定一致）。
-        const message =
-          error instanceof OversizedInlineVideoAttachmentError
-            ? intl.formatMessage(
-                { id: "chat.attachments.oversizedInlineVideo" },
-                {
-                  filename: error.filename,
-                  size: formatAttachmentSize(error.sizeBytes),
-                  maxSize: formatAttachmentSize(error.maxSizeBytes),
-                },
-              )
-            : error instanceof OversizedInlinePdfAttachmentError
-              ? intl.formatMessage(
-                  { id: "chat.attachments.oversizedInlinePdf" },
-                  {
-                    filename: error.filename,
-                    size: formatAttachmentSize(error.sizeBytes),
-                    maxSize: formatAttachmentSize(error.maxSizeBytes),
-                  },
-                )
-              : error instanceof MissingInlinePdfContentError
-                ? intl.formatMessage(
-                    { id: "chat.attachments.missingInlinePdfContent" },
-                    { filename: error.filename },
-                  )
-                : error instanceof Error
-                  ? error.message
-                  : String(error);
+        const message = formatAttachmentUploadError(intl, error);
         const transient = isTransientAttachmentUploadError(error);
         if (transient && current.autoRetryCount < 1) {
           updateItem(targetScopeKey, attachmentId, (item) => ({
@@ -577,12 +532,30 @@ export function useComposerAttachments(
       !isRemoteAttachmentTarget({ remoteSessionId, workspaceIdentity }) || Boolean(remoteSessionId);
     if (attachmentSessionId && remoteTargetReady) {
       for (const item of current) {
-        if (item.uploadStatus === "waitingSession") {
+        if (
+          item.uploadStatus === "waitingSession" ||
+          (item.uploadStatus === "failed" && item.uploadErrorKind === "sessionPreparation")
+        ) {
           updateItem(scopeKey, item.id, (candidate) => ({
             ...candidate,
             uploadStatus: "queued",
+            uploadError: undefined,
+            uploadErrorKind: undefined,
           }));
           enqueueUpload(scopeKey, item.id);
+        }
+      }
+      return;
+    }
+    if (!attachmentSessionId && sessionPreparationError) {
+      for (const item of current) {
+        if (item.uploadStatus === "waitingSession") {
+          updateItem(scopeKey, item.id, (candidate) => ({
+            ...candidate,
+            uploadStatus: "failed",
+            uploadError: sessionPreparationError,
+            uploadErrorKind: "sessionPreparation",
+          }));
         }
       }
     }
@@ -592,6 +565,7 @@ export function useComposerAttachments(
     remoteSessionId,
     restartEpoch,
     scopeKey,
+    sessionPreparationError,
     updateItem,
     workspaceIdentity,
   ]);
@@ -710,6 +684,7 @@ export function useComposerAttachments(
       const accepted = selectedAttachments.slice(0, remainingSlots);
       selectedAttachments.slice(remainingSlots).forEach(revokeChatComposerAttachment);
       const target = targetsRef.current.get(scopeKey);
+      const immediateSessionFailure = !target?.sessionId ? sessionPreparationError : null;
       const items: ComposerAttachmentUploadItem[] = accepted.map((attachment) => {
         // 远端 identity 往往早于 remoteSessionId 注入；这段窗口不能退化为本地路径直读。
         const localZeroCopy = Boolean(
@@ -719,8 +694,20 @@ export function useComposerAttachments(
           ...attachment,
           referenceOwnership: "composer",
           operationId: `prompt-attachment-${attachment.id}`,
-          uploadStatus: localZeroCopy ? "ready" : target?.sessionId ? "queued" : "waitingSession",
+          uploadStatus: localZeroCopy
+            ? "ready"
+            : target?.sessionId
+              ? "queued"
+              : immediateSessionFailure
+                ? "failed"
+                : "waitingSession",
           uploadProgress: localZeroCopy ? 100 : 0,
+          ...(immediateSessionFailure && !localZeroCopy
+            ? {
+                uploadError: immediateSessionFailure,
+                uploadErrorKind: "sessionPreparation" as const,
+              }
+            : {}),
           ...(localZeroCopy && attachment.localPath
             ? {
                 attachmentRef: {
@@ -747,7 +734,7 @@ export function useComposerAttachments(
       }
       return items.map((item) => item.id);
     },
-    [commitScope, enqueueUpload, scopeKey, showAttachmentLimitWarning],
+    [commitScope, enqueueUpload, scopeKey, sessionPreparationError, showAttachmentLimitWarning],
   );
 
   const addAttachmentFiles = useCallback(
@@ -826,6 +813,14 @@ export function useComposerAttachments(
       if (!shouldCreateClipboardTextAttachment(text)) return;
       event.preventDefault();
       event.stopPropagation?.();
+      // 普通 Web 没有 desktop host，platform.createTempTextAttachment 不存在，
+      // 原先在 preventDefault 之后才调用它会直接失败：长文本既没进输入框也没变成附件。
+      // 按 openAttachmentPicker 同款能力口径分流，Web 复用既有 bytes 上传路径（内存 File 附件），
+      // 桌面仍走临时文件零复制路径。不新增上传协议，也不把长文本塞进 Composer 正文。
+      if (!platform.canSelectFilePath) {
+        addPreparedAttachments([createClipboardTextComposerAttachment(text)]);
+        return;
+      }
       void (async () => {
         try {
           const attachment = await platform.createTempTextAttachment?.({
@@ -1022,8 +1017,9 @@ export function useComposerAttachments(
         showComplete: false,
       }));
       if (target?.sessionId) enqueueUpload(scopeKey, id);
+      else onRetrySessionPreparation?.();
     },
-    [enqueueUpload, scopeKey, updateItem],
+    [enqueueUpload, onRetrySessionPreparation, scopeKey, updateItem],
   );
 
   const clearAttachments = useCallback(

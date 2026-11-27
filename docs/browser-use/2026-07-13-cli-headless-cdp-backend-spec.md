@@ -130,7 +130,8 @@ P0 必须通过 `apiSupportOverrides` 隐藏未完成能力：
 - 同一 TUI 进程可以复用 Chromium process，但不同 session 使用不同 BrowserContext，tab 不互见。
 - turn 结束只取消该 turn 的 pending request，tab 保持到 session/app 关闭。
 - `tab.close()` 只关闭目标 tab。
-- `closeSession()` 关闭该 session 的 pages/context；没有剩余 context 时关闭 managed Chromium。
+- `closeSession()` 保持彻底销毁语义：关闭该 session 的 pages/context 并清理空闲定时器；没有剩余 context 时关闭 managed Chromium。
+- `ManagedCdpBrowserRuntime` 额外暴露 `releaseSession(sessionId)` 租约释放接口（配置 `maxReleasedSessions?: number`，默认 `16`；`releasedSessionIdleTtlMs?: number`，默认 `30 * 60_000`）：中止该 `sessionId` 当前在途操作但保留其 `BrowserContext`、页面与 Cookie，标为已释放空闲态并启动空闲 TTL 定时器；已释放空闲数超过 `maxReleasedSessions` 时按 LRU 仅关闭最久未使用的已释放空闲 context（绝不驱逐活跃会话）。同一 `sessionId` 后续再次调用 `list` / `execute` 时取消空闲回收定时器并恢复复用原 `BrowserContext`。同一 `sessionId` 的创建、释放与关闭操作串行化执行，防止竞态泄漏。
 - browser crash/relaunch 必须递增 `generation`，旧 Browser/Tab binding 返回 stale/unavailable。
 - CLI 进程退出不承诺恢复 tab；临时 profile 必须清理。
 - P0 不接受外部 CDP endpoint，所以 adapter 始终拥有并负责关闭它启动的 Chromium。

@@ -100,6 +100,8 @@ describe("设置页个性化（自定义指令）E2E", () => {
 
   it("PZ-01: 点击个性化直达编辑器，保存后落盘 AGENTS.md", async () => {
     await openSettingsSection("personalization");
+    // 独立 Web 使用服务器说明；桌面端仍需明确指向本机，避免混淆指令归属。
+    expect(await $(sel(TID_SETTINGS_PAGE)).getText()).toContain("本机 Agent");
 
     const editor = $(sel(TID_SETTINGS_PERSONALIZATION_EDITOR));
     await editor.waitForDisplayed({

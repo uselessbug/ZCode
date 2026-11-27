@@ -125,3 +125,15 @@ mobile /remote
   -> 不创建新 runtime，不在 relay/main 保存附件状态
   -> replayable 只恢复已 admission 的 conversation intent，不恢复 renderer-local 上传进度
 ```
+
+## 普通上传文件 URI 物化（runtime-local）
+
+普通文件通过 V4 分块上传为 `zcode-artifact://`（`data:<mime>;base64,...`）后：
+
+1. **协议边界保留 URI**：`attachment-refs.ts` 对普通文件 URI ref 统一输出 `{ content: ref.ref, type: "file", ...displayMeta }`，保留 `sourceKind` 与 `messageCount`，不提前在命令映射层按 UTF-8 解码，也不因 `bytes > 64 KiB` 丢弃 `ref.ref` 或将 `fileName` 冒充本地 `path`。
+2. **具名子目录落盘与统一桌面解析链路**：`resolveTurnAttachments` 在通用 inline fallback 之前先读回原 artifact 并解码真实字节，统一调用 `writeToolResultBinaryArtifact`（`retention: "session"`，传入 `fileName: attachment.filename`）写入 `<rootDir>/<sanitizedSessionId>/<artifactId>/<safeFileName>`（`uri` 保持 `zcode-artifact://<sessionId>/<artifactId>`，`path` 为真实具名文件完整路径；未传 `fileName` 时保持既有平铺文件布局）。随后按严格 UTF-8（`TextDecoder("utf-8", { fatal: true })` + 无 NUL 及除 `\t`/`\n`/`\r` 外的 C0 控制字节）配合 `hasPositiveTextAttachmentType` 分类：
+   - 属于安全 UTF-8 文本（含 `0` 字节空文本、`.json`、`.vue`、70 KiB–256 KiB 日志、>256 KiB 超大文本以及无后缀显式安全文本 MIME）时，直接将刚落盘的具名 `written.path` 交给桌面同款 `resolveLocalFileAttachment` / `readTextFileForModel`（256 KiB + 25,000 token 上限、超限前段部分视图与路径提示、`mime: "text/plain"`、`source` 与 `preview`）；
+   - 属于二进制文件、未知格式或含非法 UTF-8/控制字节时，生成 `binary_file` 的 `resolvedPathReferenceAttachment`（`path` 即带原文件名的 `written.path`）。
+   - 无论文本内联预览还是 `local_ref`，统一在返回结果中合并保留双 `zcode-artifact://` URI（`url` 存新原始字节 `written.uri ?? attachment.content`，`metadata.artifactUri` 与 `metadata.originalUrl` 存原上传 URI），保障冷恢复与 fork 引用保护（`listArtifactReferrers` / `purgeSessionDataWith` / 永久删除）。
+   - 若 `artifactStore` 缺失、原 URI 读取/解码失败或落盘失败/无有效路径，返回 `attachment_read_failed` 占位结果，不伪造仅元信息的成功附件。
+   - `clipboard-text` / `topic-history` 经 `writeToolResultBinaryArtifact` 传入 `fileName: attachment.filename || "pasted-text.txt"` 落盘为 `<artifactId>/<safeFileName>`（如 `<artifactId>/pasted-text-YYYYMMDD-HHMMSS.txt`），继续保持延迟读取 `local_ref` 与双 `zcode-artifact://` URI。

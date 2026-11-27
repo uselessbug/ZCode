@@ -351,6 +351,145 @@ describe("managed CDP browser adapter", () => {
     expect((error as Error).message).not.toMatch(/49152|profile-secret/u);
     await runtime.close();
   });
+
+  it("releases a session without closing its context and resumes it on subsequent list/execute", async () => {
+    const fake = createFakePlaywright();
+    const runtime = createManagedCdpBrowserRuntime({
+      loadPlaywright: fake.loadPlaywright,
+      maxReleasedSessions: 4,
+      releasedSessionIdleTtlMs: 30_000,
+    });
+    const [descriptor] = await runtime.browserControlPort.list({ sessionId: "session-a" });
+    await runtime.browserControlPort.execute({
+      browserGeneration: descriptor!.generation,
+      browserId: descriptor!.id,
+      command: { method: "newTab" },
+      sessionId: "session-a",
+    });
+    await runtime.browserControlPort.execute({
+      browserGeneration: descriptor!.generation,
+      browserId: descriptor!.id,
+      command: { method: "navigate", url: "https://example.test/page" },
+      sessionId: "session-a",
+    });
+
+    await runtime.releaseSession("session-a");
+    expect(fake.contexts).toHaveLength(1);
+    expect(fake.contexts[0]?.closed).toBe(false);
+    expect(fake.browserCloseCount()).toBe(0);
+
+    // 再次 list/execute 复用原 BrowserContext 与原页面
+    await runtime.browserControlPort.list({ sessionId: "session-a" });
+    const tabsResult = await runtime.browserControlPort.execute({
+      browserGeneration: descriptor!.generation,
+      browserId: descriptor!.id,
+      command: { method: "list" },
+      sessionId: "session-a",
+    });
+    expect(tabsResult.ok).toBe(true);
+    expect(tabsResult.tabs).toHaveLength(1);
+    expect(tabsResult.tabs?.[0]?.url).toBe("https://example.test/page");
+    expect(fake.contexts).toHaveLength(1);
+
+    await runtime.browserControlPort.closeSession?.({ sessionId: "session-a" });
+    expect(fake.contexts[0]?.closed).toBe(true);
+    expect(fake.browserCloseCount()).toBe(1);
+  });
+
+  it("evicts only LRU released sessions above maxReleasedSessions without evicting active sessions", async () => {
+    const fake = createFakePlaywright();
+    const runtime = createManagedCdpBrowserRuntime({
+      loadPlaywright: fake.loadPlaywright,
+      maxReleasedSessions: 2,
+      releasedSessionIdleTtlMs: 30_000,
+    });
+    const [descriptor] = await runtime.browserControlPort.list({ sessionId: "active-session" });
+
+    for (const sessionId of ["active-session", "rel-a", "rel-b", "rel-c"]) {
+      await runtime.browserControlPort.execute({
+        browserGeneration: descriptor!.generation,
+        browserId: descriptor!.id,
+        command: { method: "newTab" },
+        sessionId,
+      });
+    }
+
+    await runtime.releaseSession("rel-a");
+    await runtime.releaseSession("rel-b");
+    expect(fake.contexts[1]?.closed).toBe(false);
+    expect(fake.contexts[2]?.closed).toBe(false);
+
+    // 释放第三个已释放会话超出 maxReleasedSessions=2：应按 LRU 关闭 rel-a，但绝不驱逐 active-session
+    await runtime.releaseSession("rel-c");
+    expect(fake.contexts[0]?.closed).toBe(false);
+    expect(fake.contexts[1]?.closed).toBe(true);
+    expect(fake.contexts[2]?.closed).toBe(false);
+    expect(fake.contexts[3]?.closed).toBe(false);
+
+    await runtime.close();
+    expect(fake.contexts.every((c) => c.closed)).toBe(true);
+  });
+
+  it("closes released idle sessions automatically after releasedSessionIdleTtlMs", async () => {
+    const fake = createFakePlaywright();
+    const runtime = createManagedCdpBrowserRuntime({
+      loadPlaywright: fake.loadPlaywright,
+      maxReleasedSessions: 4,
+      releasedSessionIdleTtlMs: 30,
+    });
+    const [descriptor] = await runtime.browserControlPort.list({ sessionId: "session-ttl" });
+    await runtime.browserControlPort.execute({
+      browserGeneration: descriptor!.generation,
+      browserId: descriptor!.id,
+      command: { method: "newTab" },
+      sessionId: "session-ttl",
+    });
+
+    await runtime.releaseSession("session-ttl");
+    expect(fake.contexts[0]?.closed).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    expect(fake.contexts[0]?.closed).toBe(true);
+    expect(fake.browserCloseCount()).toBe(1);
+    await runtime.close();
+  });
+
+  it("does not deadlock when releaseSession(A) and duplicate releaseSession(B) run concurrently with maxReleasedSessions=1", async () => {
+    const fake = createFakePlaywright();
+    const runtime = createManagedCdpBrowserRuntime({
+      loadPlaywright: fake.loadPlaywright,
+      maxReleasedSessions: 1,
+      releasedSessionIdleTtlMs: 30_000,
+    });
+    const [descriptor] = await runtime.browserControlPort.list({ sessionId: "sess-a" });
+    await runtime.browserControlPort.execute({
+      browserGeneration: descriptor!.generation,
+      browserId: descriptor!.id,
+      command: { method: "newTab" },
+      sessionId: "sess-a",
+    });
+    await runtime.browserControlPort.execute({
+      browserGeneration: descriptor!.generation,
+      browserId: descriptor!.id,
+      command: { method: "newTab" },
+      sessionId: "sess-b",
+    });
+
+    await runtime.releaseSession("sess-b");
+    expect(fake.contexts[1]?.closed).toBe(false);
+
+    // 并发调用 releaseSession(A) 与重复 releaseSession(B)：必须在有限时间内完成且正确淘汰 B、保留 A
+    await Promise.race([
+      Promise.all([runtime.releaseSession("sess-a"), runtime.releaseSession("sess-b")]),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("concurrent releaseSession deadlocked")), 1_000),
+      ),
+    ]);
+
+    expect(fake.contexts[0]?.closed).toBe(false);
+    expect(fake.contexts[1]?.closed).toBe(true);
+    await runtime.close();
+  });
 });
 
 const STORAGE_STATE = {

@@ -1,15 +1,42 @@
 /* oxlint-disable eslint(max-lines) -- 平台事件和分享导入共用同一生命周期。 */
 import { getConversationShareErrorDetails } from "@/lib/conversationShareError.js";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useZCodeSessionStore } from "@/store/zcodeSessionStore.js";
 import type { CreateTaskOptions } from "@/app-shell/types.js";
-import type { IPlatformService, ZCodeTaskClientMode } from "@zcode/shared";
-import { readV4ComposerDraft, V4_DRAFT_SCOPE_ROOT } from "@/v4/composer/composerDraftStore.js";
-import { readComposerWorkspaceScope } from "@/v4/composer/composerDraftStore.js";
+import {
+  remoteHostIdFromWorkspaceIdentity,
+  type IPlatformService,
+  type WorkspacePurpose,
+  type ZCodeTaskClientMode,
+} from "@zcode/shared";
+import type { IServiceAccessor } from "@zcode/services";
+import {
+  bindPendingTaskDraft,
+  ensurePendingTaskDraft,
+  readComposerWorkspaceScope,
+  readPendingTaskDraft,
+  readV4ComposerDraft,
+  resolveComposerScope,
+  rotateMissingPendingTaskDraft,
+  transferStaleProjectDraftToProjectlessScope,
+  V4_DRAFT_SCOPE_ROOT,
+} from "@/v4/composer/composerDraftStore.js";
 import { useComposerClientNamespace } from "@/hooks/useServices.js";
-import { isWorkspaceTab, type TabStoreState, type WindowTabState } from "@/store/tabStore.js";
-import { useTabStore } from "@/store/TabStoreProvider.js";
+import {
+  isWorkspaceTab,
+  type TabStoreState,
+  type WindowTabState,
+  type WorkspaceTabState,
+} from "@/store/tabStore.js";
+import { useTabStore, useTabStoreApi } from "@/store/TabStoreProvider.js";
+import { ensureTaskNavigationWorkspace } from "@/app-shell/taskNavigationWorkspace.js";
+import { requestNotificationTaskNavigation } from "@/app-shell/useWorkspaceTaskNavigation.js";
+import { getRemoteWorkspaceSession } from "@/store/remoteWorkspaceSessionStore.js";
 import { logger } from "@/logger.js";
+import {
+  isWebRemoteControlMobileHomeListVisible,
+  subscribeWebRemoteControlMobileHomeListVisibility,
+} from "@/WebRemoteControlMobileShell.js";
 import { resolveImportedComposerConfig } from "@/v4/composer/newTaskDraft.js";
 import { dismissToast, toast, updateToast } from "@/components/ui/toast.js";
 import { matchesPrimaryShortcut } from "@/lib/keyboardShortcuts.js";
@@ -27,12 +54,298 @@ import {
   type ShareImportIntent,
 } from "@/root/shareImportIntent.js";
 
+type NotificationTaskContext = { workspacePath?: string; workspaceIdentity?: string };
+
+/** 冷启动时 workspace 列表可能还在加载，通知点击最多等待这么久再放弃。 */
+const NOTIFICATION_TASK_WAIT_MS = 12_000;
+
+const STANDALONE_PAGE_NAV_STORAGE_KEY = "zcode-standalone-page-navigation:v1";
+const STANDALONE_BROWSER_NAV_STORAGE_KEY = "zcode-standalone-browser-navigation:v1";
+
+export interface StandaloneWebNavigationSnapshot {
+  workspacePath: string;
+  workspaceIdentity?: string;
+  workspacePurpose?: WorkspacePurpose;
+  taskId: string | null;
+  projectId?: string | null;
+}
+
+function parseStandaloneWebNavigationSnapshot(
+  raw: string | null | undefined,
+): StandaloneWebNavigationSnapshot | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (typeof record.workspacePath !== "string" || !record.workspacePath.trim()) return null;
+    if (record.taskId !== null && typeof record.taskId !== "string") return null;
+    if (
+      record.projectId !== undefined &&
+      record.projectId !== null &&
+      typeof record.projectId !== "string"
+    ) {
+      return null;
+    }
+    if (record.workspaceIdentity !== undefined && typeof record.workspaceIdentity !== "string") {
+      return null;
+    }
+    if (
+      record.workspacePurpose !== undefined &&
+      record.workspacePurpose !== "project" &&
+      record.workspacePurpose !== "conversation"
+    ) {
+      return null;
+    }
+    return {
+      workspacePath: record.workspacePath,
+      ...(record.workspaceIdentity ? { workspaceIdentity: record.workspaceIdentity } : {}),
+      ...(record.workspacePurpose ? { workspacePurpose: record.workspacePurpose } : {}),
+      taskId: record.taskId,
+      ...(record.projectId !== undefined ? { projectId: record.projectId } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function readStandaloneWebNavigationSnapshot(): StandaloneWebNavigationSnapshot | null {
+  if (typeof window === "undefined") return null;
+  // 页面级 sessionStorage 优先（同浏览器多标签互不干扰且刷新保留）；新开标签回退本浏览器 localStorage，
+  // 全程不读写服务端全局 settings.lastActiveWorkspace。
+  for (const readStorage of [
+    () => window.sessionStorage?.getItem(STANDALONE_PAGE_NAV_STORAGE_KEY),
+    () => window.localStorage?.getItem(STANDALONE_BROWSER_NAV_STORAGE_KEY),
+  ]) {
+    try {
+      const parsed = parseStandaloneWebNavigationSnapshot(readStorage());
+      if (parsed) return parsed;
+    } catch {
+      // 隐私模式/禁用 storage 降级跳过
+    }
+  }
+  return null;
+}
+
+export function persistStandaloneWebNavigationSnapshot(
+  snapshot: StandaloneWebNavigationSnapshot,
+): void {
+  if (typeof window === "undefined") return;
+  const serialized = JSON.stringify(snapshot);
+  for (const writeStorage of [
+    () => window.sessionStorage?.setItem(STANDALONE_PAGE_NAV_STORAGE_KEY, serialized),
+    () => window.localStorage?.setItem(STANDALONE_BROWSER_NAV_STORAGE_KEY, serialized),
+  ]) {
+    try {
+      writeStorage();
+    } catch {
+      // 存储受限时保留内存导航
+    }
+  }
+}
+
+type NotificationNavigationDeps = {
+  activateTabByPath: (workspacePath: string, options?: { workspaceIdentity?: string }) => boolean;
+  addTab: (workspacePath: string) => void;
+  /** 读取当前激活的 workspace tab，用来取得 tab 实际使用的 workspaceIdentity。 */
+  getActiveWorkspaceTab: () => { workspacePath: string; workspaceIdentity?: string } | undefined;
+  /** 独立 Web 才允许在 identity 未命中时退回本地 path 与新建本地 tab。 */
+  allowLocalFallback: boolean;
+  /** 历史 tab 还没恢复完成时不能 addTab，否则会被随后的 restoreTabs 整体替换。 */
+  canOpenTab: boolean;
+};
+
+/**
+ * 激活通知目标 workspace，返回 tab 实际使用的 identity；目标暂不可用时返回 null。
+ *
+ * 独立 Web 的浏览器本地 tab 没有 workspaceIdentity，而服务端通知带的是 canonical identity，
+ * 所以 identity 未命中时先退回纯 path 激活，仍未打开则新建本地 tab。
+ */
+function activateNotificationWorkspace(
+  workspacePath: string,
+  workspaceIdentity: string | undefined,
+  deps: NotificationNavigationDeps,
+): { workspaceIdentity: string | undefined } | null {
+  const resolveIdentity = (fallback: string | undefined) => {
+    const activeTab = deps.getActiveWorkspaceTab();
+    return activeTab?.workspacePath === workspacePath ? activeTab.workspaceIdentity : fallback;
+  };
+  const strict = ensureTaskNavigationWorkspace({
+    workspacePath,
+    workspaceIdentity,
+    activateTabByPath: deps.activateTabByPath,
+    // 本地目录没有 tab 时的新建行为受 canOpenTab 约束，下面统一处理。
+    addLocalWorkspaceTab: (path) => {
+      if (deps.canOpenTab) deps.addTab(path);
+    },
+  });
+  if (strict.accepted) {
+    return deps.canOpenTab || !strict.openedLocalTab
+      ? { workspaceIdentity: resolveIdentity(workspaceIdentity) }
+      : null;
+  }
+  if (!deps.allowLocalFallback) return null;
+  if (deps.activateTabByPath(workspacePath)) {
+    return { workspaceIdentity: resolveIdentity(undefined) };
+  }
+  if (!deps.canOpenTab) return null;
+  deps.addTab(workspacePath);
+  return { workspaceIdentity: resolveIdentity(undefined) };
+}
+
+type NotificationTaskTarget = { workspacePath: string; workspaceIdentity?: string };
+type NotificationTaskLookup = NotificationTaskTarget | "retry" | null;
+
+/** 连接断线或目标服务暂不可用时的重试间隔；总时长仍受 NOTIFICATION_TASK_WAIT_MS 约束。 */
+const NOTIFICATION_TASK_RETRY_MS = 400;
+
+/** 为 workspace tab 选择任务查询服务；远程 tab 未连接时返回 null，由调用方等待重连。 */
+function resolveNotificationLookupServices(
+  tab:
+    | Pick<WorkspaceTabState, "remoteSessionId" | "remoteTarget" | "workspaceIdentity">
+    | undefined,
+  baseServices: IServiceAccessor | null,
+): IServiceAccessor | null {
+  if (tab?.remoteSessionId) return getRemoteWorkspaceSession(tab.remoteSessionId)?.services ?? null;
+  if (tab?.remoteTarget) return null;
+  return baseServices;
+}
+
+/**
+ * 向 Host 索引确认任务存在并取得真实归属。侧栏已迁到项目树，旧任务列表缓存恒为 null，
+ * 只信 getTaskMeta：明确返回 null 才表示不存在，RPC 抛错交给调用方重试。
+ * 独立 Web 的浏览器本地 tab 可能没有 canonical identity，带 identity 查不到时再按纯 path 查一次。
+ */
+async function lookupNotificationTask(
+  services: IServiceAccessor,
+  taskId: string,
+  workspacePath: string,
+  workspaceIdentity: string | undefined,
+  allowIdentityFallback: boolean,
+): Promise<NotificationTaskTarget | null> {
+  const query = (identity: string | undefined) =>
+    services.zcodeTaskService.getTaskMeta({
+      workspacePath,
+      ...(identity ? { workspaceIdentity: identity } : {}),
+      taskId,
+    });
+  let meta = await query(workspaceIdentity);
+  let usedIdentity = workspaceIdentity;
+  if (!meta && workspaceIdentity && allowIdentityFallback) {
+    meta = await query(undefined);
+    usedIdentity = undefined;
+  }
+  if (!meta) return null;
+  const resolvedIdentity = meta.workspaceIdentity ?? usedIdentity;
+  return {
+    workspacePath: meta.workspacePath || workspacePath,
+    ...(resolvedIdentity ? { workspaceIdentity: resolvedIdentity } : {}),
+  };
+}
+
+/**
+ * 定位通知任务所属 workspace。带 workspacePath 时直接验证该 workspace；
+ * 旧桌面 IPC 只传 taskId，则遍历已打开的 workspace tab 逐个查询。
+ */
+async function locateNotificationTask(params: {
+  taskId: string;
+  context: NotificationTaskContext | undefined;
+  tabs: WindowTabState[];
+  baseServices: IServiceAccessor | null;
+  allowIdentityFallback: boolean;
+}): Promise<NotificationTaskLookup> {
+  const { taskId, context, baseServices, allowIdentityFallback } = params;
+  const workspaceTabs = params.tabs.filter(isWorkspaceTab);
+  try {
+    if (context?.workspacePath) {
+      const targetPath = context.workspacePath;
+      const targetIdentity = context.workspaceIdentity;
+      // 同路径不同远端的 tab 不能互相借用连接；只有独立 Web 的本地 tab 允许忽略 identity。
+      const tab =
+        workspaceTabs.find(
+          (candidate) =>
+            candidate.workspacePath === targetPath &&
+            (targetIdentity
+              ? candidate.workspaceIdentity === targetIdentity
+              : !candidate.workspaceIdentity),
+        ) ??
+        (allowIdentityFallback
+          ? workspaceTabs.find(
+              (candidate) =>
+                candidate.workspacePath === targetPath &&
+                !candidate.remoteSessionId &&
+                !candidate.remoteTarget,
+            )
+          : undefined);
+      const services = resolveNotificationLookupServices(tab, baseServices);
+      if (!services) return "retry";
+      return await lookupNotificationTask(
+        services,
+        taskId,
+        targetPath,
+        targetIdentity,
+        allowIdentityFallback,
+      );
+    }
+  } catch (error) {
+    logger.warn("[Root] 通知任务查询失败，等待连接恢复后重试", { taskId, error });
+    return "retry";
+  }
+
+  let needsRetry = false;
+  for (const tab of workspaceTabs) {
+    const services = resolveNotificationLookupServices(tab, baseServices);
+    if (!services) {
+      needsRetry = true;
+      continue;
+    }
+    try {
+      const found = await lookupNotificationTask(
+        services,
+        taskId,
+        tab.workspacePath,
+        tab.workspaceIdentity,
+        false,
+      );
+      if (found) return found;
+    } catch (error) {
+      logger.warn("[Root] 遍历 workspace 查询通知任务失败", {
+        taskId,
+        workspacePath: tab.workspacePath,
+        error,
+      });
+      needsRetry = true;
+    }
+  }
+  return needsRetry ? "retry" : null;
+}
+
+/**
+ * 冷启动深链带了 canonical workspaceIdentity，但浏览器已恢复的同路径本地 tab 没有 identity 时，
+ * 沿用该本地 tab，避免 addTab 另开一个 identity tab（与 activateNotificationWorkspace 的回退一致）。
+ */
+function resolveBootstrapWorkspaceIdentity(
+  tabs: WindowTabState[],
+  workspacePath: string,
+  workspaceIdentity: string | undefined,
+  allowLocalFallback: boolean,
+): string | undefined {
+  if (!workspaceIdentity || !allowLocalFallback) return workspaceIdentity;
+  const samePath = tabs.filter(isWorkspaceTab).filter((tab) => tab.workspacePath === workspacePath);
+  if (samePath.some((tab) => tab.workspaceIdentity === workspaceIdentity)) return workspaceIdentity;
+  return samePath.some((tab) => !tab.workspaceIdentity && !tab.remoteSessionId && !tab.remoteTarget)
+    ? undefined
+    : workspaceIdentity;
+}
+
 export function useRootPlatformEffects({
   initialWorkspaceAbsPath,
   initialWorkspaceIdentity,
   initialWorkspacePurpose,
   initialTaskId,
   initialTaskDraft,
+  standaloneWebNavigation = false,
+  standaloneWebDefaultWorkspacePath,
   clientMode = "desktop-continuous",
   canBootstrapInitialWorkspace = true,
   addTab,
@@ -63,6 +376,8 @@ export function useRootPlatformEffects({
   initialWorkspacePurpose?: import("@zcode/shared").WorkspacePurpose;
   initialTaskId?: string;
   initialTaskDraft?: CreateTaskOptions;
+  standaloneWebNavigation?: boolean;
+  standaloneWebDefaultWorkspacePath?: string;
   clientMode?: ZCodeTaskClientMode;
   canBootstrapInitialWorkspace?: boolean;
   addTab: (
@@ -100,6 +415,13 @@ export function useRootPlatformEffects({
   isRestoringOAuthSession: boolean;
 }) {
   const didBootstrapInitialWorkspaceRef = useRef(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const baseServices = useOptionalBaseWorkspaceServices();
   const pendingShareImportRef = useRef<ShareImportIntent | null>(null);
   const [shareImportRevision, setShareImportRevision] = useState(0);
@@ -108,6 +430,38 @@ export function useRootPlatformEffects({
   const importOperationRef = useRef<string | null>(null);
   const lastImportProgressToastRef = useRef<{ phase: string; at: number } | null>(null);
   const importToastIdRef = useRef<number | null>(null);
+  // 进行中的通知点击流程的取消函数；独立于平台监听 effect，避免 tabs 变化时被提前取消。
+  const pendingNotificationWaitRef = useRef<(() => void) | null>(null);
+  // 唤醒正在等待就绪或连接恢复的通知点击流程。
+  const wakeNotificationWaitRef = useRef<(() => void) | null>(null);
+  const tabStoreApi = useTabStoreApi();
+  // 初始 workspace 注入（含 openWorkspacePath 异步分支）是否已结束；通知点击要等它结束再改 tab。
+  const bootstrapSettledRef = useRef(false);
+  // 通知点击回调只在平台监听 effect 里注册一次，这里用 ref 读取最新的 tab 恢复状态与服务。
+  const notificationEnvRef = useRef({
+    addTab,
+    hasCompletedFullTabRestore,
+    isDesktop,
+    baseServices,
+  });
+  notificationEnvRef.current = { addTab, hasCompletedFullTabRestore, isDesktop, baseServices };
+  useEffect(() => {
+    // 历史 tab 恢复完成后，等待中的通知目标可以开始解析与新建 tab。
+    if (hasCompletedFullTabRestore) wakeNotificationWaitRef.current?.();
+  }, [hasCompletedFullTabRestore]);
+  const settleInitialBootstrap = useCallback(() => {
+    bootstrapSettledRef.current = true;
+    setIsBootstrappingInitialWorkspace(false);
+    wakeNotificationWaitRef.current?.();
+  }, [setIsBootstrappingInitialWorkspace]);
+
+  useEffect(
+    () => () => {
+      pendingNotificationWaitRef.current?.();
+      pendingNotificationWaitRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     // 启动时必须先判断 OAuth 本地会话，再恢复历史/初始 workspace。
@@ -117,6 +471,307 @@ export function useRootPlatformEffects({
     }
 
     didBootstrapInitialWorkspaceRef.current = true;
+    const openStandaloneProjectlessDraft = async (stale?: {
+      staleWorkspacePath?: string;
+      staleWorkspaceIdentity?: string;
+      staleProjectId?: string;
+    }) => {
+      const projectService = baseServices?.projectService;
+      if (!projectService) throw new Error("project.service-unavailable");
+      const nullScope = resolveComposerScope(null, undefined, composerClientNamespace);
+      let draft = ensurePendingTaskDraft(nullScope);
+      let target: Awaited<ReturnType<typeof projectService.prepareSession>>;
+      try {
+        target = await projectService.prepareSession({
+          draftId: draft.draftId,
+          reuseDraft: Boolean(draft.workspacePath),
+        });
+      } catch (error) {
+        if (!mountedRef.current) return;
+        const message =
+          error && typeof error === "object" && "message" in error
+            ? String(error.message)
+            : String(error);
+        if (!draft.workspacePath || !message.includes("project.draft-workspace-missing")) {
+          throw error;
+        }
+        const rotated = rotateMissingPendingTaskDraft(nullScope, draft.draftId);
+        if (!rotated) {
+          // 在途首发 commandId 存在时不得换绑或重建空目录；保留原目录供 SessionPane 仅查询恢复。
+          if (draft.workspacePath) {
+            if (stale?.staleWorkspacePath && stale.staleProjectId) {
+              transferStaleProjectDraftToProjectlessScope({
+                staleWorkspacePath: stale.staleWorkspacePath,
+                workspaceIdentity: stale.staleWorkspaceIdentity,
+                staleProjectId: stale.staleProjectId,
+                targetWorkspacePath: draft.workspacePath,
+                clientNamespace: composerClientNamespace,
+              });
+            }
+            addTab(draft.workspacePath, { workspacePurpose: "conversation" });
+            startDraftInWorkspace(draft.workspacePath, undefined, {
+              projectId: null,
+              draftId: draft.draftId,
+              taskGroupId: null,
+            });
+            return;
+          }
+          throw error;
+        }
+        draft = rotated;
+        target = await projectService.prepareSession({
+          draftId: draft.draftId,
+          reuseDraft: Boolean(draft.workspacePath),
+        });
+      }
+      if (!mountedRef.current) return;
+      const currentDraft = readPendingTaskDraft(nullScope);
+      if (!currentDraft || currentDraft.draftId !== draft.draftId) return;
+      bindPendingTaskDraft(nullScope, draft.draftId, target.workspacePath);
+      if (stale?.staleWorkspacePath && stale.staleProjectId) {
+        transferStaleProjectDraftToProjectlessScope({
+          staleWorkspacePath: stale.staleWorkspacePath,
+          workspaceIdentity: stale.staleWorkspaceIdentity,
+          staleProjectId: stale.staleProjectId,
+          targetWorkspacePath: target.workspacePath,
+          clientNamespace: composerClientNamespace,
+        });
+      }
+      addTab(target.workspacePath, {
+        workspacePurpose: "conversation",
+        ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+      });
+      startDraftInWorkspace(target.workspacePath, target.workspaceIdentity, {
+        projectId: null,
+        draftId: draft.draftId,
+        taskGroupId: null,
+      });
+    };
+
+    const resolveValidatedLocalCachedProject = async (params: {
+      workspacePath: string;
+      workspaceIdentity?: string;
+      workspacePurpose?: WorkspacePurpose;
+      projectId: string;
+    }) => {
+      const projectService = baseServices?.projectService;
+      if (!projectService) throw new Error("project.service-unavailable");
+      let projects: Awaited<ReturnType<typeof projectService.readProjects>>;
+      try {
+        projects = await projectService.readProjects();
+      } catch (error) {
+        // 读取失败不得当成项目删除：保留原项目导航，暴露错误。
+        if (!mountedRef.current) return;
+        logger.warn("[Root] 冷恢复校验项目失败，保留原导航", {
+          projectId: params.projectId,
+          error,
+        });
+        setWorkspaceActionError(error instanceof Error ? error.message : String(error));
+        addTab(params.workspacePath, {
+          ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+          ...(params.workspacePurpose ? { workspacePurpose: params.workspacePurpose } : {}),
+        });
+        startDraftInWorkspace(params.workspacePath, params.workspaceIdentity, {
+          projectId: params.projectId,
+        });
+        return;
+      }
+      if (!mountedRef.current) return;
+      const validProject = projects.find(
+        (project) =>
+          project.id === params.projectId && project.hostId === "local" && !project.deleted,
+      );
+      if (validProject) {
+        if (standaloneWebNavigation) {
+          try {
+            const target = await projectService.prepareSession({ projectId: params.projectId });
+            if (!mountedRef.current) return;
+            addTab(target.workspacePath, {
+              workspacePurpose: "project",
+              ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
+            });
+            startDraftInWorkspace(target.workspacePath, target.workspaceIdentity, {
+              projectId: target.projectId,
+            });
+            return;
+          } catch (prepareError) {
+            if (!mountedRef.current) return;
+            const prepareMessage =
+              prepareError && typeof prepareError === "object" && "message" in prepareError
+                ? String(prepareError.message)
+                : String(prepareError);
+            if (!prepareMessage.includes("project.not-found")) {
+              logger.warn("[Root] 冷恢复准备有效项目失败，保留原导航", {
+                projectId: params.projectId,
+                error: prepareError,
+              });
+              setWorkspaceActionError(prepareMessage);
+              addTab(params.workspacePath, {
+                workspacePurpose: params.workspacePurpose ?? "project",
+                ...(params.workspaceIdentity
+                  ? { workspaceIdentity: params.workspaceIdentity }
+                  : {}),
+              });
+              startDraftInWorkspace(params.workspacePath, params.workspaceIdentity, {
+                projectId: params.projectId,
+              });
+              return;
+            }
+          }
+        } else {
+          addTab(params.workspacePath, {
+            ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
+            ...(params.workspacePurpose ? { workspacePurpose: params.workspacePurpose } : {}),
+          });
+          startDraftInWorkspace(params.workspacePath, params.workspaceIdentity, {
+            projectId: params.projectId,
+          });
+          return;
+        }
+      }
+      // 确认原项目不存在或已软删除：在保留草稿正文与配置意图的前提下路由到正常无项目草稿。
+      logger.info("[Root] 冷恢复确认项目已不存在或软删除，路由到无项目草稿", {
+        projectId: params.projectId,
+      });
+      await openStandaloneProjectlessDraft({
+        staleWorkspacePath: params.workspacePath,
+        staleWorkspaceIdentity: params.workspaceIdentity,
+        staleProjectId: params.projectId,
+      });
+    };
+
+    if (standaloneWebNavigation && !initialWorkspaceAbsPath) {
+      void (async () => {
+        let savedNav = readStandaloneWebNavigationSnapshot();
+        const nullScope = resolveComposerScope(null, undefined, composerClientNamespace);
+        const pendingDraft = readPendingTaskDraft(nullScope);
+        if (!savedNav && pendingDraft?.workspacePath) {
+          savedNav = {
+            workspacePath: pendingDraft.workspacePath,
+            workspacePurpose: "conversation",
+            taskId: null,
+            projectId: null,
+          };
+        }
+        if (savedNav?.taskId) {
+          const taskService = baseServices?.zcodeTaskService;
+          if (taskService) {
+            try {
+              const meta = await taskService.getTaskMeta({
+                workspacePath: savedNav.workspacePath,
+                ...(savedNav.workspaceIdentity
+                  ? { workspaceIdentity: savedNav.workspaceIdentity }
+                  : {}),
+                taskId: savedNav.taskId,
+              });
+              if (!mountedRef.current) return;
+              if (meta) {
+                const resolvedPath = meta.workspacePath || savedNav.workspacePath;
+                const resolvedIdentity = meta.workspaceIdentity ?? savedNav.workspaceIdentity;
+                addTab(resolvedPath, {
+                  ...(resolvedIdentity ? { workspaceIdentity: resolvedIdentity } : {}),
+                  ...(savedNav.workspacePurpose
+                    ? { workspacePurpose: savedNav.workspacePurpose }
+                    : {}),
+                });
+                useZCodeSessionStore
+                  .getState()
+                  .setActiveTaskId(resolvedPath, savedNav.taskId, resolvedIdentity);
+                return;
+              }
+              // 任务已不存在，降回同一工作区草稿检查。
+              savedNav = { ...savedNav, taskId: null };
+            } catch (error) {
+              // 读取失败不当成任务已删除，保留目标交由会话面板重连。
+              if (!mountedRef.current) return;
+              logger.warn("[Root] 冷恢复校验任务失败，保留原会话导航", {
+                taskId: savedNav.taskId,
+                error,
+              });
+              addTab(savedNav.workspacePath, {
+                ...(savedNav.workspaceIdentity
+                  ? { workspaceIdentity: savedNav.workspaceIdentity }
+                  : {}),
+                ...(savedNav.workspacePurpose
+                  ? { workspacePurpose: savedNav.workspacePurpose }
+                  : {}),
+              });
+              useZCodeSessionStore
+                .getState()
+                .setActiveTaskId(
+                  savedNav.workspacePath,
+                  savedNav.taskId,
+                  savedNav.workspaceIdentity,
+                );
+              return;
+            }
+          }
+        }
+        // 旧版没有页面导航快照，但草稿作用域仍在本浏览器。只在有显式项目意图时迁移，
+        // 不从服务器默认目录猜项目或直接在那里建会话。
+        if (!savedNav && standaloneWebDefaultWorkspacePath) {
+          const legacyScope = readComposerWorkspaceScope(
+            standaloneWebDefaultWorkspacePath,
+            undefined,
+            composerClientNamespace,
+          );
+          if (legacyScope?.projectId) {
+            savedNav = {
+              workspacePath: standaloneWebDefaultWorkspacePath,
+              taskId: null,
+              projectId: legacyScope.projectId,
+            };
+          }
+        }
+        const candidateProjectId =
+          savedNav?.projectId !== undefined
+            ? savedNav.projectId
+            : savedNav?.workspacePath
+              ? (readComposerWorkspaceScope(
+                  savedNav.workspacePath,
+                  savedNav.workspaceIdentity,
+                  composerClientNamespace,
+                )?.projectId ?? null)
+              : null;
+        if (candidateProjectId && savedNav?.workspacePath) {
+          const hostId = savedNav.workspaceIdentity
+            ? remoteHostIdFromWorkspaceIdentity(savedNav.workspaceIdentity)
+            : null;
+          if (hostId && hostId !== "local") {
+            addTab(savedNav.workspacePath, {
+              workspaceIdentity: savedNav.workspaceIdentity,
+              ...(savedNav.workspacePurpose ? { workspacePurpose: savedNav.workspacePurpose } : {}),
+            });
+            startDraftInWorkspace(savedNav.workspacePath, savedNav.workspaceIdentity, {
+              projectId: candidateProjectId,
+            });
+            return;
+          }
+          await resolveValidatedLocalCachedProject({
+            workspacePath: savedNav.workspacePath,
+            workspaceIdentity: savedNav.workspaceIdentity,
+            workspacePurpose: savedNav.workspacePurpose,
+            projectId: candidateProjectId,
+          });
+          return;
+        }
+        await openStandaloneProjectlessDraft();
+      })()
+        .catch((error) => {
+          if (!mountedRef.current) return;
+          logger.error("[Root] 独立 Web 冷恢复失败", error);
+          setWorkspaceActionError(
+            error && typeof error === "object" && "message" in error
+              ? String(error.message)
+              : String(error),
+          );
+        })
+        .finally(() => {
+          if (mountedRef.current) settleInitialBootstrap();
+        });
+      return;
+    }
+
     if (
       isDesktop &&
       initialWorkspaceAbsPath &&
@@ -129,9 +784,9 @@ export function useRootPlatformEffects({
     ) {
       // 冷启动的 project 标记只描述 tab，不能代替草稿 projectId；与运行中系统目录
       // 入口共用 Host 项目接纳，完成前保留启动屏障，避免空归属草稿先被预热。
-      void Promise.resolve(openWorkspacePath(initialWorkspaceAbsPath)).finally(() => {
-        setIsBootstrappingInitialWorkspace(false);
-      });
+      void Promise.resolve(openWorkspacePath(initialWorkspaceAbsPath)).finally(
+        settleInitialBootstrap,
+      );
       return;
     }
     if (initialWorkspaceAbsPath) {
@@ -140,6 +795,33 @@ export function useRootPlatformEffects({
         initialWorkspaceIdentity,
         composerClientNamespace,
       );
+      if (
+        standaloneWebNavigation &&
+        !initialTaskId &&
+        !initialTaskDraft &&
+        !initialWorkspaceIdentity &&
+        savedScope?.projectId
+      ) {
+        void resolveValidatedLocalCachedProject({
+          workspacePath: initialWorkspaceAbsPath,
+          workspaceIdentity: initialWorkspaceIdentity,
+          workspacePurpose: initialWorkspacePurpose,
+          projectId: savedScope.projectId,
+        })
+          .catch((error) => {
+            if (!mountedRef.current) return;
+            logger.error("[Root] 初始工作区项目校验失败", error);
+            setWorkspaceActionError(
+              error && typeof error === "object" && "message" in error
+                ? String(error.message)
+                : String(error),
+            );
+          })
+          .finally(() => {
+            if (mountedRef.current) settleInitialBootstrap();
+          });
+        return;
+      }
       // 手机重建 Root 时 bridge 只有地址；项目意图随已有浏览器草稿恢复，先于 prewarm。
       const savedDraft =
         clientMode === "web-remote-replayable" && !initialTaskId && !initialTaskDraft
@@ -158,19 +840,29 @@ export function useRootPlatformEffects({
         (savedDraft?.projectId !== undefined
           ? { projectId: savedDraft.projectId, taskGroupId: savedDraft.taskGroupId }
           : undefined);
+      // 通知深链冷启动：浏览器已恢复同路径的本地 tab 时沿用它，不另开 identity tab。
+      const bootstrapIdentity = initialTaskId
+        ? resolveBootstrapWorkspaceIdentity(
+            tabStoreApi.getState().tabs,
+            initialWorkspaceAbsPath,
+            initialWorkspaceIdentity,
+            !isDesktop && Boolean(platform.setWebPushSubscribed),
+          )
+        : initialWorkspaceIdentity;
       addTab(
         initialWorkspaceAbsPath,
-        initialWorkspaceIdentity || initialWorkspacePurpose
+        bootstrapIdentity || initialWorkspacePurpose
           ? {
-              ...(initialWorkspaceIdentity ? { workspaceIdentity: initialWorkspaceIdentity } : {}),
+              ...(bootstrapIdentity ? { workspaceIdentity: bootstrapIdentity } : {}),
               ...(initialWorkspacePurpose ? { workspacePurpose: initialWorkspacePurpose } : {}),
             }
           : undefined,
       );
       if (initialTaskId) {
+        // setActiveTaskId 自身会发布“已查看”事实，侧栏未读标记随之清除。
         useZCodeSessionStore
           .getState()
-          .setActiveTaskId(initialWorkspaceAbsPath, initialTaskId, initialWorkspaceIdentity);
+          .setActiveTaskId(initialWorkspaceAbsPath, initialTaskId, bootstrapIdentity);
       } else if (draftIntent || !isRendererReloadNavigation()) {
         // 修复原因：main 注入 initial workspace 只表达工作区入口；没有显式 taskId
         // 的 app 冷启动必须进入草稿，不能让 renderer-local last-session/group/pane
@@ -182,9 +874,10 @@ export function useRootPlatformEffects({
     // 如果这里仍然等首屏先按默认空 tab 渲染一次，窗口会先闪出打开工作区中间页，
     // 再异步补上目标 workspace，视觉上像是“打开错页再跳转”。
     // 这里把初始工作区注入也纳入启动保护期，等首个 tab 准备好后再渲染正式内容。
-    setIsBootstrappingInitialWorkspace(false);
+    settleInitialBootstrap();
   }, [
     addTab,
+    baseServices,
     openWorkspacePath,
     isDesktop,
     canBootstrapInitialWorkspace,
@@ -195,8 +888,13 @@ export function useRootPlatformEffects({
     initialWorkspaceAbsPath,
     initialWorkspaceIdentity,
     initialWorkspacePurpose,
-    setIsBootstrappingInitialWorkspace,
+    platform,
+    settleInitialBootstrap,
+    setWorkspaceActionError,
+    standaloneWebDefaultWorkspacePath,
+    standaloneWebNavigation,
     startDraftInWorkspace,
+    tabStoreApi,
   ]);
 
   useEffect(() => {
@@ -265,30 +963,103 @@ export function useRootPlatformEffects({
           });
         })
       : () => {};
-    const disposeNotificationClick = platform.onTaskNotificationClick((taskId: string) => {
-      logger.info("[Root] onTaskNotificationClick:", taskId);
-      // 遍历所有 workspace 找到 taskId 所属的 workspace，然后激活对应 tab 并切换任务
-      const workspaces = useZCodeSessionStore.getState().workspaces;
-      for (const [workspacePath, workspaceState] of Object.entries(workspaces)) {
-        const taskMeta = workspaceState.taskListCache?.find((task) => task.taskId === taskId);
-        const hasTask = workspaceState.activeTaskId === taskId || Boolean(taskMeta);
-        if (hasTask) {
-          const targetWorkspacePath = taskMeta?.workspacePath ?? workspacePath;
-          const targetWorkspaceIdentity = taskMeta?.workspaceIdentity;
-          // 通知点击会从全局 workspace store 反查 task。
-          // 远端任务必须用 task meta 自带的 workspaceIdentity 激活和选中，否则会落到 path-only 桶。
-          activateTabByPath(
-            targetWorkspacePath,
-            targetWorkspaceIdentity ? { workspaceIdentity: targetWorkspaceIdentity } : undefined,
-          );
-          useZCodeSessionStore
-            .getState()
-            .setActiveTaskId(targetWorkspacePath, taskId, targetWorkspaceIdentity);
-          return;
-        }
-      }
-      logger.warn("[Root] onTaskNotificationClick: task not found in any workspace:", taskId);
-    });
+    const disposeNotificationClick = platform.onTaskNotificationClick(
+      (taskId: string, context?: NotificationTaskContext) => {
+        logger.info("[Root] onTaskNotificationClick:", taskId);
+        pendingNotificationWaitRef.current?.();
+        const run = { cancelled: false };
+        const cancel = () => {
+          run.cancelled = true;
+          wakeNotificationWaitRef.current?.();
+        };
+        pendingNotificationWaitRef.current = cancel;
+        const deadline = Date.now() + NOTIFICATION_TASK_WAIT_MS;
+        const isReady = () =>
+          bootstrapSettledRef.current && notificationEnvRef.current.hasCompletedFullTabRestore;
+        // 可被就绪/重连事件提前唤醒的等待，且不会越过总超时。
+        const wait = (ms: number) =>
+          new Promise<void>((resolve) => {
+            const finish = () => {
+              clearTimeout(timer);
+              if (wakeNotificationWaitRef.current === finish)
+                wakeNotificationWaitRef.current = null;
+              resolve();
+            };
+            const timer = setTimeout(finish, Math.max(0, Math.min(ms, deadline - Date.now())));
+            wakeNotificationWaitRef.current = finish;
+          });
+        const fail = (reason: string) => {
+          logger.warn(`[Root] onTaskNotificationClick: ${reason}:`, taskId);
+          toast(intl.formatMessage({ id: "automations.runs.openSessionFailed" }));
+        };
+
+        void (async () => {
+          try {
+            // 冷启动时历史 tab 与初始 workspace 可能还没就绪，此时 addTab 会被随后的 restoreTabs 覆盖。
+            while (!isReady()) {
+              if (run.cancelled) return;
+              if (Date.now() >= deadline) return fail("workspace not ready");
+              await wait(deadline - Date.now());
+            }
+            let located: NotificationTaskLookup = "retry";
+            while (!run.cancelled) {
+              const env = notificationEnvRef.current;
+              located = await locateNotificationTask({
+                taskId,
+                context,
+                tabs: tabStoreApi.getState().tabs,
+                baseServices: env.baseServices,
+                allowIdentityFallback: !env.isDesktop && Boolean(platform.setWebPushSubscribed),
+              });
+              if (located !== "retry" || Date.now() >= deadline) break;
+              // 连接断线重连时 RPC 会暂时抛错，等待恢复而不是判定任务不存在。
+              await wait(NOTIFICATION_TASK_RETRY_MS);
+            }
+            if (run.cancelled) return;
+            if (!located || located === "retry") {
+              return fail(
+                located === "retry" ? "task lookup timed out" : "task not found in any workspace",
+              );
+            }
+            const env = notificationEnvRef.current;
+            const activated = activateNotificationWorkspace(
+              located.workspacePath,
+              located.workspaceIdentity,
+              {
+                activateTabByPath,
+                addTab: (workspacePath) => env.addTab(workspacePath),
+                getActiveWorkspaceTab: () => {
+                  const { tabs: currentTabs, activeTabId: currentActiveTabId } =
+                    tabStoreApi.getState();
+                  const active = currentTabs.find((tab) => tab.id === currentActiveTabId);
+                  return active && isWorkspaceTab(active) ? active : undefined;
+                },
+                allowLocalFallback: !env.isDesktop && Boolean(platform.setWebPushSubscribed),
+                canOpenTab: env.hasCompletedFullTabRestore,
+              },
+            );
+            if (!activated) return fail("workspace unavailable");
+            // 与侧栏点击任务同一条路径：分屏同步、退出自动化/插件页、选中并清未读，窄屏切入 Chat。
+            requestNotificationTaskNavigation({
+              workspacePath: located.workspacePath,
+              ...(activated.workspaceIdentity
+                ? { workspaceIdentity: activated.workspaceIdentity }
+                : {}),
+              taskId,
+              revealChat: true,
+            });
+          } catch (error) {
+            logger.warn("[Root] onTaskNotificationClick failed", { taskId, error });
+            if (!run.cancelled)
+              toast(intl.formatMessage({ id: "automations.runs.openSessionFailed" }));
+          } finally {
+            if (pendingNotificationWaitRef.current === cancel) {
+              pendingNotificationWaitRef.current = null;
+            }
+          }
+        })();
+      },
+    );
     const disposeUpdateCheckResult = platform.onUpdateCheckResult
       ? platform.onUpdateCheckResult((payload) => {
           logger.info("[Root] onUpdateCheckResult:", payload.kind);
@@ -349,6 +1120,7 @@ export function useRootPlatformEffects({
     activeWorkspacePath,
     platform,
     startNewTaskFromActiveWorkspace,
+    tabStoreApi,
     tabs,
   ]);
 
@@ -580,6 +1352,24 @@ export function useRootPlatformEffects({
     platform.syncWindowTabs(paths);
   }, [hasCompletedFullTabRestore, isDesktop, platform, tabs]);
 
+  const activeTab = useTabStore((state: TabStoreState) => {
+    const tab = state.tabs.find((candidate) => candidate.id === state.activeTabId);
+    return tab && isWorkspaceTab(tab) ? tab : undefined;
+  });
+  const viewingWorkspacePath = activeTab?.workspacePath;
+  const viewingWorkspaceIdentity = activeTab?.workspaceIdentity;
+
+  useEffect(() => {
+    if (isDesktop || !shouldPublishCompleteWorkspaceSnapshot(hasCompletedFullTabRestore)) {
+      return;
+    }
+    // activeWorkspacePath 保留最近的工作区。设置页等非工作区标签必须以上报空首项表示。
+    platform.syncWindowTabs([
+      viewingWorkspacePath ?? "",
+      ...new Set(tabs.filter(isWorkspaceTab).map((tab) => tab.workspacePath)),
+    ]);
+  }, [viewingWorkspacePath, hasCompletedFullTabRestore, isDesktop, platform, tabs]);
+
   useWebRemoteControlWorkspaceSync({
     platform,
     tabs,
@@ -657,27 +1447,30 @@ export function useRootPlatformEffects({
     };
   }, [isDesktop, locale, localeResolved, platform]);
 
-  const activeTabId = useTabStore((state: TabStoreState) => state.activeTabId);
-  const activeTabCandidate = useTabStore((state: TabStoreState) =>
-    state.tabs.find((tab: WindowTabState) => tab.id === state.activeTabId),
-  );
-  const activeTab =
-    activeTabCandidate && isWorkspaceTab(activeTabCandidate) ? activeTabCandidate : undefined;
   const lastSyncedSessionIdRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
-    if (!isDesktop) return;
-    const workspacePath = activeTab?.workspacePath;
-    const workspaceIdentity = activeTab?.workspaceIdentity;
+    // 桌面端交给 Main 做 PiP 聚焦；Web 端交给通知控制器，按任务精确判断是否正在被查看。
     const syncActiveSession = (): void => {
-      const nextSessionId = workspacePath
-        ? (useZCodeSessionStore.getState().getWorkspaceState(workspacePath, workspaceIdentity)
-            .activeTaskId ?? null)
-        : null;
+      // 设置页等非 workspace tab 时 workspacePath 为空，已上报 null；手机窄屏停在 Home 列表时
+      // 聊天区未显示，同样上报 null，让通知照常展示。
+      const nextSessionId =
+        viewingWorkspacePath && !isWebRemoteControlMobileHomeListVisible()
+          ? (useZCodeSessionStore
+              .getState()
+              .getWorkspaceState(viewingWorkspacePath, viewingWorkspaceIdentity).activeTaskId ??
+            null)
+          : null;
       if (nextSessionId === lastSyncedSessionIdRef.current) return;
       lastSyncedSessionIdRef.current = nextSessionId;
       platform.syncActiveTaskSession(nextSessionId);
     };
     syncActiveSession();
-    return useZCodeSessionStore.subscribe(syncActiveSession);
-  }, [activeTab, activeTabId, isDesktop, platform]);
+    const unsubscribeSession = useZCodeSessionStore.subscribe(syncActiveSession);
+    const unsubscribeMobileHome =
+      subscribeWebRemoteControlMobileHomeListVisibility(syncActiveSession);
+    return () => {
+      unsubscribeSession();
+      unsubscribeMobileHome();
+    };
+  }, [viewingWorkspacePath, viewingWorkspaceIdentity, platform]);
 }

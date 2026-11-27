@@ -2,7 +2,7 @@ import { useSetInterfaceModeWithTelemetry } from "@/lib/appTelemetry.js";
 import { DataSyncSection } from "@/data-sync/index.js";
 import { getWorkspaceSourceServerId } from "@/conversation-workspace-target/sourceIdentity.js";
 /* oxlint-disable eslint(max-lines) */
-import { ArrowLeft, type LucideIcon } from "lucide-react";
+import { ArrowLeft, Rocket, type LucideIcon } from "lucide-react";
 import { useStore } from "zustand";
 import {
   marketingNavigation,
@@ -420,6 +420,34 @@ export function SettingsPage({
           linuxCloseToTrayCapability.gnomeLikeWithoutTray,
       }
     : undefined;
+  const [webPushSearchAvailable, setWebPushSearchAvailable] = useState(false);
+  useEffect(() => {
+    if (isDesktop || !platform.setWebPushSubscribed || !platform.getWebNotificationState) {
+      setWebPushSearchAvailable(false);
+      return;
+    }
+    let cancelled = false;
+    const apply = (state: {
+      pushAvailable?: boolean;
+      pushSupported: boolean;
+      permission: string;
+    }) => {
+      if (cancelled) return;
+      setWebPushSearchAvailable(
+        Boolean(state.pushAvailable) &&
+          (state.pushSupported || state.permission === "ios-install-required"),
+      );
+    };
+    platform
+      .getWebNotificationState()
+      .then(apply)
+      .catch(() => {});
+    const dispose = platform.onWebNotificationStateChanged?.(apply);
+    return () => {
+      cancelled = true;
+      dispose?.();
+    };
+  }, [isDesktop, platform]);
   const marketingRequest = useStore(marketingNavigation, (state) => state.request);
   useEffect(() => {
     if (marketingRequest?.target.page !== "settings") return;
@@ -1613,6 +1641,7 @@ export function SettingsPage({
                     tray: Boolean(isWindowsDesktop || isLinuxDesktop),
                     notWindows: !isWindowsDesktop,
                     macDesktop: Boolean(isDesktop && isMacDesktop),
+                    webPush: !isDesktop && webPushSearchAvailable,
                     computerUse: resolveComputerUseAvailability({
                       isDesktop: Boolean(isDesktop),
                       isMacDesktop: Boolean(isMacDesktop),
@@ -1694,6 +1723,26 @@ export function SettingsPage({
                       </div>
                     );
                   })}
+                  {/* 上游迁移入口位于桌面专用的数据同步页，独立 Web 保留原入口。 */}
+                  {!isDesktop ? (
+                    <SettingsSidebarButton
+                      icon={Rocket}
+                      label={intl.formatMessage({ id: "settings.onboarding" })}
+                      className="border border-dashed border-border hover:border-border-hover"
+                      onClick={() => {
+                        runUserAction({
+                          input: {
+                            featureId: "settings.navigation",
+                            action: "open_onboarding",
+                            trigger: "button",
+                          },
+                          operation: requestMigrationDialog,
+                          completed: { resultSource: "local_commit" },
+                          failureStage: "dialog_open",
+                        });
+                      }}
+                    />
+                  ) : null}
                 </div>
               </nav>
 
@@ -2118,19 +2167,20 @@ export function SettingsPage({
                               />
                             </ServiceProvider>
                           ) : activeSection === "personalization" ? (
-                            // 个性化指令编辑的是本机 ~/.zcode/AGENTS.md（Agent 实际读取的文件）。
-                            // 仅桌面本地入口可编辑：手机远控的 base services 可能归属远程
-                            // Source（remoteWorkspaceServiceCollection 注册的是远端 settingService），
-                            // 编辑会写错机器；Web 端只显示本地桌面端指引。
+                            // 复用 base Host：桌面编辑本机，独立 Web 编辑服务器；
+                            // 官方 relay 远控保留上游仅桌面端边界。
                             <PersonalizationSection
                               settingService={localHostServices.settingService}
                               isDesktop={Boolean(isDesktop)}
+                              isStandaloneWeb={!isDesktop && !isWebRemoteControl}
                             />
                           ) : activeSection === "memory" ? (
                             <MemorySettingsPage
                               workspacePath={activeWorkspacePath}
                               workspaceIdentity={activeWorkspaceIdentity}
                               isDesktop={Boolean(isDesktop)}
+                              // 独立 Web 的 base Host 是服务器本机；官方 relay 远控不开放项目记忆页内读写。
+                              isStandaloneWeb={!isDesktop && !isWebRemoteControl}
                               workspaceDisplayNames={memoryWorkspaceDisplayNames}
                             />
                           ) : activeSection === "plugin" ? (

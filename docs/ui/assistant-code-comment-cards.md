@@ -4,8 +4,8 @@
 
 - 本文是 Assistant 输出 `::code-comment{...}` 在 ZCode Renderer 中解析、展示与只读 Code Review 跳转的功能规范。
 - 本功能只派生 UI，不新增 ZCode Protocol、session snapshot、relay、Host 或 Agent runtime 状态。
-- capability 默认关闭；Desktop 与手机 `/remote` 的 workspace bridge 显式开启，普通 Web Server
-  入口保持关闭。关闭时保留现有原始 directive 展示，避免 Agent 已输出审查意见但 Renderer 静默吞掉。
+- capability 默认关闭；Desktop、手机 `/remote` 的 workspace bridge 与独立 Web Server `<Root>`
+  显式开启，仅不承载会话正文的 home-only 入口保持关闭。关闭时保留现有原始 directive 展示，避免 Agent 已输出审查意见但 Renderer 静默吞掉。
 
 ## 功能摘要
 
@@ -15,7 +15,7 @@
 | 输入 | 已持久化 Assistant text row 中的 `::code-comment{...}` |
 | 输出 | 正文投影文本 + turn-local 单行代码审查卡片组 |
 | 点击效果 | 直接打开 workspace-scoped `code-review` CodeViewer，定位行并用现有评论样式展示只读模型评论；不要求文件处于 Git 变更中 |
-| 灰度 owner | Renderer Root capability `assistantCodeCommentCardsEnabled`，默认 `false`；Desktop 与手机 `/remote` workspace bridge 显式为 `true` |
+| 灰度 owner | Renderer Root capability `assistantCodeCommentCardsEnabled`，默认 `false`；Desktop、手机 `/remote` workspace bridge 与独立 Web Server `<Root>` 显式为 `true` |
 | 恢复 | 从原始 row text 确定性重建，不持久化独立卡片状态 |
 | 不涉及 | 卡片生成阶段文件存在性检查、Assistant Preview Cards 15→10 配额、Composer code-comment 草稿、Git diff 与历史 diff 快照 |
 
@@ -66,7 +66,8 @@ raw assistant text rows
 后续若要求“关闭时也绝不展示原始 directive”，必须让同一能力开关同时控制 Desktop context 的 directive 输出要求；仅在 Renderer 隐藏而不控制 Agent 输出是不安全的。
 
 手机 `/remote` 有 external relay 与 token/WebSocket 两条 workspace bridge 装配路径，两者都必须显式开启；
-普通 Web Server 和不承载会话正文的 home-only 入口保持默认关闭。该开关只控制 Renderer 对同一持久化
+独立 Web Server `<Root>` 与手机远控一致显式开启（独立 Web 与桌面共享同一 Host 会话正文，需与桌面渲染一致）；
+不承载会话正文的 home-only 入口保持默认关闭。该开关只控制 Renderer 对同一持久化
 Assistant row 的派生展示，不进入 Host、relay、snapshot，也不改变 `web-remote-replayable` 恢复语义。
 
 ## 卡片界面
@@ -131,7 +132,7 @@ card click
 - 文件不存在：沿用 Preview Pane 的 workspace-scoped 读取错误；不刷新 Git，不回退到 Git Review。
 - Markdown/HTML 在 `code-review` 模式下展示源码；binary/too-large 文件沿用 Preview Pane 既有错误状态。
 - 模型评论只作为 source 内的临时只读数据传给 CodeViewer；不读取或写入 `useCodeCommentPreviewStore`，不提供 gutter、框选、添加或删除评论交互。
-- Desktop local/remote 和手机 `/remote` 共用现有 code-viewer side pane / overlay；两条手机 workspace bridge Root 与 Desktop 一样显式开启 capability。remote 通过 source 携带的 `workspaceIdentity`、`workspaceRemoteSessionId` 选择正确 workspace service，delivery/replayable 状态不改变。普通 Web Server 入口继续使用 capability 默认值 `false`。
+- Desktop local/remote 和手机 `/remote` 共用现有 code-viewer side pane / overlay；两条手机 workspace bridge Root 与 Desktop 一样显式开启 capability。remote 通过 source 携带的 `workspaceIdentity`、`workspaceRemoteSessionId` 选择正确 workspace service，delivery/replayable 状态不改变。独立 Web Server `<Root>` 同样显式开启。
 
 ## UI Surface Matrix
 
@@ -165,7 +166,7 @@ card click
 | ACC04 | streaming 半截、已闭合 directive、complete、interrupted、failed | 推进状态 | 流式半截不闪现；流式期间不出卡；complete/interrupted 才出卡；failed 整轮和非法终态恢复正文 | accepted |
 | ACC05 | 已持久化历史 turn | cold resume/虚拟行重挂 | 从 row text 重建同一正文与卡片，不新增 RPC | accepted |
 | ACC06 | 文件无 Git 变更、没有行号、行号越界、文件不存在，或同一文件有多条评论 | 点击 | Git 状态不影响打开；无行号/越界时在顶部展示只读评论且越界有提示；缺失文件显示读取错误；同文件复用 code-review tab 并更新锚点，不切换 workspace | accepted |
-| ACC07 | Desktop Host 已持久化含合法 directive 的终态 turn，手机通过 external relay 或 token/WebSocket `/remote` bridge hydration，并切换 local/remote workspace | 查看同一 turn 并点击卡片 | 两条手机 bridge Root 都开启 capability；正文不泄露原始 directive，卡片与 Desktop 确定性一致；workspace 切换后仍开启且导航保留 `workspaceIdentity` / `remoteSessionId`；普通 Web Server 入口仍关闭 | accepted |
+| ACC07 | Desktop Host 已持久化含合法 directive 的终态 turn，手机通过 external relay 或 token/WebSocket `/remote` bridge hydration，并切换 local/remote workspace | 查看同一 turn 并点击卡片 | 两条手机 bridge Root 都开启 capability；正文不泄露原始 directive，卡片与 Desktop 确定性一致；workspace 切换后仍开启且导航保留 `workspaceIdentity` / `remoteSessionId`；独立 Web Server `<Root>` 同样开启 | accepted |
 
 剪枝：首版不做 Git diff 或历史 diff snapshot；不把 desktop/web/mobile 与所有 priority/path/source 做全排列；Windows/UNC 路径由 focused tests 覆盖，Desktop local 作为首批窗口 E2E 代表。E2E fixture 只需准备真实存在/缺失的 workspace 代码文件，不要求 Git 变更，也不 fake 卡片生成阶段的文件存在性检查。
 

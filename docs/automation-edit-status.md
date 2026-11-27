@@ -328,11 +328,11 @@ fork 预留：子会话行与父会话的 host_id / root_path / forked_from 不�
 ```
 
 - `runCount` 统计 schedule 与 manual 两类 run 首次成功接受派发的总次数；派发失败、misfire skipped
-  不计数。
+  不计数。Desktop Window Host 与开启 `automationExecutionEnabled` 的独立 HTTP Host 共用同一口径与共享 `automation-runtime` 执行器。
 - 有限计划必须使用独立的 schedule 派发计数判断 `maxRuns`；禁止用展示用的 `runCount` 推进
   生命周期。历史数据库升级时以升级前的 `runCount` 初始化 schedule 计数，升级后的 manual run
   只更新累计展示计数。
-- 同一个 manual `runId` 的重复或迟到成功回报必须幂等，不得重复增加 `runCount`。
+- 同一个 schedule 或 manual `runId` 的重复或迟到成功回报必须幂等，不得重复增加 `runCount`（schedule 亦不得重复增加 `scheduledRunCount` 或重复推进 `nextRunAt`）。
 - manual run 只影响累计展示与 `lastRunAt`，不消耗有限任务的 `maxRuns`，也不推进 cron、启停状态或
   生命周期；manual single-flight claim 仍由真实 turn 终态收口。
 - Card 在桌面端与 Web 端统一使用 `automations.runCount` 文案；中英文均只插入累计 `count`。

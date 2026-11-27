@@ -20,7 +20,7 @@ export interface ComposerAttachmentUploadItem extends ChatComposerAttachment {
   uploadStatus: ComposerAttachmentUploadStatus;
   uploadProgress: number;
   uploadError?: string;
-  uploadErrorKind?: "transient" | "permanent" | "runtimeRestarted";
+  uploadErrorKind?: "transient" | "permanent" | "runtimeRestarted" | "sessionPreparation";
   attachmentRef?: AttachmentRef;
   operationId: string;
   autoRetryCount: number;

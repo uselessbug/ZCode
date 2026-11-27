@@ -147,6 +147,8 @@ export function V4InteractionDialogs({
   });
   usePendingInteractionTaskNotifications({
     snapshot: currentSnapshot,
+    workspacePath,
+    workspaceIdentity,
     enabled: notificationEnabled,
     platform,
     formatMessage: intl.formatMessage,

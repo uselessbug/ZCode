@@ -21,6 +21,8 @@ export function TaskListItemContextMenu({
   onMarkTaskAsUnread,
   onOpenTaskFeedback,
   onOpenTaskPathInFileManager,
+  onOpenTaskFiles,
+  canOpenLocalFiles,
   onCopyWorkspacePath,
   onCopyTaskPath,
   onCopyTaskLogPath,
@@ -52,6 +54,8 @@ export function TaskListItemContextMenu({
   onMarkTaskAsUnread: () => void;
   onOpenTaskFeedback: () => void;
   onOpenTaskPathInFileManager: () => void;
+  onOpenTaskFiles?: () => void;
+  canOpenLocalFiles?: boolean;
   onCopyWorkspacePath: () => void;
   onCopyTaskPath: () => void;
   onCopyTaskLogPath: () => void;
@@ -82,6 +86,8 @@ export function TaskListItemContextMenu({
         onMarkTaskAsUnread={onMarkTaskAsUnread}
         onOpenTaskFeedback={onOpenTaskFeedback}
         onOpenTaskPathInFileManager={onOpenTaskPathInFileManager}
+        onOpenTaskFiles={onOpenTaskFiles}
+        canOpenLocalFiles={canOpenLocalFiles}
         onCopyWorkspacePath={onCopyWorkspacePath}
         onCopyTaskPath={onCopyTaskPath}
         onCopyTaskLogPath={onCopyTaskLogPath}

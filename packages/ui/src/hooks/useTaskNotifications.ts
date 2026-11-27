@@ -30,6 +30,8 @@ interface WorkspaceTerminalTaskNotificationsParams {
 
 interface PendingInteractionTaskNotificationsParams {
   snapshot: ConversationSnapshot | null;
+  workspacePath?: string;
+  workspaceIdentity?: string;
   enabled: boolean;
   platform: TaskNotificationPlatform | null | undefined;
   formatMessage: FormatMessage;
@@ -183,12 +185,13 @@ export function useWorkspaceTerminalTaskNotifications({
       previousBySessionId,
       sessions: indexState.sessions,
       formatMessage,
+      workspace: { workspacePath, ...(workspaceIdentity ? { workspaceIdentity } : {}) },
     });
     for (const payload of payloads) {
       showTaskNotification(platform, payload);
     }
     previousBySessionIdRef.current = nextBySessionId;
-  }, [enabled, formatMessage, indexState, platform, signature]);
+  }, [enabled, formatMessage, indexState, platform, signature, workspaceIdentity, workspacePath]);
 }
 
 /**
@@ -199,11 +202,20 @@ export function useWorkspaceTerminalTaskNotifications({
  */
 export function usePendingInteractionTaskNotifications({
   snapshot,
+  workspacePath: rawWorkspacePath,
+  workspaceIdentity: rawWorkspaceIdentity,
   enabled,
   platform,
   formatMessage,
 }: PendingInteractionTaskNotificationsParams): void {
   const seenRef = useRef<{ sessionId: string; seenRequestIds: Set<string> } | null>(null);
+  const workspacePath = trimOptional(rawWorkspacePath);
+  const workspaceIdentity = trimOptional(rawWorkspaceIdentity);
+  const workspaceRef = useRef<{ workspacePath?: string; workspaceIdentity?: string }>({});
+  workspaceRef.current = {
+    ...(workspacePath ? { workspacePath } : {}),
+    ...(workspaceIdentity ? { workspaceIdentity } : {}),
+  };
 
   useEffect(() => {
     if (!enabled || !snapshot) {
@@ -228,6 +240,7 @@ export function usePendingInteractionTaskNotifications({
         snapshot,
         seenRequestIds: currentSeen.seenRequestIds,
         formatMessage,
+        workspace: workspaceRef.current,
       });
       for (const payload of payloads) {
         showTaskNotification(platform, payload);

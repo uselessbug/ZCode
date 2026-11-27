@@ -1362,10 +1362,16 @@ function V4ComposerModelControlsImpl({
             sessionConfigPending,
           ])}
           modelGroups={modelSelectGroups}
+          isMobileViewport={isMobileViewport}
           contentAlign="center"
           normalizedValue={normalizedModelValue}
           triggerLabel={
-            sessionConfigPending && !effectiveConfig?.model ? "" : modelTriggerDisplay.modelLabel
+            sessionConfigPending && !effectiveConfig?.model
+              ? ""
+              : isMobileViewport
+                ? (modelTriggerDisplay.modelLabel.split("/").at(-1) ??
+                  modelTriggerDisplay.modelLabel)
+                : modelTriggerDisplay.modelLabel
           }
           composerOptions={composerOptions}
           showManageModelsAction={showManageModelsAction}
@@ -1395,10 +1401,22 @@ function V4ComposerModelControlsImpl({
           onOpenChange={handleModelPickerOpenChange}
           openRequestKey={modelMenuOpenRequestKey}
           labelVisibilityClassName="hidden @sm/composer:inline-flex"
-          indicatorClassName="block group-data-[composer-model-icon=true]/toolbar:hidden"
-          triggerLabelClassName="block min-w-0 text-left group-data-[composer-model-icon=true]/toolbar:hidden [&>span]:max-w-full [&>span>span]:block [&>span>span]:truncate"
+          indicatorClassName={
+            isMobileViewport
+              ? "block"
+              : "block group-data-[composer-model-icon=true]/toolbar:hidden"
+          }
+          triggerLabelClassName={
+            isMobileViewport
+              ? "block min-w-0 max-w-32 truncate text-left [&>span]:max-w-full [&>span>span]:block [&>span>span]:truncate"
+              : "block min-w-0 text-left group-data-[composer-model-icon=true]/toolbar:hidden [&>span]:max-w-full [&>span>span]:block [&>span>span]:truncate"
+          }
           triggerClassName="composer-model-trigger group-data-[composer-model-icon=true]/toolbar:px-1.5 group-data-[composer-model-icon=true]/toolbar:justify-center"
-          triggerIconClassName="hidden group-data-[composer-model-icon=true]/toolbar:inline-flex"
+          triggerIconClassName={
+            isMobileViewport
+              ? "hidden"
+              : "hidden group-data-[composer-model-icon=true]/toolbar:inline-flex"
+          }
           focusSelectorOnClose={V4_COMPOSER_INPUT_SELECTOR}
           providerSubmenuClassName={providerSubmenuClassName}
         />

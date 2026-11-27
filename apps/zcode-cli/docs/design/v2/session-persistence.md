@@ -711,3 +711,4 @@ interface SessionStore {
 - `0025_session_permanent_deletion` 保留已发布 SQL 与 checksum。已记账的数据库继续校验后跳过；未记账但已有部分或全部同版结构时，`apply` 仅补缺失的表、索引和触发器，保留现有数据与删除凭据，再由原迁移事务记账。此守卫不改写已有同名对象，也不修复不兼容的表结构。
 - 顺序为准入 → 释放空闲 runtime → 删除私有文件 → 删除 owned tree 数据行 → 标记完成 → 移除 Host 索引。任一步失败保留凭据，用户重试继续清理；无法把部分删除的会话恢复为普通会话。完成后同 ID 不能重建。
 - 独立 fork 保留；仍被保留会话引用的附件文件留下，原对话正文继续删除。已发布分享、工作目录、导出、备份与系统日志不联动。不承诺磁盘取证级擦除。
+- `cli/artifacts/<sid>` 兼容旧平铺文件与具名子目录 `<artifactId>/<safeFileName>` 两种布局；`session-data-files` 与永久删除按第一层顶层 artifact 条目名（子目录布局为 `<artifactId>`，平铺布局为顶层文件名）精确判定归属与保留，绝不用叶子 `fileName.includes(artifactId)` 匹配，确保同名不同 `artifactId` 的附件不会误保留或误删。

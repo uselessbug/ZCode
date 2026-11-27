@@ -1,5 +1,9 @@
 import { basename, resolvePath } from "../deps.js";
-import { READ_DEFAULT_MAX_LINES, READ_MAX_FILE_SIZE_BYTES } from "@zcode/contracts";
+import {
+  createFileSystemError,
+  READ_DEFAULT_MAX_LINES,
+  READ_MAX_FILE_SIZE_BYTES,
+} from "@zcode/contracts";
 import type {
   FilePartSource,
   FileSystemPort,
@@ -15,7 +19,7 @@ import type {
 import { readTextFileForModel } from "../../tool/handlers/read-text.js";
 import type { ResolvedTurnAttachment } from "../types.js";
 import { readInlineAttachmentContent } from "./attachment-artifacts.js";
-import { parseDataUrlHeader } from "./attachment-data-url.js";
+import { isStrictBase64Payload, parseDataUrlHeader } from "./attachment-data-url.js";
 import {
   resolveInlineMediaAttachment,
   resolveLocalMediaAttachment,
@@ -23,6 +27,7 @@ import {
 import { resolvedPlaceholderAttachment } from "./attachment-placeholder.js";
 import { inferImageMimeFromPath } from "./attachment-image.js";
 import {
+  hasPositiveTextAttachmentType,
   inferAttachmentMimeFromPath,
   isDataOrArtifactUrl,
   isTextLikePath,
@@ -137,15 +142,29 @@ async function resolveTurnAttachment(
         content: data,
         contentType: "text/plain",
         extension: "txt",
+        // 传入原文件名或兜底名，落入独立 <artifactId>/<safeFileName> 目录避免同名覆盖。
+        fileName: attachment.filename || "pasted-text.txt",
         retention: "session",
       },
       { signal: options.abortSignal },
     );
     if (!file.path) throw new Error("Text attachment path unavailable");
-    return resolvedPathReferenceAttachment({ ...attachment, path: file.path }, file.path, {
+    const source: FilePartSource = {
+      type: "file",
+      path: file.path,
+      text: { value: file.path, start: 0, end: file.path.length },
+    };
+    // 修复原因：原分支只传本地磁盘 path，丢失了新原始字节文件的 file.uri 与原上传
+    // inline.artifactUri，导致 fork 后 SqliteSessionStore.listArtifactReferrers 扫不到引用，
+    // 源会话 purge 时误删仍被 fork 会话引用的原始文件。
+    return resolvedPathReferenceAttachment(attachment, file.path, {
+      ...(inline.artifactUri ? { artifactUri: inline.artifactUri } : {}),
       filename: attachment.filename,
       mime: "text/plain",
+      ...(inline.artifactUri ? { originalUrl: inline.artifactUri } : {}),
       sizeBytes: data.length,
+      source,
+      url: file.uri ?? inline.artifactUri ?? file.path,
       reason:
         attachment.sourceKind === "topic-history"
           ? "deferred_topic_history"
@@ -166,6 +185,11 @@ async function resolveTurnAttachment(
           sizeBytes: attachment.sizeBytes,
         },
       );
+    }
+    if (attachment.type === "file" && attachment.content.startsWith("zcode-artifact://")) {
+      // 修复原因：普通上传文件曾落入通用 resolvedInlineAttachment fallback，把整段 data:...base64
+      // 原串当作文本注入 prompt；这里在 fallback 前按真实解码字节分流为安全小文本内联或落盘 local_ref。
+      return await resolveUploadedFileArtifactAttachment(attachment, index, options);
     }
     if (attachment.type !== "image" && !isDataOrArtifactUrl(attachment.content)) {
       return resolvedInlineTextAttachment(attachment, index);
@@ -198,6 +222,276 @@ async function resolveTurnAttachment(
 
   const placeholder = attachment.path ?? `attachment-${index + 1}`;
   return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed");
+}
+
+const VALID_MIME_TYPE_PATTERN = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u;
+
+function decodeUploadedFileDataUrl(
+  content: string,
+  fallbackMime: string,
+): { bytes: Buffer; mediaType: string } | undefined {
+  const commaIndex = content.indexOf(",");
+  if (content.slice(0, "data:".length).toLowerCase() !== "data:" || commaIndex < 0) {
+    return undefined;
+  }
+  const headerParts = content.slice("data:".length, commaIndex).split(";");
+  const rawMediaType = headerParts.shift()?.trim().toLowerCase() ?? "";
+  const mediaType = rawMediaType || fallbackMime;
+  if (!VALID_MIME_TYPE_PATTERN.test(mediaType)) {
+    return undefined;
+  }
+  const payload = content.slice(commaIndex + 1);
+  const isBase64 = headerParts.at(-1)?.trim().toLowerCase() === "base64";
+  if (isBase64) {
+    if (!isStrictBase64Payload(payload)) return undefined;
+    return { bytes: Buffer.from(payload, "base64"), mediaType };
+  }
+  try {
+    return { bytes: Buffer.from(decodeURIComponent(payload), "utf8"), mediaType };
+  } catch {
+    return undefined;
+  }
+}
+
+function hasDisallowedControlBytes(bytes: Uint8Array): boolean {
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index]!;
+    if (byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isSafeUtf8TextBytes(bytes: Uint8Array): boolean {
+  if (hasDisallowedControlBytes(bytes)) return false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function createInMemoryTextFileSystemPort(filePath: string, bytes: Buffer): FileSystemPort {
+  return {
+    async stat(request) {
+      if (request.path !== filePath) {
+        throw createFileSystemError({
+          code: "not_found",
+          path: request.path,
+          message: `File not found: ${request.path}`,
+        });
+      }
+      return {
+        path: filePath,
+        kind: "file",
+        mtimeMs: 0,
+        sizeBytes: bytes.byteLength,
+      };
+    },
+    async readTextFileRange(request) {
+      if (request.path !== filePath) {
+        throw createFileSystemError({
+          code: "not_found",
+          path: request.path,
+          message: `File not found: ${request.path}`,
+        });
+      }
+      if (request.maxBytes !== undefined && bytes.byteLength > request.maxBytes) {
+        throw createFileSystemError({
+          code: "too_large",
+          path: filePath,
+          message: `File content (${bytes.byteLength}) exceeds maxBytes (${request.maxBytes})`,
+        });
+      }
+      const rawText = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      const lineEndings = rawText.includes("\r\n")
+        ? "CRLF"
+        : rawText.includes("\n")
+          ? "LF"
+          : undefined;
+      const normalized = rawText.replace(/\r\n/g, "\n");
+      const lines = normalized.length === 0 ? [] : normalized.split("\n");
+      const offsetLine = Math.max(0, Math.trunc(request.offsetLine ?? 0));
+      const limitLines =
+        request.limitLines === undefined ? undefined : Math.max(0, Math.trunc(request.limitLines));
+      const selected =
+        limitLines === undefined
+          ? lines.slice(offsetLine)
+          : lines.slice(offsetLine, offsetLine + limitLines);
+      return {
+        path: filePath,
+        content: selected.join("\n"),
+        encoding: "utf8",
+        lineEndings,
+        bytesRead: bytes.byteLength,
+        sizeBytes: bytes.byteLength,
+        truncated: false,
+        startLine: offsetLine + 1,
+        lineCount: selected.length,
+        totalLines: lines.length,
+      };
+    },
+  } as FileSystemPort;
+}
+
+function normalizedFileExtension(filename: string | undefined): string | undefined {
+  if (!filename) return undefined;
+  const base = filename.split(/[\\/]/).pop() ?? "";
+  const dotIndex = base.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === base.length - 1) return undefined;
+  const sanitized = base
+    .slice(dotIndex + 1)
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .slice(0, 15)
+    .toLowerCase();
+  return sanitized.length > 0 ? `.${sanitized}` : undefined;
+}
+
+async function resolveUploadedFileArtifactAttachment(
+  attachment: TurnAttachment,
+  index: number,
+  options: ResolveAttachmentOptions,
+): Promise<ResolvedTurnAttachment> {
+  const placeholder = attachment.path ?? attachment.filename ?? `attachment-${index + 1}`;
+  const fallbackMime =
+    attachment.mimeType?.split(";", 1)[0]?.trim().toLowerCase() || "application/octet-stream";
+
+  if (!options.artifactStore || !attachment.content) {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: fallbackMime,
+    });
+  }
+
+  let artifactContent: string;
+  try {
+    const artifact = await options.artifactStore.readToolResultArtifact(
+      {
+        trace: options.traceContext,
+        uri: attachment.content,
+      },
+      { signal: options.abortSignal },
+    );
+    artifactContent = artifact.content;
+  } catch {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: fallbackMime,
+    });
+  }
+
+  const decoded = decodeUploadedFileDataUrl(artifactContent, fallbackMime);
+  if (!decoded) {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: fallbackMime,
+    });
+  }
+
+  const { bytes, mediaType } = decoded;
+  const hasPositiveTextType = hasPositiveTextAttachmentType(attachment.filename, mediaType);
+  const isSafeText = hasPositiveTextType && isSafeUtf8TextBytes(bytes);
+  const resolvedContentType = isSafeText
+    ? mediaType !== "application/octet-stream"
+      ? mediaType
+      : attachment.filename
+        ? inferAttachmentMimeFromPath(attachment.filename)
+        : "text/plain"
+    : hasPositiveTextType
+      ? "application/octet-stream"
+      : mediaType;
+
+  const write = options.artifactStore.writeToolResultBinaryArtifact?.bind(options.artifactStore);
+  if (!write || !options.sessionId) {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: resolvedContentType,
+      sizeBytes: bytes.byteLength,
+    });
+  }
+
+  // 修复原因：统一将上传原始字节以具名子目录 <artifactId>/<safeFileName> 落盘，
+  // 消除 64 KiB 硬切分并避免同名附件覆盖或路径丢失。
+  let written: { uri?: string; path?: string };
+  try {
+    written = await write(
+      {
+        sessionId: options.sessionId,
+        turnId: options.turnId,
+        trace: options.traceContext,
+        toolCallId: `file-attachment-${index}`,
+        toolName: "prompt-attachment:file",
+        content: bytes,
+        contentType: resolvedContentType,
+        ...(normalizedFileExtension(attachment.filename)
+          ? { extension: normalizedFileExtension(attachment.filename) }
+          : {}),
+        fileName: attachment.filename ?? "",
+        retention: "session",
+      },
+      { signal: options.abortSignal },
+    );
+  } catch {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: resolvedContentType,
+      sizeBytes: bytes.byteLength,
+    });
+  }
+
+  if (!written.path) {
+    return resolvedPlaceholderAttachment(attachment, placeholder, "attachment_read_failed", {
+      filename: attachment.filename,
+      mime: resolvedContentType,
+      sizeBytes: bytes.byteLength,
+    });
+  }
+
+  const dualUri = written.uri ?? attachment.content;
+
+  if (isSafeText) {
+    // 安全 UTF-8 文本直接走桌面同款 resolveLocalFileAttachment / readTextFileForModel 预读链路，
+    // 并传入已知文本分类提示避免无扩展名文本被误判为二进制；保留双 artifact URI 保护 fork 引用。
+    const fileSystemPort =
+      options.fileSystemPort ?? createInMemoryTextFileSystemPort(written.path, bytes);
+    const localResolved = await resolveLocalFileAttachment(
+      { ...attachment, path: written.path, sourceKind: undefined },
+      {
+        abortSignal: options.abortSignal,
+        assumeTextFile: true,
+        fileSystemPort,
+        traceContext: options.traceContext,
+        workingDirectory: options.workingDirectory,
+      },
+    );
+    return {
+      ...localResolved,
+      metadata: {
+        ...localResolved.metadata,
+        artifactUri: attachment.content,
+        originalUrl: attachment.content,
+      },
+      url: dualUri,
+    };
+  }
+
+  const source: FilePartSource = {
+    type: "file",
+    path: written.path,
+    text: { value: written.path, start: 0, end: written.path.length },
+  };
+  return resolvedPathReferenceAttachment(attachment, written.path, {
+    artifactUri: attachment.content,
+    filename: basename(written.path),
+    mime: resolvedContentType,
+    originalUrl: attachment.content,
+    reason: "binary_file",
+    sizeBytes: bytes.byteLength,
+    source,
+    url: dualUri,
+  });
 }
 
 async function resolvedInlineAttachment(
@@ -242,6 +536,7 @@ async function resolveLocalFileAttachment(
   attachment: TurnAttachment,
   options: {
     abortSignal?: AbortSignal;
+    assumeTextFile?: boolean;
     fileSystemPort: FileSystemPort;
     traceContext: TraceContext;
     workingDirectory: string;
@@ -270,7 +565,7 @@ async function resolveLocalFileAttachment(
       });
     }
 
-    if (!isTextLikePath(absolutePath)) {
+    if (!options.assumeTextFile && !isTextLikePath(absolutePath)) {
       // 疑似二进制文件不能误当文本读入 prompt，只交付路径引用给后续工具处理。
       return resolvedPathReferenceAttachment(attachment, attachment.path!, {
         filename,

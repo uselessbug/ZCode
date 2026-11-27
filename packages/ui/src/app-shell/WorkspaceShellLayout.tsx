@@ -83,6 +83,7 @@ import { AnimatedTerminalPanel } from "@/app-shell/AnimatedTerminalPanel.js";
 import { SIDE_PANE_DEFAULT_EXPANDED_SIZE } from "@/app-shell/sidePaneLayout.js";
 import { useAnimatedResizablePanel } from "@/app-shell/useAnimatedResizablePanel.js";
 import { ensureTaskNavigationWorkspace } from "@/app-shell/taskNavigationWorkspace.js";
+import { subscribeNotificationTaskNavigation } from "@/app-shell/useWorkspaceTaskNavigation.js";
 
 import {
   resolveWorkspaceShellPanelRadiusPx,
@@ -492,6 +493,12 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   );
   const isLinuxDesktop = Boolean(isDesktop && !isMacDesktop && !isWindowsDesktop);
   const isWebRemoteControlShell = Boolean(webRemoteControlWorkspaceSwitcher);
+  // 设置里的“新建技能/插件试用”走 Root 草稿入口，未经过 sidebar 的手机导航回调。
+  // 复用已有按 workspace/identity 隔离的待插入请求，等目录准备成功后才进入聊天消费。
+  const pendingComposerPrefill = useZCodeSessionStore(
+    (state) =>
+      state.getWorkspaceState(workspaceAbsPath, workspaceIdentity).composerTextInsertRequest,
+  );
   // Windows/Linux 原先遗漏外层留白，导致独立面板贴住窗口边缘；桌面统一使用 4px 间距。
   const hasDesktopPanelInset = isMacDesktop || isWindowsDesktop || isLinuxDesktop;
   const usesInlineWindowControls = Boolean(isWindowsDesktop || isLinuxDesktop);
@@ -547,6 +554,12 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   const [isWebRemoteControlMobileViewport, setIsWebRemoteControlMobileViewport] = useState(
     getIsWebRemoteControlMobileViewport,
   );
+  // 独立云端 Web 没有 relay switcher：非桌面一律常驻手机壳层。MobileShell 在宽视口内部
+  // 直接渲染 children(wideContent)，因此常驻挂载才能在横竖屏（390px <-> 844px）切换时
+  // 不卸载组件、不丢失 currentPage === "chat"；紧凑宽度仍只在窄视口生效。
+  const isMobileWorkspaceShellActive = isWebRemoteControlShell || !isDesktop;
+  const isCompactMobileWorkspace =
+    isWebRemoteControlShell || (!isDesktop && isWebRemoteControlMobileViewport);
   const [isWebRemoteControlNavigationDragging, setIsWebRemoteControlNavigationDragging] =
     useState(false);
   const webRemoteControlNavigationHeightRef = useRef(webRemoteControlNavigationHeightPx);
@@ -1170,7 +1183,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   }, [isWebRemoteControlNavigationCollapsed, webRemoteControlNavigationHeightPx]);
   useEffect(() => {
     if (
-      !isWebRemoteControlShell ||
+      (isDesktop && !isWebRemoteControlShell) ||
       typeof window === "undefined" ||
       typeof window.matchMedia !== "function"
     ) {
@@ -1194,7 +1207,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
     return () => {
       mediaQueryList.removeListener(syncMobileViewport);
     };
-  }, [isWebRemoteControlShell]);
+  }, [isDesktop, isWebRemoteControlShell]);
 
   useEffect(() => {
     if (!isWebRemoteControlShell || typeof window === "undefined") {
@@ -1502,7 +1515,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
         return;
       }
       showChatMainView();
-      onCreateTask(request);
+      return onCreateTask(request);
     },
     [onCreateTask, showChatMainView, workspaceReadOnlyReason],
   );
@@ -1601,6 +1614,25 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       }
     },
     [handleSelectTask, intl, isWebRemoteControlShell, showChatMainView, tabStoreApi],
+  );
+  // 系统通知点击：Root 解析出真实 workspace 后，走与侧栏点击任务完全一致的选择路径，
+  // 窄屏单栏壳层同时递增序号，让停在 Home 的手机立即切入目标会话的 Chat。
+  const [revealChatRequestId, setRevealChatRequestId] = useState(0);
+  const selectTaskInChatRef = useRef(handleSelectTaskInChat);
+  useLayoutEffect(() => {
+    selectTaskInChatRef.current = handleSelectTaskInChat;
+  }, [handleSelectTaskInChat]);
+  useEffect(
+    () =>
+      subscribeNotificationTaskNavigation((request) => {
+        selectTaskInChatRef.current(
+          request.workspacePath,
+          request.taskId,
+          request.workspaceIdentity,
+        );
+        if (request.revealChat) setRevealChatRequestId((requestId) => requestId + 1);
+      }),
+    [],
   );
   // 中枢直接启动 accepted 后切到新会话（run 卡已在顶部）：复用运行历史那条导航，
   // target 恒带工作流所属项目坐标（不变式 7），remoteSessionId 决定连接 endpoint。
@@ -1836,7 +1868,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   const draftProjectId = useZCodeSessionStore(
     (state) => state.getWorkspaceState(workspaceAbsPath, workspaceIdentity).draftProjectId ?? null,
   );
-  // worktree 复选框只对本地桌面的 Git 项目草稿开放（docs/git/worktree.md §3.1）。
+  // worktree 复选框只对本地（桌面或独立 Web 本地连接，需 Host 提供 managedWorktreeService）的 Git 项目草稿开放（docs/git/worktree.md §3.1）。
   const worktreeEligible =
     activeWorkspacePurpose === "project" &&
     !isOfficeMode &&
@@ -1918,7 +1950,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
           showEditProject
           workspacePath={workspaceAbsPath}
           workspaceIdentity={workspaceIdentity}
-          compactForRemoteControl={isWebRemoteControlShell}
+          compactForRemoteControl={isCompactMobileWorkspace}
           onCreateTask={handleCreateTaskInChat}
           onSelectConversationWorkspace={handleSelectConversationWorkspace}
           allowRemoteWorkspace={allowRemoteWorkspace}
@@ -1961,7 +1993,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
               gitSummary={gitState.summary}
               dirtyFileCount={gitDirtyFileCount}
               onRefreshGit={handleRefreshGit}
-              compactForRemoteControl={isWebRemoteControlShell}
+              compactForRemoteControl={isCompactMobileWorkspace}
               className="px-0 pt-0"
               popoverClassName="w-72"
               branchListClassName="max-h-48"
@@ -1995,6 +2027,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       handleRefreshGit,
       handleSelectConversationWorkspace,
       handleCreateTaskInChat,
+      isCompactMobileWorkspace,
       isWebRemoteControlShell,
       onOpenRemoteWorkspace,
       onConnectRemote,
@@ -2308,7 +2341,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       onBrowserPageMetadataChange={handleBrowserPageMetadataChange}
       onSelectGitSource={setGitSelectedSourceId}
       mobileOverlay={options.mobileOverlay}
-      mobileStacked={isWebRemoteControlShell}
+      mobileStacked={isCompactMobileWorkspace}
     />
   );
   const sidePanePanel = renderSidePanePanel();
@@ -2350,12 +2383,79 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
             }
           : handleOpenSidebarFiles
       }
-      onSelectTask={handleSelectTaskInChat}
-      onStartDraftInWorkspace={handleStartDraftInWorkspaceInChat}
+      onSelectTask={
+        mobile && !isWebRemoteControlShell
+          ? (
+              targetWorkspacePath: string,
+              taskId: string,
+              targetWorkspaceIdentity?: string,
+              targetRemoteSessionId?: string,
+              expectedUnreadAt?: number,
+            ) => {
+              handleSelectTaskInChat(
+                targetWorkspacePath,
+                taskId,
+                targetWorkspaceIdentity,
+                targetRemoteSessionId,
+                expectedUnreadAt,
+              );
+              mobile.navigateToChat();
+            }
+          : handleSelectTaskInChat
+      }
+      onStartDraftInWorkspace={
+        mobile && !isWebRemoteControlShell
+          ? (
+              targetWorkspacePath: string,
+              targetWorkspaceIdentity?: string,
+              targetWorkspacePurpose?: import("@zcode/shared").WorkspacePurpose,
+              createSource?: import("@zcode/shared").SessionCreateSource,
+            ) => {
+              handleStartDraftInWorkspaceInChat(
+                targetWorkspacePath,
+                targetWorkspaceIdentity,
+                targetWorkspacePurpose,
+                createSource,
+              );
+              mobile.navigateToChat();
+            }
+          : handleStartDraftInWorkspaceInChat
+      }
       onOpenBrowserUrl={handleOpenBrowserUrl}
       fileTreeOpenRequest={fileTreeOpenRequest}
-      onCreateTask={handleCreateTaskInChat}
-      onCreateConversationTask={onCreateConversationTask ?? handleCreateTaskInChat}
+      onCreateTask={
+        mobile && !isWebRemoteControlShell
+          ? async (request?: import("./types.js").CreateTaskRequest) => {
+              const nextRequest =
+                typeof request === "string" ? { provider: request } : { ...request };
+              const prevOnComplete = nextRequest.onComplete;
+              await handleCreateTaskInChat({
+                ...nextRequest,
+                onComplete: () => {
+                  prevOnComplete?.();
+                  mobile.navigateToChat();
+                },
+              });
+            }
+          : handleCreateTaskInChat
+      }
+      onCreateConversationTask={
+        mobile && !isWebRemoteControlShell
+          ? async (request?: import("./types.js").CreateTaskRequest) => {
+              const handler = onCreateConversationTask ?? handleCreateTaskInChat;
+              const nextRequest =
+                typeof request === "string" ? { provider: request } : { ...request };
+              const prevOnComplete = nextRequest.onComplete;
+              await handler({
+                ...nextRequest,
+                onComplete: () => {
+                  prevOnComplete?.();
+                  mobile.navigateToChat();
+                },
+              });
+            }
+          : (onCreateConversationTask ?? handleCreateTaskInChat)
+      }
       onCreateConversationTaskOnSource={onCreateConversationTaskOnSource}
       onOpenFolderFromWorkspaceMenu={onOpenFolderFromWorkspaceMenu}
       onOpenRemoteWorkspace={onOpenRemoteWorkspace}
@@ -2385,9 +2485,23 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       goBackShortcutLabel={goBackShortcutLabel}
       goForwardShortcutLabel={goForwardShortcutLabel}
       onOpenCommandCenter={handleOpenCommandCenter}
-      onOpenAutomations={handleOpenAutomations}
+      onOpenAutomations={
+        mobile && !isWebRemoteControlShell
+          ? () => {
+              handleOpenAutomations();
+              mobile.navigateToChat();
+            }
+          : handleOpenAutomations
+      }
       automationsActive={workspaceMainView === "automations"}
-      onOpenPluginStore={handleOpenPluginStore}
+      onOpenPluginStore={
+        mobile && !isWebRemoteControlShell
+          ? () => {
+              handleOpenPluginStore();
+              mobile.navigateToChat();
+            }
+          : handleOpenPluginStore
+      }
       pluginStoreActive={workspaceMainView === "plugin-store"}
       navPrimarySlot={navPrimarySlot}
       // 桌面没有 mobile 导航动作；内联包装曾让右侧开关穿透侧栏 memo，重复渲染全部项目。
@@ -2414,7 +2528,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
   // 断点切换曾卸载查看 Reporter，伪造离开后返回并清掉手动未读。
   // 同一 Shell 持有查看与手机导航，只替换布局内容；真实 Home/后台仍立即撤销查看。
   const renderRemoteShell = (wideContent: ReactNode) =>
-    webRemoteControlWorkspaceSwitcher ? (
+    isMobileWorkspaceShellActive ? (
       <WebRemoteControlMobileShell
         isMobileViewport={isWebRemoteControlMobileViewport}
         taskViewEnabled={
@@ -2424,6 +2538,12 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
         activeWorkspaceIdentity={workspaceIdentity}
         activeWorkspacePath={workspaceAbsPath}
         initialNavigationIntent={initialWebRemoteControlMobileNavigationIntent}
+        composerPrefillRequestId={
+          !isWebRemoteControlShell && activeTaskId === null
+            ? pendingComposerPrefill?.requestId
+            : undefined
+        }
+        revealChatRequestId={revealChatRequestId}
         webRemoteControlTerminalTransportState={webRemoteControlTerminalTransportState}
         isSidePaneOpen={isSidePaneOpen}
         onCloseSidePane={isSidePaneOpen ? handleToggleSidePane : undefined}
@@ -2598,7 +2718,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
                   workspacePath={workspaceAbsPath}
                   workspaceIdentity={workspaceIdentity}
                   isDesktop={isDesktop === true}
-                  compactForRemoteControl={isWebRemoteControlShell}
+                  compactForRemoteControl={isCompactMobileWorkspace}
                   sessionId={activeTaskId}
                   provider={activeTaskProvider ?? undefined}
                   onSessionCreated={handleV4SessionCreated}
@@ -3212,7 +3332,7 @@ const WorkspaceShellLayoutContent = memo(function WorkspaceShellLayoutComponent(
       isWindowsDesktop={isWindowsDesktop}
       headerTestId={TID_APP_HEADER}
     >
-      {isWebRemoteControlShell ? renderRemoteShell(wideContent) : wideContent}
+      {isMobileWorkspaceShellActive ? renderRemoteShell(wideContent) : wideContent}
     </DesktopWindowFrame>
   );
 });

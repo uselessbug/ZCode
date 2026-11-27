@@ -1587,6 +1587,7 @@ export function createConversationV4Gateway(
         hasBackgroundWork: false,
         hasCompactWork: false,
         lastActivityAt: session.time?.updated ?? 0,
+        terminalAt: session.time?.updated ?? 0,
         createdAt: session.time?.created ?? 0,
       });
   /**

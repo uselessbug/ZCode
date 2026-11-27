@@ -24,11 +24,11 @@ export function normalizeThemePreference(theme: Theme): Theme {
   return theme;
 }
 
-function setThemeMetaContent(name: "theme-color" | "color-scheme", content: string) {
-  let meta = document.querySelector<HTMLMetaElement>(`meta[name="${name}"]`);
+function setThemeColorMeta(content: string) {
+  let meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
   if (!meta) {
     meta = document.createElement("meta");
-    meta.name = name;
+    meta.name = "theme-color";
     document.head.append(meta);
   }
   meta.content = content;
@@ -46,12 +46,13 @@ function syncBrowserThemeSurface(resolved: ResolvedTheme) {
   // Electron 为 vibrancy 保持透明根背景，但普通浏览器需要从文档根和标准 meta
   // 获得页面主题。只切换 React 的 dark class 会让浏览器工具栏、原生控件和 overscroll 留在旧主题。
   root.setAttribute(BROWSER_THEME_SURFACE_ATTRIBUTE, resolved);
+  // Firefox Nightly 的单值 meta 会覆写系统媒体查询（Mozilla bug 2085572）；
+  // meta 保持双值，实际控件亮暗只写 CSS。
   root.style.colorScheme = resolved;
-  setThemeMetaContent("color-scheme", resolved);
 
   const background = getComputedStyle(root).getPropertyValue("--color-background").trim();
   if (background) {
-    setThemeMetaContent("theme-color", background);
+    setThemeColorMeta(background);
   }
 }
 
