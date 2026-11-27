@@ -8,7 +8,7 @@ import type {
   BrowserControlPort,
   BrowserErrorCode,
 } from "@zcode/contracts";
-import type { Browser } from "playwright-core";
+import type { Browser, BrowserContextOptions } from "playwright-core";
 import { createManagedCdpDescriptor } from "./descriptor.js";
 import {
   loadPlaywrightChromium,
@@ -20,10 +20,12 @@ import {
 import { executeManagedPageCommand } from "./page-command.js";
 import { abortError, classifyError, hasSideEffects, raceWithAbort } from "./request.js";
 import { ManagedCdpSession } from "./session.js";
+import { loadBrowserStorageState } from "./storage-state.js";
 
 export interface ManagedCdpBrowserRuntimeOptions extends BrowserExecutableResolutionOptions {
   closeTimeoutMs?: number;
   loadPlaywright?: () => Promise<PlaywrightChromiumModule>;
+  storageStatePath?: string;
   /** 允许缓存的已释放空闲会话上限，默认 16。 */
   maxReleasedSessions?: number;
   /** 已释放空闲会话的回收 TTL（毫秒），默认 30 分钟。 */
@@ -34,7 +36,7 @@ export interface ManagedCdpBrowserRuntime {
   browserControlPort: BrowserControlPort;
   close(): Promise<void>;
   /** 释放会话租约并进入空闲缓存池，保留页面与 Cookie，超出上限或 TTL 到期后再回收。 */
-  releaseSession(sessionId: string): Promise<void>;
+  releaseSession?(sessionId: string): Promise<void>;
 }
 
 interface PendingRequest {
@@ -44,7 +46,6 @@ interface PendingRequest {
 }
 
 interface ReleasedSessionState {
-  releasedAt: number;
   timer: NodeJS.Timeout;
 }
 
@@ -172,7 +173,7 @@ class ManagedCdpBrowserControlPort implements BrowserControlPort {
         void this.evictIdleSession(sessionId);
       }, this.#releasedSessionIdleTtlMs);
       timer.unref?.();
-      this.#releasedSessions.set(sessionId, { releasedAt: Date.now(), timer });
+      this.#releasedSessions.set(sessionId, { timer });
 
       // 仅在当前 session 队列内同步摘除待 LRU 驱逐条目并从 #sessions 移除，退出当前队列锁后再关闭过期 context，避免跨 session 死锁与并发重入。
       while (this.#releasedSessions.size > this.#maxReleasedSessions) {
@@ -412,9 +413,16 @@ class ManagedCdpBrowserControlPort implements BrowserControlPort {
       const promise = (async () => {
         const browser = await this.ensureBrowser(signal);
         const generation = this.#generation;
+        const storageStatePath = this.#options.storageStatePath;
+        const storageState = storageStatePath
+          ? (await loadBrowserStorageState(storageStatePath)).state
+          : undefined;
         const context = await browser.newContext({
           acceptDownloads: false,
           viewport: { width: 1280, height: 720 },
+          ...(storageState
+            ? { storageState: storageState as BrowserContextOptions["storageState"] }
+            : {}),
         });
         if (
           this.#disposed ||
@@ -592,6 +600,19 @@ export {
 } from "./executable.js";
 export type { BrowserExecutableResolutionOptions, PlaywrightChromiumModule } from "./executable.js";
 export { isAllowedManagedBrowserUrl } from "./page-command.js";
+export {
+  BrowserStateFileError,
+  loadBrowserStorageState,
+  resolveDefaultBrowserStatePath,
+} from "./storage-state.js";
+export type {
+  BrowserStateCookie,
+  BrowserStateFileErrorCode,
+  BrowserStateLoadResult,
+  BrowserStateOrigin,
+  BrowserStorageState,
+  LoadBrowserStorageStateOptions,
+} from "./storage-state.js";
 
 function waitForPromise(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {

@@ -13,6 +13,7 @@ import type {
   ProjectTaskRef,
   VirtualProject,
 } from "#src/project-storage/contract.js";
+import { hostMismatch } from "#src/project-storage/host-mismatch.js";
 import {
   assertStoredTaskDirectories,
   type StandaloneNonProjectPolicy,
@@ -109,14 +110,25 @@ export function resolveDirectories(
 ): ProjectDirectories {
   const row = readTask(db, task);
   // 旧远端影子行仍可能保留；行与项目一致不代表当前 Host 有权加载其目录。
-  if (row && row.host_id !== ownerHostId) throw new Error("project.host-mismatch");
+  if (row && row.host_id !== ownerHostId)
+    throw hostMismatch("owner", task, {
+      rowHostId: row.host_id,
+      ownerHostId,
+      projectId: row.project_id,
+    });
   // root_path 是 cwd；worktree 任务的 workspace 是 workspace_path（项目主目录），两者分开返回，
   // 导航等调用方打开的是 workspace，执行目录只给需要 cwd 的调用方（§6.6.1）。
   const cwd = row ? String(row.root_path) : task.workspacePath;
   const workspacePath =
     row && typeof row.worktree_root === "string" ? String(row.workspace_path) : cwd;
   const project = row?.project_id ? requireProject(db, String(row.project_id)) : null;
-  if (project && row?.host_id !== project.hostId) throw new Error("project.host-mismatch");
+  if (project && row?.host_id !== project.hostId)
+    throw hostMismatch("project", task, {
+      rowHostId: row?.host_id,
+      ownerHostId,
+      projectId: project.id,
+      projectHostId: project.hostId,
+    });
   // 读取已持久化目录：独立多 root 下 root 可能被用户改过，历史任务 cwd 允许已不在 roots 内。
   assertStoredTaskDirectories(
     ownerHostId,

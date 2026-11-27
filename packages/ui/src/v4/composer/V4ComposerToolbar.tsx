@@ -38,7 +38,11 @@ import type {
   SessionPhase,
   SessionUsageState,
 } from "@zcode/shared/zcode-protocol-v4";
-import { ModelConfigSelect, type ModelSelectGroup } from "@/ModelConfigSelect.js";
+import {
+  ModelConfigSelect,
+  type ModelConfigSelectGuide,
+  type ModelSelectGroup,
+} from "@/ModelConfigSelect.js";
 import type { ComposerModelOptions } from "@/chat-input-toolbar/ComposerModelMenu.js";
 import { Button } from "@/components/ui/button.js";
 import { HighspeedModelIndicator } from "@/highspeed/HighspeedModelIndicator.js";
@@ -69,6 +73,7 @@ import {
   setPendingSettingsUsageCodingPlanIntent,
 } from "@/lib/settingsNavigation.js";
 import { useTabStore } from "@/store/TabStoreProvider.js";
+import { isSettingsTab } from "@/store/tabStore.js";
 import type { ModelSelectionView } from "@zcode/services";
 import type {
   ModelSelectionState,
@@ -438,6 +443,8 @@ export interface V4ComposerToolbarProps {
     sourceModel: ModelSelectionSource | null,
   ) => Promise<void> | void;
   onSendCompressionCommand?: (command: string) => void;
+  /** 模型按钮上的一次性引导气泡；设置页覆盖工作区时不显示。 */
+  modelGuide?: ModelConfigSelectGuide | null;
 }
 
 /** 模型 / 思考深度 / context usage 簇（渲染在发送键左侧，与旧 UI 同位）。 */
@@ -470,6 +477,7 @@ function V4ComposerModelControlsImpl({
   onSelectThought,
   onSendCompressionCommand,
   onRecoverCustomModelSelection,
+  modelGuide = null,
 }: V4ComposerToolbarProps) {
   const { intl, locale } = useZCodeIntl();
   const { openCodingPlanUpgrade } = useCodingPlanUpgradeDialog();
@@ -498,6 +506,10 @@ function V4ComposerModelControlsImpl({
     suppressProviderFingerprintAutoRefresh: true,
   });
   const openSettingsTab = useTabStore((state) => state.openSettingsTab);
+  // 气泡 Portal 位于 body，工作区的 opacity/inert 隐藏不了它；必须跟随设置标签的可见性。
+  const isWorkspaceVisible = useTabStore(
+    (state) => !state.tabs.some((tab) => tab.id === state.activeTabId && isSettingsTab(tab)),
+  );
   const modelTriggerRef = useRef<HTMLSpanElement | null>(null);
   const thoughtTriggerRef = useRef<HTMLSpanElement | null>(null);
   // Ctrl+M 热键：递增 openRequestKey 请求 ModelConfigSelect 打开菜单（旧 handleOpenModelMenuShortcut 语义）。
@@ -1236,9 +1248,10 @@ function V4ComposerModelControlsImpl({
   const sessionConfigPending = sessionId !== null && draftConfig?.mode === undefined;
   // Bug 根因：手机端固定宽度的二级菜单没有消费 Radix 测得的当前方向可用宽度，
   // 共享 min-w-32 还会阻止极窄空间继续收缩。保持二级交互，同时把窗口边缘作为硬上限。
-  const providerSubmenuClassName = isMobileViewport
-    ? "w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)"
-    : undefined;
+  const providerSubmenuClassName =
+    isWebRemoteControl && isMobileViewport
+      ? "w-40 min-w-0 max-w-(--radix-dropdown-menu-content-available-width)"
+      : undefined;
   useToolbarShortcutBindings({
     hasAnyOption: Boolean(modelOption) || Boolean(thoughtOption),
     toolbarDisabled:
@@ -1381,6 +1394,7 @@ function V4ComposerModelControlsImpl({
               !(modelSelectionState.status === "loading" && modelSelectionState.catalog))
           }
           tooltipTitle={modelTriggerDisplay.fullLabel}
+          guide={isWorkspaceVisible ? modelGuide : null}
           shortcutLabel={modelShortcutLabel}
           triggerRef={modelTriggerRef}
           open={!modelLocked && activeConfigPicker === "model"}

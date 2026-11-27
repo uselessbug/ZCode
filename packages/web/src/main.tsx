@@ -47,7 +47,6 @@ import { WebCallbackPage } from "./auth/WebCallbackPage.js";
 import { WebLoginPage } from "./auth/WebLoginPage.js";
 import { createWebAuthService } from "./auth/webAuthService.js";
 import { WEB_ZAI_OAUTH_CONFIG, resolveWebAuthDevReturnTo } from "./auth/webZaiOAuthConfig.js";
-import { parseOAuthState, resolveSafeAppReturnTo } from "./auth/oauthStateCodec.js";
 import {
   ConversationShareLandingLoader,
   ConversationShareLandingStatus,
@@ -305,10 +304,8 @@ function isWebOAuthCallback(params: URLSearchParams): boolean {
 
 function renderWebAuthCallbackPage(): void {
   document.title = "ZCode - Web Remote Control Sign In";
-  const callbackState = parseOAuthState(
-    new URLSearchParams(window.location.search).get("state") ?? "",
-  );
-  const safeRetryTarget = resolveSafeAppReturnTo(callbackState?.app_return_to);
+  // 区域登录的 state 来自服务端，回跳地址只记在 pending 里；必须在 handleCallback 取出前读取。
+  const safeRetryTarget = webAuthService.resolveCallbackReturnTo(window.location.href);
   root.render(
     <WebCallbackPage
       authService={webAuthService}
@@ -769,6 +766,7 @@ export function createHomeOnlyWebRemoteControlServices(): RootServices {
         pluginStoreOrder: null,
         zsrcUrl: null,
         uiPluginRecommendations: [],
+        draftModelMigration: null,
       }),
     }),
     // 手机 Web 未连接 shared-host attachment 时禁止直连 scenes HTTP；返回空配置保持首页可用。
@@ -2150,11 +2148,17 @@ async function bootstrapWebApp() {
   // 只带 taskId 的深链没有目标 workspace，仍走点击队列由 Root 遍历已打开的 workspace 定位。
   const coldLaunchTarget = consumeNotificationDeepLink();
   const coldLaunchWorkspace = coldLaunchTarget?.workspacePath ? coldLaunchTarget : null;
+  // services 随重连被整体替换，回调每次读取当前 live 代理；首连完成前或断线写入失败时抛错，让设置页提示保存失败并恢复旧值。
+  // 空串是清除哨兵：服务端归一为删除 setting.json 字段，并实时更新 Host 内存中的回复语言。
+  let services: RootServices | undefined;
   const platform = createWebPlatform({
     initialNotificationTarget: coldLaunchWorkspace ? null : coldLaunchTarget,
+    setReplyLanguage: async (language) => {
+      if (!services) throw new Error("Standalone Web services are not connected");
+      await services.settingService.update({ replyLanguage: language.trim() });
+    },
   });
   document.title = "ZCode - Web + Server";
-  let services: RootServices | undefined;
   const authRequiredAtStart = bootstrap.initialAccessState === "auth-required";
   let state: StandaloneWebConnectionState = authRequiredAtStart ? "auth-required" : "connecting";
   let connection: ReturnType<typeof createStandaloneWebConnection> | undefined;

@@ -31,8 +31,11 @@ export function createWebPlatform(options?: {
   externalWebRemoteControlProxy?: WebRemoteControlPlatformProxy;
   /** 通知深链带来的冷启动目标，Root 注册点击监听后派发。 */
   initialNotificationTarget?: NotificationClickTarget | null;
+  /** 独立 Web 把 Agent 回复语言写回当前服务器；手机远控代理页不挂载，设置页保持“请在本机设置”。 */
+  setReplyLanguage?: (language: string) => Promise<void>;
 }): IPlatformService {
   const platformProxy = options?.externalWebRemoteControlProxy;
+  const settingsChangedListeners = new Set<() => void>();
   // 远控页没有独立 Server 的 /api/web-push，只保留页内通知；独立 Web 由 /api/web-push/config 判断是否可用。
   const notifications = createWebNotificationController({
     pushEnabled: !platformProxy,
@@ -178,6 +181,22 @@ export function createWebPlatform(options?: {
     onWebNotificationStateChanged: notifications.onWebNotificationStateChanged,
     requestWebNotificationPermission: notifications.requestWebNotificationPermission,
     ...(platformProxy ? {} : { setWebPushSubscribed: notifications.setWebPushSubscribed }),
+    // 未传回调（或远控代理页）时保持 undefined，设置页据此显示“请在本机设置”。
+    // 保存成功后通知 onSettingsChanged 监听者刷新设置页快照，对齐桌面端 applyReplyLanguage 行为。
+    ...(!platformProxy && options?.setReplyLanguage
+      ? {
+          setReplyLanguage: async (language: string) => {
+            await options.setReplyLanguage!(language);
+            for (const listener of settingsChangedListeners) listener();
+          },
+          onSettingsChanged: (callback: () => void) => {
+            settingsChangedListeners.add(callback);
+            return () => {
+              settingsChangedListeners.delete(callback);
+            };
+          },
+        }
+      : {}),
     // Web 端没有跨窗口 tab 管理；这里只把本页的工作区快照交给通知控制器，用于通知点击路由
     syncWindowTabs: notifications.syncWindowTabs,
     // Web 端没有宿主层 Dock / 任务栏徽标，保持空实现以兼容统一平台接口

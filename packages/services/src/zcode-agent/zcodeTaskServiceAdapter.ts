@@ -3023,6 +3023,34 @@ export function createZCodeTaskServiceAdapter(
       return result;
     },
 
+    async previewArchivedTaskDeletions({ tasks }) {
+      const preview = options.zcodeAgentService.previewSessionDeletions;
+      if (!preview) throw new Error("session-data.unavailable");
+      if (!tasks.length) return { results: [] };
+      const [archived, sessionDirectories] = await Promise.all([
+        Promise.all(tasks.map((task) => taskIndexRepo.isTaskArchived(task))),
+        Promise.all(tasks.map((task) => resolveArchivedTaskSessionDirectory(task))),
+      ]);
+      const { results } = await preview({
+        items: tasks.map((task, index) => ({
+          sessionId: task.taskId,
+          workspace: normalizeWorkspaceParams(task),
+          ...(sessionDirectories[index] ? { sessionDirectory: sessionDirectories[index] } : {}),
+        })),
+      });
+      // 未归档判定与单项预检一致：已在删除或已完成的续删不受归档状态影响。
+      return {
+        results: results.map((result, index) =>
+          "preview" in result &&
+          !archived[index] &&
+          !result.preview.completed &&
+          !result.preview.incomplete
+            ? { preview: { ...result.preview, blockedReason: "not-archived" as const } }
+            : result,
+        ),
+      };
+    },
+
     async permanentlyDeleteArchivedTask(params) {
       const execute = options.zcodeAgentService.executeSessionDeletion;
       if (!execute) throw new Error("session-data.unavailable");
@@ -3060,9 +3088,8 @@ export function createZCodeTaskServiceAdapter(
     async deleteArchivedTask(params): Promise<boolean> {
       // Bug 根因：原顺序先 taskIndexRepo.deleteArchivedTask（立即把 deleted 置 1）再让 CLI 删除。
       // mutateSessionFacts 抛错时 SQLite 已被改成 deleted=1，刷新后失败项消失且无法重试。
-      // 修复：先读归档事实，再让 CLI 接受删除事实，最后才写 tombstone。
-      const flags = await taskIndexRepo.getTaskIndexFlags(params);
-      if (!flags || flags.deleted || !flags.archived) return false;
+      // 修复：先确认当前处于已归档且未删除，再让 CLI 接受删除事实，最后才写 tombstone。
+      if (!(await taskIndexRepo.isTaskArchived(params))) return false;
       await taskIndexSyncer.mutateSessionFacts(
         { ...params, sessionId: params.taskId },
         { type: "delete" },
@@ -3105,8 +3132,7 @@ export function createZCodeTaskServiceAdapter(
         };
         try {
           // 保留逐项事务与归档 guard：一项失败不能回滚其它成功项，也不能提前隐藏失败项。
-          const flags = await taskIndexRepo.getTaskIndexFlags(target);
-          if (!flags || flags.deleted || !flags.archived) {
+          if (!(await taskIndexRepo.isTaskArchived(target))) {
             result.skippedTaskIds.push(taskId);
             continue;
           }

@@ -278,6 +278,8 @@ const SCHEMA_ENTRY = `
     serverRemoteInfoOutputSchema,
     serverRemoteInfoSchema,
   } from ${JSON.stringify(join(repoRoot, "packages/shared/src/server-remote.ts"))};
+  export { appSettingsPatchSchema } from ${JSON.stringify(join(repoRoot, "packages/shared/src/validationAppSettings.ts"))};
+  export { normalizeSettingsPatch } from ${JSON.stringify(join(repoRoot, "packages/services/src/setting/normalizeSettingsPatch.ts"))};
 `;
 
 const CLIENT_ENTRY = `
@@ -1016,6 +1018,26 @@ async function runCapabilitySuite(schemaMod) {
       assert.deepEqual(remote.calls, [], "跨机代理不应读取本机 server-info");
     },
   );
+
+  await check(
+    "replyLanguage：patch schema 接受空串清除哨兵，normalizeSettingsPatch 归一为 undefined",
+    async () => {
+      const { appSettingsPatchSchema, normalizeSettingsPatch } = schemaMod;
+      assert.equal(
+        appSettingsPatchSchema.parse({ replyLanguage: "简体中文" }).replyLanguage,
+        "简体中文",
+      );
+      assert.equal(appSettingsPatchSchema.parse({ replyLanguage: "" }).replyLanguage, "");
+      assert.throws(() => appSettingsPatchSchema.parse({ replyLanguage: "x".repeat(257) }));
+      assert.equal(
+        normalizeSettingsPatch({ replyLanguage: "  简体中文  " }).replyLanguage,
+        "简体中文",
+      );
+      const cleared = normalizeSettingsPatch({ replyLanguage: "" });
+      assert.equal("replyLanguage" in cleared, true);
+      assert.equal(cleared.replyLanguage, undefined);
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1079,18 @@ async function runWiringSuite() {
     assert.match(line, /managedWorktreeService/u);
     assert.match(line, /!props\.isWebRemoteControl/u);
   });
+
+  await check(
+    "web/main.tsx & platform：独立 Web 接通 setReplyLanguage，远控分支不暴露",
+    async () => {
+      const platformSource = readFileSync(
+        join(repoRoot, "packages/web/src/platform/index.ts"),
+        "utf8",
+      );
+      assert.match(platformSource, /!platformProxy && options\?\.setReplyLanguage/u);
+      assert.match(mainSource, /setReplyLanguage:\s*async\s*\(language\)/u);
+    },
+  );
 }
 
 const workDir = await mkdtemp(join(tmpdir(), "zcode-desktop-parity-ui-"));

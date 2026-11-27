@@ -1537,21 +1537,4 @@ export class TaskIndexRepo {
     }
     return rowToMeta(row);
   }
-
-  /**
-   * 归档条件删除的前置读取：只暴露 archived/deleted 组织态事实。
-   *
-   * ZCodeTaskMeta 不含 archived，而 deleteArchivedTask 会把 deleted 置 1，
-   * 因此调用方需要在写 tombstone 之前读到归档事实。返回 null 表示行不存在。
-   */
-  async getTaskIndexFlags(params: {
-    workspacePath: string;
-    workspaceIdentity?: string;
-    taskId: string;
-  }): Promise<{ archived: boolean; deleted: boolean } | null> {
-    await this.ensureReady();
-    const row = this.getTaskRow(params);
-    if (!row) return null;
-    return { archived: row.archived === 1, deleted: row.deleted === 1 };
-  }
 }

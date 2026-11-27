@@ -6,6 +6,7 @@
 - URL 内容按流读取并检查实际字节数；异常停止读取。只接受 HTTP、HTTPS、data、blob 来源。
 - 下载文件名清理路径和非法字符；触发后移除临时链接并回收 Blob URL。
 - success 只表示交付给浏览器下载，不能视为用户已确认或文件已落盘。取消下载无法被页面可靠观察。
+- `setReplyLanguage` 仅在独立 Web 入口传入回调且无 `externalWebRemoteControlProxy` 时与 `onSettingsChanged` 一并挂载，经 `settingService.update({ replyLanguage })` 写回服务器（空串清除）后通知监听方刷新设置快照；尚未建立首个连接或断线失败时抛错，由设置页提示失败并恢复旧值。未传入或手机远控页保持 `undefined`，设置页显示“请在本机设置”。
 - 此模块不持有工作区、任务、session 或 stream 状态；现有远控连接、事件和 owner 语义保持不变。
 
 ## 浏览器通知与 Web Push

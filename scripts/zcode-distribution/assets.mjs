@@ -16,7 +16,11 @@ import {
   collectSeaTuiAssets,
   seaTuiAssetPrefix,
 } from "../../apps/zcode-cli/packages/cli/scripts/sea-tui-assets.mjs";
-import { supportedTargets } from "../../apps/zcode-cli/packages/cli/scripts/sea-targets.mjs";
+import {
+  hostTarget,
+  supportedTargets,
+} from "../../apps/zcode-cli/packages/cli/scripts/sea-targets.mjs";
+import { isRealComputerUseProducerInstalled } from "../../packages/desktop/scripts/computer-use-producer.mjs";
 import { stageKoffiIntoBundledAgents } from "../../packages/desktop/scripts/koffi-package-assets.mjs";
 import {
   isSharpRequiredByComputerUse,
@@ -25,26 +29,42 @@ import {
 const root = resolve(import.meta.dirname, "../..");
 const readJson = async (file) => JSON.parse(await readFile(file, "utf8"));
 const cliRoot = resolve(root, "apps/zcode-cli");
+const desktopPackageRoot = resolve(root, "packages", "desktop");
 // 与 bootstrap/src/app/bundled-plugins.ts 的 candidateBaseDirs 一致：Node 发行包在
 // agent/zcode.cjs 旁查找内置资产，因此统一 stage 到 <packageRoot>/agent/packages/*。
 const agentRoot = (packageRoot) => resolve(packageRoot, "agent");
 
-// 官方插件清单与文件枚举的唯一事实源是 CLI 的 SEA 采集器。这里只把清单自带的 rootPath
-// 映射成发行包内的相对目录（repo 里是 packages/<x>-plugin，发行包里是 agent/packages/<x>-plugin），
-// 不新增插件或文件白名单；CUA 与 SEA 一样不在此集合内。
+// 官方插件清单与文件枚举的唯一事实源是 CLI 的 SEA 采集器。这里按目标平台（默认当前宿主 target）
+// 过滤 plugin.targets（例如 Linux 不包含仅限 macOS/Windows 的 computer-use）并遵守 CUA 真实 producer 门禁，
+// 再把清单自带的 rootPath 映射成发行包内的相对目录（agent/packages/<x>-plugin）。
 // 同时带出发布校验所需的必需资产路径，供发行包静态验收与 SEA 采集器共用同一份清单。
-export const officialPluginStagingTargets = () =>
-  officialSeaPlugins.map((plugin) => ({
-    directory: plugin.rootPath,
-    name: plugin.name,
-    packageName: plugin.packageName,
-    requiredRuntimePaths:
-      plugin.requiresRuntime === false
-        ? []
-        : (plugin.requiredRuntimePaths ?? ["dist/mcp/server.js"]),
-    requiredSeedPaths: plugin.requiredSeedPaths ?? [],
-    requiresRuntime: plugin.requiresRuntime !== false,
-  }));
+export function isOfficialPluginIncludedForTarget(plugin, target = hostTarget()) {
+  if (plugin.targets && !plugin.targets.includes(target)) {
+    return false;
+  }
+  if (
+    plugin.name === "computer-use" &&
+    !isRealComputerUseProducerInstalled({ desktopPackageRoot })
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export const officialPluginStagingTargets = ({ target = hostTarget() } = {}) =>
+  officialSeaPlugins
+    .filter((plugin) => isOfficialPluginIncludedForTarget(plugin, target))
+    .map((plugin) => ({
+      directory: plugin.rootPath,
+      name: plugin.name,
+      packageName: plugin.packageName,
+      requiredRuntimePaths:
+        plugin.requiresRuntime === false
+          ? []
+          : (plugin.requiredRuntimePaths ?? ["dist/mcp/server.js"]),
+      requiredSeedPaths: plugin.requiredSeedPaths ?? [],
+      requiresRuntime: plugin.requiresRuntime !== false,
+    }));
 
 const runtimePackageNames = [
   "@hono/node-server",
@@ -100,23 +120,27 @@ export async function stageTuiRuntime(packageRoot) {
 // 内置官方插件：复用 SEA 采集器的官方清单与枚举输出，按 bootstrap 的 filesystem seed 期望
 // 把每个插件落到 <agent>/packages/<x>-plugin。requireRuntime 默认开启，缺 dist/mcp/server.js
 // 直接让发行包构建失败（与 SEA 的 producer 门禁一致），而不是发一个没有运行时的插件。
-export async function stageOfficialPluginAssets(packageRoot, { requireRuntime = true } = {}) {
+export async function stageOfficialPluginAssets(
+  packageRoot,
+  { requireRuntime = true, target = hostTarget() } = {},
+) {
   const stagingDirectory = resolve(packageRoot, "../official-plugin-staging");
   const targetByName = new Map(
-    officialPluginStagingTargets().map((target) => [target.name, target]),
+    officialPluginStagingTargets({ target }).map((entry) => [entry.name, entry]),
   );
   try {
     const { assets, manifest } = await collectSeaOfficialPluginAssets({
       requireRuntime,
       root: cliRoot,
       stagingDirectory,
+      target,
     });
     for (const plugin of manifest.plugins) {
-      const target = targetByName.get(plugin.name);
-      if (!target) {
+      const targetEntry = targetByName.get(plugin.name);
+      if (!targetEntry) {
         throw new Error(`Unknown official plugin in SEA asset manifest: ${plugin.name}`);
       }
-      const pluginTarget = resolve(agentRoot(packageRoot), target.directory);
+      const pluginTarget = resolve(agentRoot(packageRoot), targetEntry.directory);
       // 重新构建不累积上一轮的残留文件；插件目录是本次采集内容的完整快照。
       await rm(pluginTarget, { force: true, recursive: true });
       for (const file of plugin.files) {
@@ -134,7 +158,13 @@ export async function stageOfficialPluginAssets(packageRoot, { requireRuntime = 
         resolve(pluginTarget, ".zcode-plugin", "plugin.json"),
         `${plugin.name} staged plugin manifest in ${packageRoot}`,
       );
-      for (const runtimePath of requireRuntime ? target.requiredRuntimePaths : []) {
+      for (const seedPath of targetEntry.requiredSeedPaths) {
+        await assertStagedFile(
+          resolve(pluginTarget, ...seedPath.split("/")),
+          `${plugin.name} staged seed asset ${seedPath} in ${packageRoot}`,
+        );
+      }
+      for (const runtimePath of requireRuntime ? targetEntry.requiredRuntimePaths : []) {
         await assertStagedFile(
           resolve(pluginTarget, ...runtimePath.split("/")),
           `${plugin.name} staged runtime in ${packageRoot}`,
@@ -191,7 +221,6 @@ const pluginNativeStagingTargets = [
 ];
 
 export async function stagePluginNativeRuntimeDependencies(packageRoot) {
-  const desktopPackageRoot = resolve(root, "packages", "desktop");
   if (!isSharpRequiredByComputerUse({ desktopPackageRoot })) {
     console.log(
       "[zcode] Computer Use SDK does not declare sharp; skipping plugin native dependency staging",

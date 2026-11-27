@@ -292,6 +292,53 @@ test("official plugin assets are staged under agent/packages from the SEA list",
   );
 });
 
+// 4.0 清单中 computer-use 仅限 darwin/win targets；Linux 发行包过滤后不得把它当作必选插件，
+// 同时必须保留 4 个办公文档插件新增的 scripts/zcode_libreoffice.py 等 seed 资产。
+test("Linux target filtering excludes computer-use and preserves 4.0 office seed assets", async (t) => {
+  for (const linuxTarget of ["linux-x64", "linux-arm64"]) {
+    const targets = officialPluginStagingTargets({ target: linuxTarget });
+    assert.equal(
+      targets.some((target) => target.name === "computer-use"),
+      false,
+      `${linuxTarget} must exclude computer-use`,
+    );
+    for (const officePlugin of ["documents", "pdf", "presentations", "spreadsheets"]) {
+      const entry = targets.find((target) => target.name === officePlugin);
+      assert.ok(entry, `${linuxTarget} missing ${officePlugin}`);
+      assert.ok(
+        entry.requiredSeedPaths.includes("scripts/zcode_libreoffice.py"),
+        `${officePlugin} missing scripts/zcode_libreoffice.py in requiredSeedPaths`,
+      );
+    }
+  }
+
+  const packageRoot = await stageRoot(t);
+  const stagedNames = await stageOfficialPluginAssets(packageRoot, {
+    requireRuntime: false,
+    target: "linux-arm64",
+  });
+  assert.equal(stagedNames.includes("computer-use"), false);
+  assert.equal(
+    await stat(join(packageRoot, "agent/packages/zcode-cua-plugin")).catch(() => null),
+    null,
+  );
+  for (const dir of [
+    "documents-plugin",
+    "pdf-plugin",
+    "presentations-plugin",
+    "spreadsheets-plugin",
+  ]) {
+    assert.ok(
+      (
+        await stat(join(packageRoot, "agent/packages", dir, "scripts/zcode_libreoffice.py")).catch(
+          () => null,
+        )
+      )?.isFile(),
+      `${dir} missing staged scripts/zcode_libreoffice.py`,
+    );
+  }
+});
+
 // 插件 native 依赖（sharp/koffi）只按 desktop 的官方 producer 门禁 stage：当前仓库的
 // @zcode/zcode-cua 不声明 sharp，因此必须整体跳过，且绝不在插件目录里塞 node_modules。
 test("plugin native dependency staging follows the official producer gate", async (t) => {

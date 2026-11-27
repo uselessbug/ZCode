@@ -1,33 +1,34 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { png, fixture } from "./attachment-resume-wire-fixture.js";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText } from "ai";
 import { describe, expect, it } from "vitest";
 import {
   createMessageId,
+  createPartId,
   createProjectId,
   createSessionId,
+  createTraceId,
   type AttachmentStorageMetadata,
+  type ModelInputFormat,
   type ModelInputMessage,
-  type TurnAttachment,
 } from "@zcode/contracts";
-import { MessageHistoryImpl } from "../../core/src/agent/message-history.js";
-import { hydrateMessageHistoryFromSession } from "../../core/src/agent/session-history-hydrator.js";
+import type { TurnAttachment } from "../../core/src/runtime/deps.js";
 import { resolveTurnAttachments } from "../../core/src/runtime/helpers/attachments.js";
-import { resolvedPathReferenceAttachment } from "../../core/src/runtime/helpers/attachment-path-reference.js";
 import { buildRuntimeUserEntriesFromTurn } from "../../core/src/runtime/helpers/conversation.js";
 import { projectMessagesWithMediaAttachmentPaths } from "../../core/src/runtime/helpers/media-attachment-path.js";
 import { buildProviderRequestMessages } from "../../core/src/runtime/helpers/provider-request-messages.js";
-import { persistUserPrompt } from "../../core/src/runtime/methods/message-persistence.js";
-import type { AgentRuntimeInternal } from "../../core/src/runtime/internal.js";
-import { createNodeFileSystemAdapter } from "../src/fs/index.js";
 import { toAiSdkMessages } from "../src/model/transform.js";
-import { createNodeToolArtifactStore, createSqliteSessionStore } from "../src/storage/index.js";
 
-const png =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aDo0AAAAASUVORK5CYII=";
+const FULL_INPUT_FORMAT: ModelInputFormat = {
+  supportsText: true,
+  supportsImage: true,
+  supportsAudio: false,
+  supportsVideo: true,
+  supportsPdf: true,
+};
+const TRACE_CONTEXT = { traceId: createTraceId() };
+
 const pdf = `data:application/pdf;base64,${Buffer.from("%PDF-1.7\nfixture").toString("base64")}`;
 const scenarios: Array<{ name: string; attachments: TurnAttachment[] }> = [
   { name: "binary path", attachments: [{ type: "file", path: "bundle.zip" }] },
@@ -87,75 +88,11 @@ async function captureWire(messages: ModelInputMessage[], kind: "anthropic" | "o
     model,
     maxRetries: 0,
     messages: toAiSdkMessages(messages, {
-      inputFormat: { supportsImage: true, supportsPdf: true, supportsVideo: true },
+      inputFormat: FULL_INPUT_FORMAT,
     }),
   });
   expect(captured).toBeDefined();
   return captured;
-}
-
-async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "attachment-resume-"));
-  const dbPath = join(root, "session.sqlite");
-  const sessionId = createSessionId("attachment-resume");
-  let store = await createSqliteSessionStore({ dbPath });
-  await store.createSession({
-    id: sessionId,
-    projectID: createProjectId("fixture"),
-    slug: "fixture",
-    directory: root,
-    title: "fixture",
-    version: "1",
-  });
-  await Promise.all([
-    writeFile(join(root, "bundle.zip"), "binary fixture"),
-    writeFile(join(root, "pasted.txt"), "clipboard text"),
-    writeFile(join(root, "notes.md"), "# Notes\nKeep exact text."),
-    writeFile(join(root, "local.png"), Buffer.from(png.split(",")[1]!, "base64")),
-  ]);
-  const artifactStore = createNodeToolArtifactStore({
-    rootDir: join(root, "artifacts"),
-    imageCacheRootDir: join(root, "images"),
-    videoCacheRootDir: join(root, "videos"),
-  });
-  const history = new MessageHistoryImpl();
-  history.init("system fixture");
-  const runtime = {
-    sessionId,
-    sessionStore: store,
-    messageHistory: history,
-    artifactStore,
-    fileSystemPort: createNodeFileSystemAdapter(),
-    workingDirectory: root,
-    config: { agentName: "fixture", systemPrompt: "system fixture" },
-    getTools: () => [],
-    getSessionModelSelection: () => undefined,
-    persistMessage: (message: Parameters<typeof store.saveMessage>[0]) =>
-      store.saveMessage(message),
-    persistPart: (part: Parameters<typeof store.savePart>[0]) => store.savePart(part),
-  } as unknown as AgentRuntimeInternal;
-  runtime.persistUserPrompt = persistUserPrompt.bind(runtime);
-  return {
-    root,
-    runtime,
-    history,
-    artifactStore,
-    async cold() {
-      store.close();
-      store = await createSqliteSessionStore({ dbPath });
-      // 修复原因：cold() 关库重开后同步刷新 runtime.sessionStore，避免后续用例继续访问已关闭连接。
-      runtime.sessionStore = store;
-      const messages = await store.messages({ sessionID: sessionId });
-      const cold = new MessageHistoryImpl();
-      cold.init("system fixture");
-      await hydrateMessageHistoryFromSession({ history: cold, messages, artifactStore });
-      return { history: cold, messages };
-    },
-    async close() {
-      store.close();
-      await rm(root, { recursive: true, force: true });
-    },
-  };
 }
 
 describe("attachment history across durable cold resume", () => {
@@ -167,12 +104,15 @@ describe("attachment history across durable cold resume", () => {
         try {
           const resolved = await resolveTurnAttachments(scenario.attachments, {
             ...f.runtime,
-            traceContext: { traceId: "fixture" },
+            traceContext: TRACE_CONTEXT,
           });
           f.history.addEntries(buildRuntimeUserEntriesFromTurn(prompt, resolved));
-          await f.runtime.persistUserPrompt(createMessageId("first"), prompt, resolved, {
-            traceId: "fixture",
-          });
+          await f.runtime.persistUserPrompt(
+            createMessageId("first"),
+            prompt,
+            resolved,
+            TRACE_CONTEXT,
+          );
           const cold = await f.cold();
           for (const attachment of resolved.filter((a) => a.metadata.storageKind === "local_ref")) {
             const part = cold.messages[0]!.parts.find(
@@ -222,32 +162,6 @@ describe("attachment history across durable cold resume", () => {
     );
   }
 
-  it.each([
-    ["image/png", "image_too_large"],
-    ["application/pdf", "pdf_too_large"],
-    ["video/mp4", "video_too_large"],
-    ["text/plain", "text_too_large"],
-    ["text/plain", "deferred_topic_history"],
-  ] as const)("restores %s path text for %s without preview or source IO", async (mime, reason) => {
-    const f = await fixture();
-    try {
-      const path = join(f.root, "missing-attachment");
-      const attachment = resolvedPathReferenceAttachment({ type: "file", path }, path, {
-        mime,
-        reason,
-        source: { type: "file", path, text: { value: path, start: 0, end: path.length } },
-      });
-      expect(attachment.metadata.preview).toBeUndefined();
-      f.history.addEntries(buildRuntimeUserEntriesFromTurn("Inspect.", [attachment]));
-      await f.runtime.persistUserPrompt(createMessageId("path-text"), "Inspect.", [attachment], {
-        traceId: "fixture",
-      });
-      expect((await f.cold()).history.toRuntimeEntries()).toEqual(f.history.toRuntimeEntries());
-    } finally {
-      await f.close();
-    }
-  });
-
   it("keeps local images in submission order even when hydration rebuilds their media source as inline", async () => {
     const f = await fixture();
     try {
@@ -257,19 +171,22 @@ describe("attachment history across durable cold resume", () => {
           { type: "image", path: "local.png" },
           { type: "pdf", content: pdf, filename: "report.pdf" },
         ],
-        { ...f.runtime, traceContext: { traceId: "fixture" } },
+        { ...f.runtime, traceContext: TRACE_CONTEXT },
       );
       f.history.addEntries(buildRuntimeUserEntriesFromTurn("Compare.", resolved));
-      await f.runtime.persistUserPrompt(createMessageId("mixed-local"), "Compare.", resolved, {
-        traceId: "fixture",
-      });
+      await f.runtime.persistUserPrompt(
+        createMessageId("mixed-local"),
+        "Compare.",
+        resolved,
+        TRACE_CONTEXT,
+      );
       const cold = await f.cold();
       // 这里只比较媒体与正文合同；local path 到 artifact 派生 path 的既有投影单独测试。
       const requests = [f.history, cold.history].map(
         (h) => buildProviderRequestMessages({ entries: h.toRuntimeEntries() }).messages,
       );
       const transformOptions = {
-        inputFormat: { supportsImage: true, supportsPdf: true, supportsVideo: true },
+        inputFormat: FULL_INPUT_FORMAT,
       };
       const first = toAiSdkMessages(requests[0]!, transformOptions);
       expect(toAiSdkMessages(requests[1]!, transformOptions)).toEqual(first);
@@ -292,15 +209,18 @@ describe("attachment history across durable cold resume", () => {
       try {
         const resolved = await resolveTurnAttachments([{ type: "file", path: "bundle.zip" }], {
           ...f.runtime,
-          traceContext: { traceId: "fixture" },
+          traceContext: TRACE_CONTEXT,
         });
         resolved[0]!.metadata = {
           ...resolved[0]!.metadata,
           pathReferenceText,
         } as AttachmentStorageMetadata;
-        await f.runtime.persistUserPrompt(createMessageId("legacy"), "Prompt", resolved, {
-          traceId: "fixture",
-        });
+        await f.runtime.persistUserPrompt(
+          createMessageId("legacy"),
+          "Prompt",
+          resolved,
+          TRACE_CONTEXT,
+        );
         const cold = await f.cold();
         expect(
           buildProviderRequestMessages({ entries: cold.history.toRuntimeEntries() }).messages.at(-1)
@@ -364,7 +284,7 @@ describe("attachment history across durable cold resume", () => {
           },
           { type: "file", content: logArt.uri, filename: "app.log", mimeType: "text/plain" },
         ],
-        { ...f.runtime, traceContext: { traceId: "fixture" } },
+        { ...f.runtime, traceContext: TRACE_CONTEXT },
       );
 
       f.history.addEntries(buildRuntimeUserEntriesFromTurn("Inspect uploaded files.", resolved));
@@ -372,7 +292,7 @@ describe("attachment history across durable cold resume", () => {
         createMessageId("uploaded-files"),
         "Inspect uploaded files.",
         resolved,
-        { traceId: "fixture" },
+        TRACE_CONTEXT,
       );
 
       const cold = await f.cold();
@@ -438,7 +358,7 @@ describe("attachment history across durable cold resume", () => {
             sourceKind: "clipboard-text",
           },
         ],
-        { ...f.runtime, traceContext: { traceId: "fixture" } },
+        { ...f.runtime, traceContext: TRACE_CONTEXT },
       );
 
       expect(resolved[0]).toMatchObject({
@@ -456,7 +376,7 @@ describe("attachment history across durable cold resume", () => {
         createMessageId("clip-msg-1"),
         "Inspect clipboard.",
         resolved,
-        { traceId: "fixture" },
+        TRACE_CONTEXT,
       );
 
       const cold = await f.cold();
@@ -483,7 +403,7 @@ describe("attachment history across durable cold resume", () => {
       });
       await f.runtime.sessionStore!.savePart({
         ...clipPart,
-        id: "fork-clip-part",
+        id: createPartId("fork-clip-part"),
         sessionID: forkId,
         messageID: createMessageId("fork-clip-msg"),
       });

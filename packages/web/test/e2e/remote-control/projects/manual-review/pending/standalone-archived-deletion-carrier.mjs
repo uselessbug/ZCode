@@ -67,6 +67,26 @@ async function runStubCli() {
       });
       return;
     }
+    if (method === "v4/storage/sessionData/deletionPreviewBatch") {
+      send({
+        id: message.id,
+        result: {
+          results: (params.items ?? []).map((item) => ({
+            preview: {
+              sessionId: item.sessionId,
+              revision: `rev-${item.sessionId}`,
+              sessionIds: [item.sessionId],
+              forks: [],
+              retainedArtifacts: [],
+              deletedFiles: 1,
+              incomplete: false,
+              completed: false,
+            },
+          })),
+        },
+      });
+      return;
+    }
     if (method === "v4/storage/sessionData/deletionPreview") {
       send({
         id: message.id,
@@ -286,7 +306,14 @@ async function runSuite() {
     console.log("PASS 2 热态归档预检与永久删除复用原工作区 CLI");
 
     // 3. 异域身份、错 path、带 remoteSessionId：严禁 fallback，透传 ERR_ZCODE_AGENT_RUNTIME_UNAVAILABLE
-    const beforeRejectCalls = (await readCalls()).length;
+    const readDeletionCalls = async () =>
+      (await readCalls()).filter(
+        (call) =>
+          call.method.startsWith("v4/storage/sessionData/") ||
+          call.params?.sessionId === "task-forbidden" ||
+          call.cwd === wsForeign,
+      );
+    const beforeRejectCalls = (await readDeletionCalls()).length;
     for (const item of [
       {
         label: "异域 server 同 path",
@@ -340,8 +367,36 @@ async function runSuite() {
         `${item.label} execute 必须拒绝 fallback`,
       );
     }
-    assert.equal((await readCalls()).length, beforeRejectCalls, "被拒绝场景不得发起任何 CLI 请求");
+    assert.equal(
+      (await readDeletionCalls()).length,
+      beforeRejectCalls,
+      "被拒绝场景不得发起任何删除或异域 CLI 请求",
+    );
     console.log("PASS 3 异域身份/错 path/remoteSessionId 禁止 fallback 并透传 UNAVAILABLE");
+
+    // 4. 4.0 批量预检：混合冷态本机 canonical、热态工作区与异域目标，按实际载体分组且逐项隔离错误
+    await seedArchivedTask(wsCold, coldIdentity, "task-batch-cold");
+    await seedArchivedTask(wsHot, hotIdentity, "task-batch-hot");
+    const { results: batchPreview } = await taskService.previewArchivedTaskDeletions({
+      tasks: [
+        { workspacePath: wsCold, workspaceIdentity: coldIdentity, taskId: "task-batch-cold" },
+        { workspacePath: wsHot, workspaceIdentity: hotIdentity, taskId: "task-hot-1" },
+        {
+          workspacePath: wsForeign,
+          workspaceIdentity: `remote:ssh:box:22:alice:${wsForeign}`,
+          taskId: "task-batch-foreign",
+        },
+      ],
+    });
+    assert.equal(batchPreview.length, 3);
+    assert.equal(batchPreview[0].preview?.revision, "rev-task-batch-cold");
+    assert.equal(batchPreview[1].preview?.revision, "rev-task-hot-1");
+    assert.equal(batchPreview[2].error?.code, "ZCode Agent runtime is not running.");
+    const batchCalls = (await readCalls()).filter(
+      (call) => call.method === "v4/storage/sessionData/deletionPreviewBatch",
+    );
+    assert.equal(batchCalls.length, 2, "冷态与热态应分别命中控制面 carrier 与热工作区 CLI");
+    console.log("PASS 4 4.0 批量归档预检按热/冷载体分组并隔离异域错误");
 
     taskIndexRepo.close();
   } finally {

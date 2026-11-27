@@ -193,6 +193,21 @@ module.exports = noopProxy;
       });
 
       build.onLoad({ filter: /.*/, namespace: stubNs }, (args) => {
+        if (args.path === "chokidar") {
+          return {
+            contents: `
+import { EventEmitter } from "node:events";
+export function watch() {
+  const emitter = new EventEmitter();
+  emitter.close = async () => { emitter.removeAllListeners(); };
+  queueMicrotask(() => emitter.emit("ready"));
+  return emitter;
+}
+export default { watch };
+`,
+            loader: "js",
+          };
+        }
         if (args.path === "zod-to-json-schema") {
           return {
             contents: `export function zodToJsonSchema() { return { type: "object", properties: {} }; }`,
@@ -248,7 +263,7 @@ try {
     `export { createManagedCdpBrowserRuntime } from ${JSON.stringify(join(cliPackages, "adapters/src/browser/index.ts"))};`,
     `export { createProtocolBrowserControlBroker } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol/browser-control-broker.ts"))};`,
     `export { purgeSessionDataWith } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol/session-data/index.ts"))};`,
-    `export { executeSessionDeletionWith, previewSessionDeletionWith } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol/session-data/permanent-deletion.ts"))};`,
+    `export { executeSessionDeletionWith, previewSessionDeletionsWith, previewSessionDeletionWith } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol/session-data/permanent-deletion.ts"))};`,
     `export { createMessageId, createProjectId, createSessionId, SessionEventType } from ${JSON.stringify(join(cliPackages, "contracts/src/index.ts"))};`,
     `export { ConversationV4Gateway } from ${JSON.stringify(join(cliPackages, "bootstrap/src/zcode-protocol-v4/v4-gateway.ts"))};`,
     `export { createZCodeApp } from ${JSON.stringify(join(cliPackages, "bootstrap/src/app/create-app.ts"))};`,
@@ -1078,7 +1093,7 @@ try {
 
   const delHost = {
     store: {
-      inspectSessionDeletion: store.inspectSessionDeletion.bind(store),
+      inspectSessionDeletions: store.inspectSessionDeletions.bind(store),
       beginSessionDeletion: store.beginSessionDeletion.bind(store),
       completeSessionDeletion: store.completeSessionDeletion.bind(store),
     },
@@ -1087,6 +1102,12 @@ try {
     release: async () => {},
     forget: () => {},
   };
+  const delBatchPreview = await mod.previewSessionDeletionsWith(delHost, {
+    items: [{ sessionId: dupSrcSessionId, workspace: { workspacePath: tempRoot } }],
+  });
+  assert.equal(delBatchPreview.results.length, 1);
+  assert.equal(delBatchPreview.results[0].preview.retainedArtifacts.length, 2);
+  assert.equal(delBatchPreview.results[0].preview.deletedFiles, 2);
   const delPreview = await mod.previewSessionDeletionWith(delHost, {
     sessionId: dupSrcSessionId,
     workspace: { workspacePath: tempRoot },

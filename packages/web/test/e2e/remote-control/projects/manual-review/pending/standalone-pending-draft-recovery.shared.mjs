@@ -152,7 +152,12 @@ await build({
         }));
         builder.onResolve({ filter: /^[^./#][^:]*$/ }, ({ path, importer }) => {
           if (path.startsWith("@/") || path.startsWith("@zcode/")) return;
-          if (path === "electron" || builtinModules.includes(path)) {
+          if (
+            path === "electron" ||
+            path === "@napi-rs/keyring" ||
+            path.startsWith("@napi-rs/keyring-") ||
+            builtinModules.includes(path)
+          ) {
             return { path, external: true };
           }
           const req = importer ? createRequire(importer) : require;
@@ -176,12 +181,9 @@ await build({
 
 const bundle = require(outfile);
 const { JSDOM } = require(join(jsdomDir, "jsdom"));
-export const dom = new JSDOM(
-  "<!doctype html><html><body><div id='root'></div></body></html>",
-  {
-    url: "https://zcode.example.test/",
-  },
-);
+export const dom = new JSDOM("<!doctype html><html><body><div id='root'></div></body></html>", {
+  url: "https://zcode.example.test/",
+});
 dom.window.URL.createObjectURL = () => "blob:mock-url";
 dom.window.URL.revokeObjectURL = () => {};
 for (const [key, value] of [

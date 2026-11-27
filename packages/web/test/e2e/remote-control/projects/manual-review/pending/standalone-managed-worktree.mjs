@@ -63,7 +63,14 @@ try {
 
   const outfile = join(temporary, "worktree-bundle.cjs");
   const resolveExternal = (path, importer) => {
-    if (path === "electron") return { path, external: true };
+    if (
+      path === "electron" ||
+      path === "@napi-rs/keyring" ||
+      path.startsWith("@napi-rs/keyring-") ||
+      path === "node-pty"
+    ) {
+      return { path, external: true };
+    }
     try {
       const resolved = (importer ? createRequire(importer) : require).resolve(path);
       return isAbsolute(resolved) ? { path: resolved } : { path, external: true };
@@ -94,7 +101,7 @@ try {
     platform: "node",
     format: "cjs",
     target: "node24",
-    external: ["electron"],
+    external: ["@napi-rs/keyring", "@napi-rs/keyring-*", "node-pty", "electron"],
     define: { "import.meta.url": JSON.stringify(pathToFileURL(outfile).href) },
     logLevel: "silent",
     plugins: [

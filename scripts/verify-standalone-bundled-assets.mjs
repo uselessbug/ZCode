@@ -18,9 +18,13 @@ import {
   bundledSkillPackRootPath,
 } from "../apps/zcode-cli/packages/cli/scripts/sea-bundled-skill-assets.mjs";
 import { officialSeaPlugins } from "../apps/zcode-cli/packages/cli/scripts/sea-official-plugin-assets.mjs";
+import { hostTarget } from "../apps/zcode-cli/packages/cli/scripts/sea-targets.mjs";
+import { isRealComputerUseProducerInstalled } from "../packages/desktop/scripts/computer-use-producer.mjs";
 
 const releaseRoot = resolve(process.argv[2] ?? "/app/zcode");
 const repoRoot = resolve(import.meta.dirname, "..");
+const desktopPackageRoot = join(repoRoot, "packages", "desktop");
+const currentTarget = hostTarget();
 const agentRoot = join(releaseRoot, "agent");
 const insideRelease = (path) => path === releaseRoot || path.startsWith(`${releaseRoot}${sep}`);
 
@@ -34,7 +38,13 @@ async function assertReleaseFile(file, label) {
   assert.ok(info?.isFile(), `Missing ${label}: ${file}`);
 }
 
-for (const plugin of officialSeaPlugins) {
+const expectedPlugins = officialSeaPlugins.filter(
+  (plugin) =>
+    (!plugin.targets || plugin.targets.includes(currentTarget)) &&
+    (plugin.name !== "computer-use" || isRealComputerUseProducerInstalled({ desktopPackageRoot })),
+);
+
+for (const plugin of expectedPlugins) {
   const pluginRoot = join(agentRoot, plugin.rootPath);
   assert.ok(
     insideRelease(pluginRoot) && !pluginRoot.startsWith(`${repoRoot}${sep}`),
@@ -71,7 +81,8 @@ for (const relativePath of bundledSkillPackRequiredPaths) {
 console.log(
   JSON.stringify({
     releaseRoot,
-    plugins: officialSeaPlugins.length,
+    target: currentTarget,
+    plugins: expectedPlugins.length,
     bundledSkillAssets: bundledSkillPackRequiredPaths.length,
     bundledAssets: "verified",
   }),

@@ -14,7 +14,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../../../../../../../../", import.meta.url));
@@ -49,7 +49,7 @@ await build({
   platform: "node",
   format: "cjs",
   target: "node24",
-  external: ["electron"],
+  external: ["@napi-rs/keyring", "@napi-rs/keyring-*", "node-pty", "electron"],
   define: { "import.meta.url": JSON.stringify(pathToFileURL(outfile).href) },
   logLevel: "silent",
   plugins: [
@@ -88,9 +88,12 @@ await build({
           ),
         }));
         builder.onResolve({ filter: /^[^./#@][^:]*$/ }, ({ path, importer }) => {
-          if (path === "electron") return { path, external: true };
+          if (path === "@napi-rs/keyring" || path === "node-pty" || path === "electron") {
+            return { path, external: true };
+          }
           const req = importer ? createRequire(importer) : require;
-          return { path: req.resolve(path) };
+          const resolved = req.resolve(path);
+          return isAbsolute(resolved) ? { path: resolved } : { path, external: true };
         });
       },
     },

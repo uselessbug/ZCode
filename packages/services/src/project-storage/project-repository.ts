@@ -14,6 +14,7 @@ import {
   type SaveProjectInput,
   type VirtualProject,
 } from "#src/project-storage/contract.js";
+import { hostMismatch } from "#src/project-storage/host-mismatch.js";
 import {
   ensureHost,
   OWNERSHIP_DECIDED,
@@ -477,7 +478,12 @@ export class ProjectRepository implements ProjectRepositoryContract, ProjectData
           existing.root_path !== parent.root_path ||
           (existing.forked_from_task_id && existing.forked_from_task_id !== input.parentTaskId))
       )
-        throw new Error("project.host-mismatch");
+        throw hostMismatch("fork-parent", input.task, {
+          rowHostId: existing.host_id,
+          ownerHostId: this.ownerHostId,
+          projectId: existing.project_id ?? directories.projectId,
+          parentHostId: parent.host_id,
+        });
       if (!existing) {
         // fork 正文先由 CLI 提交；Host 在 ACK 对 UI 可见之前持久化父任务归属，避免立即打开时空归属。
         this.db
