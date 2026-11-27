@@ -13,6 +13,7 @@
 | 项目记忆 catalog（按 workspace 的 Markdown） | 所属 Host 数据根 `<dataRoot>/cli/memories/projects` 的 `IMemoryService`            | `SettingsPage` 的 `localHostServices.memoryService` |
 | `localHostServices` 的归属                   | 各入口注入的 base Host（桌面本机 Host / 云端 server Host / 手机远控被控桌面 Host） | `useBaseWorkspaceServices()`                        |
 | 记忆开关与存储格式                           | 各 base Host 的 `settingService`（`memoryEnabled`）                                | `useSettings({ services: localHostServices })`      |
+| 回复语言（`replyLanguage`）                  | 各 base Host 的 `settingService`（持久化于服务端/本机 `setting.json`）             | `platform.setReplyLanguage` / `onSettingsChanged`   |
 
 ### 记忆浏览：按服务边界判定，不按平台
 
@@ -37,6 +38,12 @@ sequenceDiagram
 - 独立 Web（电脑与手机）通过 base Host 的 `settingService` 读写服务器 `~/.zcode/AGENTS.md`，复用官方保存/取消、草稿恢复及 100KB 限制；界面说明明确指向当前服务器 Agent。
 - 桌面端仍编辑本机用户指令；官方 relay 手机远控仍保留仅桌面端提示。入口边界及验收场景见 [个性化规格](ui/settings-personalization.md)。
 - 不新增 API、配置文件或持久化目录，已有用户指令不作迁移或初始化覆盖。
+
+### 回复语言（行为与工具 -> `replyLanguage`）
+
+- 独立 Web 下 `createWebPlatform` 挂载 `setReplyLanguage` 与 `onSettingsChanged`，接通「设置 -> 行为与工具 -> 回复语言（`replyLanguage`）」的读取、修改与空串清除（经空串清除哨兵写入服务端 `setting.json`）。
+- 服务端 `node.ts` 在设置更新时同步刷新内存缓存，并响应 CLI `session/readReplyLanguage` 请求，使独立 Web 会话实时读取最新回复语言配置。
+- 官方 relay 手机远控（`/remote`）保持显示“请在本机设置”提示，桌面端维持本机读写行为不变。
 
 ### 浏览器数据：区分三类浏览器
 
